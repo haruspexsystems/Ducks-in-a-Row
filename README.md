@@ -10,8 +10,7 @@ client to request certificates from an internal ADCS certificate authority.
 ## Status
 
 **Version 0.9.0-beta.1.** The feature set is complete and in real-world testing
-before a 1.0 release. The installer is not code signed yet, because the company
-behind it, Haruspex Systems B.V., is still being set up. Windows SmartScreen and
+before a 1.0 release. The installer is not code signed yet. Windows SmartScreen and
 Microsoft Defender will warn you when you run it. This is expected. Verify the
 download against the SHA256 checksum on the release page. A signed 1.0 will
 follow this beta. You can get it from the public repository at
