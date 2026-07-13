@@ -1,0 +1,186 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+  Ducks in a Row: install wizard dialog set.
+
+  This is a copy of the stock WixUI_InstallDir flow with three deliberate changes:
+    1. The license agreement screen is omitted (Welcome goes straight to the
+       destination screen). The product ships under BSL 1.1; acceptance is not
+       gated in the installer.
+    2. A custom "Data folder" screen (DataDirDlg) follows the destination
+       screen. It edits DATAFOLDER (database, logs, runtime configuration)
+       through the WIXUI_DATADIR indirection, reusing the stock BrowseDlg.
+    3. A custom "Service options" screen (ServiceConfigDlg) is inserted between
+       the data folder screen and the ready-to-install screen. It carries the
+       "Start the service now" checkbox bound to the START_SERVICE property.
+
+  The completion screen carries an optional "open the setup page in your browser"
+  checkbox, wired to a WixShellExec custom action.
+
+  Dialog flow (fresh install):
+    WelcomeDlg -> InstallDirDlg -> DataDirDlg -> ServiceConfigDlg -> VerifyReadyDlg -> ProgressDlg -> ExitDialog
+
+  Certus.wxs sets WIXUI_INSTALLDIR=INSTALLFOLDER and WIXUI_DATADIR=DATAFOLDER so
+  the destination style dialogs edit our directories. The standard dialogs come
+  from WixToolset.UI.wixext; the launch action from WixToolset.Util.wixext. Both
+  extensions are passed to `wix build` (see build.ps1).
+-->
+
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <Fragment>
+    <UI Id="CertusInstallUI">
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="9" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+
+      <!-- Standard dialogs linked from WixToolset.UI.wixext -->
+      <DialogRef Id="BrowseDlg" />
+      <DialogRef Id="DiskCostDlg" />
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+      <DialogRef Id="WelcomeDlg" />
+      <DialogRef Id="InstallDirDlg" />
+      <DialogRef Id="VerifyReadyDlg" />
+      <DialogRef Id="MaintenanceWelcomeDlg" />
+      <DialogRef Id="MaintenanceTypeDlg" />
+      <DialogRef Id="ExitDialog" />
+
+      <!-- Welcome -> Destination. License agreement screen intentionally omitted. -->
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Condition="NOT Installed" />
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Condition="Installed AND PATCH" />
+
+      <!-- Destination: forward/back plus the Change-folder browse path -->
+      <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="DataDirDlg" Order="2" />
+      <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Property="_BrowseProperty" Value="[WIXUI_INSTALLDIR]" Order="1" />
+      <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Event="SpawnDialog" Value="BrowseDlg" Order="2" />
+
+      <!--
+        Data folder (custom). Same wiring as the destination screen: the stock
+        BrowseDlg edits whatever _BrowseProperty points at, so one browse
+        dialog serves both directories.
+      -->
+      <Publish Dialog="DataDirDlg" Control="Back" Event="NewDialog" Value="InstallDirDlg" />
+      <Publish Dialog="DataDirDlg" Control="Next" Event="SetTargetPath" Value="[WIXUI_DATADIR]" Order="1" />
+      <Publish Dialog="DataDirDlg" Control="Next" Event="NewDialog" Value="ServiceConfigDlg" Order="2" />
+      <Publish Dialog="DataDirDlg" Control="ChangeFolder" Property="_BrowseProperty" Value="[WIXUI_DATADIR]" Order="1" />
+      <Publish Dialog="DataDirDlg" Control="ChangeFolder" Event="SpawnDialog" Value="BrowseDlg" Order="2" />
+
+      <!--
+        Service options (custom). On Next, mirror the start choice onto the exit
+        checkbox so the "open setup" box is checked only when the service was
+        actually started (otherwise the browser would open to a dead port).
+      -->
+      <Publish Dialog="ServiceConfigDlg" Control="Back" Event="NewDialog" Value="DataDirDlg" />
+      <Publish Dialog="ServiceConfigDlg" Control="Next" Property="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="[START_SERVICE]" Order="1" />
+      <Publish Dialog="ServiceConfigDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="2" />
+
+      <!-- Ready-to-install: route Back correctly for install vs maintenance vs patch -->
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="ServiceConfigDlg" Order="1" Condition="NOT Installed" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="2" Condition="Installed AND NOT PATCH" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2" Condition="Installed AND PATCH" />
+
+      <!-- Maintenance / uninstall -->
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg" />
+
+      <!--
+        Completion. On Finish: if the user left the optional checkbox ticked (and
+        this is an install, not uninstall), open the setup page, then end. The
+        DoAction must run before the Order=999 EndDialog.
+      -->
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchSetupBrowser" Order="1"
+               Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" />
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999" />
+
+      <!-- No feature-selection screen yet, so hide Modify in Add/Remove Programs -->
+      <Property Id="ARPNOMODIFY" Value="1" />
+
+      <UIRef Id="WixUI_Common" />
+
+      <!--
+        Custom Data folder dialog. Modeled on the stock InstallDirDlg layout:
+        a PathEdit bound indirectly through WIXUI_DATADIR plus the stock
+        browse button pattern.
+      -->
+      <Dialog Id="DataDirDlg" Width="370" Height="270" Title="Ducks in a Row Setup">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="WixUI_Bmp_Banner" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="220" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="{\WixUI_Font_Title}Data folder" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="290" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="Choose where Ducks in a Row keeps its data" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+
+        <Control Id="InfoText" Type="Text" X="25" Y="60" Width="320" Height="36" NoPrefix="yes"
+                 Text="The data folder holds the certificate database, logs, and runtime configuration. It stays in place when the application is uninstalled or upgraded." />
+        <Control Id="FolderLabel" Type="Text" X="25" Y="102" Width="290" Height="12" NoPrefix="yes"
+                 Text="Data folder:" />
+        <Control Id="Folder" Type="PathEdit" X="25" Y="116" Width="250" Height="18"
+                 Property="WIXUI_DATADIR" Indirect="yes" />
+        <Control Id="ChangeFolder" Type="PushButton" X="285" Y="115" Width="56" Height="17"
+                 Text="!(loc.InstallDirDlgChange)" />
+
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)" />
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)" />
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+      </Dialog>
+
+      <!--
+        Custom Service options dialog. Modeled on the stock interior-dialog layout
+        (370 x 270, top banner, bottom button row).
+      -->
+      <Dialog Id="ServiceConfigDlg" Width="370" Height="270" Title="Ducks in a Row Setup">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="WixUI_Bmp_Banner" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="220" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="{\WixUI_Font_Title}Service options" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="290" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="Choose whether to start the service now" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+
+        <Control Id="InfoText" Type="Text" X="25" Y="60" Width="320" Height="48" NoPrefix="yes"
+                 Text="The Ducks in a Row service is always registered and set to start automatically when Windows starts. You can also start it now, so you can finish configuration without rebooting." />
+        <Control Id="StartNowCheckBox" Type="CheckBox" X="25" Y="116" Width="320" Height="18"
+                 Property="START_SERVICE" CheckBoxValue="1"
+                 Text="Start the service now" />
+        <Control Id="HintText" Type="Text" X="40" Y="138" Width="305" Height="60" NoPrefix="yes"
+                 Text="After installation, open http://localhost:5000 to pick your certificate authority and templates in the setup wizard. The service serves the wizard even before a CA is configured." />
+
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)" />
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)" />
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+      </Dialog>
+    </UI>
+  </Fragment>
+
+  <!--
+    Completion-screen browser launch. WixShellExec runs ShellExecute on the
+    target URL as the installing user (Impersonate="yes"), opening the default
+    browser. The Util custom-action binary is arch-specific and must match the
+    package architecture passed to `wix build` (x64). Return="ignore" so a failed
+    launch never reports an install error on the very last click.
+  -->
+  <Fragment>
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Open the Ducks in a Row setup page in your browser" />
+    <Property Id="WixShellExecTarget" Value="http://localhost:5000/" />
+    <CustomAction Id="LaunchSetupBrowser" DllEntry="WixShellExec" BinaryRef="Wix4UtilCA_X64"
+                  Execute="immediate" Return="ignore" Impersonate="yes" />
+  </Fragment>
+
+</Wix>

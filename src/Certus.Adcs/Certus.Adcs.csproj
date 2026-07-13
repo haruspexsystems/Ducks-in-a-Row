@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Certus.Core\Certus.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.DirectoryServices" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Certus.Core.Tests" />
+  </ItemGroup>
+
+</Project>

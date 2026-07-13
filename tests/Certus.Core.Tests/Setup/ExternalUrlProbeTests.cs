@@ -1,0 +1,213 @@
+using System.Net;
+using System.Net.Sockets;
+using System.Security.Authentication;
+using System.Text;
+using Certus.Core.Setup;
+using Microsoft.Extensions.Logging.Abstractions;
+
+namespace Certus.Core.Tests.Setup;
+
+public class ExternalUrlProbeTests
+{
+    private static ExternalUrlProbe CreateProbe(TimeSpan? timeout = null)
+    {
+        var client = new HttpClient(ExternalUrlProbe.CreateHandler())
+        {
+            Timeout = timeout ?? TimeSpan.FromSeconds(5),
+        };
+        return new ExternalUrlProbe(client, NullLogger<ExternalUrlProbe>.Instance);
+    }
+
+    [Fact]
+    public async Task Probe_ListenerAnswers_ReportsReachableWithTheStatus()
+    {
+        // Any HTTP status proves the authority answers; a 404 from a route
+        // that does not exist yet still counts as reachable.
+        using var listener = new MinimalHttpListener(404);
+        var probe = CreateProbe();
+
+        var result = await probe.ProbeAsync(new Uri($"http://127.0.0.1:{listener.Port}"), "WebServer");
+
+        result.Attempted.Should().BeTrue();
+        result.Reachable.Should().BeTrue();
+        result.HttpStatusCode.Should().Be(404);
+        result.DialedAuthority.Should().Be($"127.0.0.1:{listener.Port}");
+        result.FailureKind.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task Probe_NothingListening_ReportsConnectionRefusedAtTheDialedPort()
+    {
+        // The issue #89 shape, reproduced locally: a port where nothing
+        // accepts connections.
+        var port = FreePort();
+        var probe = CreateProbe();
+
+        var result = await probe.ProbeAsync(new Uri($"http://127.0.0.1:{port}"), null);
+
+        result.Attempted.Should().BeTrue();
+        result.Reachable.Should().BeFalse();
+        result.FailureKind.Should().Be(ExternalUrlProbeFailure.ConnectionRefused);
+        result.DialedAuthority.Should().Be($"127.0.0.1:{port}");
+        result.FailureDetail.Should().Contain($"127.0.0.1:{port}");
+    }
+
+    [Fact]
+    public async Task Probe_ServerAcceptsButNeverAnswers_ReportsTimeout()
+    {
+        // A listener that accepts the connection and then stays silent, so
+        // the client's own timeout is what fires.
+        var silent = new TcpListener(IPAddress.Loopback, 0);
+        silent.Start();
+        try
+        {
+            var port = ((IPEndPoint)silent.LocalEndpoint).Port;
+            var probe = CreateProbe(TimeSpan.FromMilliseconds(500));
+
+            var result = await probe.ProbeAsync(new Uri($"http://127.0.0.1:{port}"), null);
+
+            result.Reachable.Should().BeFalse();
+            result.FailureKind.Should().Be(ExternalUrlProbeFailure.Timeout);
+        }
+        finally
+        {
+            silent.Stop();
+        }
+    }
+
+    [Fact]
+    public void BuildTargetUrl_WithTemplate_TargetsTheAcmeDirectory()
+    {
+        var target = ExternalUrlProbe.BuildTargetUrl(
+            new Uri("https://certus.contoso.com:5001"), "Web Server ACME");
+
+        target.AbsoluteUri.Should().Be("https://certus.contoso.com:5001/acme/Web%20Server%20ACME/directory");
+    }
+
+    [Fact]
+    public void BuildTargetUrl_NoTemplate_TargetsTheAnonymousStatusEndpoint()
+    {
+        var target = ExternalUrlProbe.BuildTargetUrl(
+            new Uri("https://certus.contoso.com:5001"), null);
+
+        target.AbsoluteUri.Should().Be("https://certus.contoso.com:5001/api/setup/status");
+    }
+
+    [Fact]
+    public void BuildTargetUrl_UsesOnlyTheAuthority_LikeTheAcmeUrlBuilder()
+    {
+        // A path on the external URL is dropped, matching how
+        // AcmeControllerBase.AcmeUrl treats the configured value.
+        var target = ExternalUrlProbe.BuildTargetUrl(
+            new Uri("https://certus.contoso.com:5001/some/path"), null);
+
+        target.AbsoluteUri.Should().Be("https://certus.contoso.com:5001/api/setup/status");
+    }
+
+    [Fact]
+    public void Classify_ConnectionRefusedSocketError_IsConnectionRefused()
+    {
+        var exception = new HttpRequestException(
+            "refused", new SocketException((int)SocketError.ConnectionRefused));
+
+        ExternalUrlProbe.Classify(exception).Should().Be(ExternalUrlProbeFailure.ConnectionRefused);
+    }
+
+    [Fact]
+    public void Classify_HostNotFoundSocketError_IsDnsFailure()
+    {
+        var exception = new HttpRequestException(
+            "no dns", new SocketException((int)SocketError.HostNotFound));
+
+        ExternalUrlProbe.Classify(exception).Should().Be(ExternalUrlProbeFailure.DnsFailure);
+    }
+
+    [Fact]
+    public void Classify_ClientTimeout_IsTimeout()
+    {
+        // HttpClient wraps its own timeout in a TaskCanceledException with a
+        // TimeoutException inside.
+        var exception = new TaskCanceledException("timed out", new TimeoutException());
+
+        ExternalUrlProbe.Classify(exception).Should().Be(ExternalUrlProbeFailure.Timeout);
+    }
+
+    [Fact]
+    public void Classify_AuthenticationFailure_IsTlsError()
+    {
+        var exception = new HttpRequestException(
+            "handshake failed", new AuthenticationException());
+
+        ExternalUrlProbe.Classify(exception).Should().Be(ExternalUrlProbeFailure.TlsError);
+    }
+
+    [Fact]
+    public void Classify_AnythingElse_IsOther()
+    {
+        ExternalUrlProbe.Classify(new HttpRequestException("plain"))
+            .Should().Be(ExternalUrlProbeFailure.Other);
+    }
+
+    /// <summary>
+    /// Grab a loopback port that nothing listens on by binding and releasing
+    /// it. Another process could take it before the probe dials, but that
+    /// window is tiny and the failure mode is a clear test failure.
+    /// </summary>
+    private static int FreePort()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
+        return port;
+    }
+
+    /// <summary>
+    /// The smallest thing that answers HTTP on a loopback port: accepts a
+    /// connection, reads the request head, writes a fixed status response.
+    /// Raw TCP rather than HttpListener so no URL reservation is needed.
+    /// </summary>
+    private sealed class MinimalHttpListener : IDisposable
+    {
+        private readonly TcpListener _listener;
+        private readonly CancellationTokenSource _cts = new();
+
+        public int Port { get; }
+
+        public MinimalHttpListener(int statusCode)
+        {
+            _listener = new TcpListener(IPAddress.Loopback, 0);
+            _listener.Start();
+            Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
+            _ = AcceptLoopAsync(statusCode, _cts.Token);
+        }
+
+        private async Task AcceptLoopAsync(int statusCode, CancellationToken ct)
+        {
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    using var client = await _listener.AcceptTcpClientAsync(ct);
+                    var stream = client.GetStream();
+                    var buffer = new byte[4096];
+                    await stream.ReadAsync(buffer, ct);
+                    var response = Encoding.ASCII.GetBytes(
+                        $"HTTP/1.1 {statusCode} Probe\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    await stream.WriteAsync(response, ct);
+                }
+            }
+            catch
+            {
+                // Disposal stops the listener; the loop just ends.
+            }
+        }
+
+        public void Dispose()
+        {
+            _cts.Cancel();
+            _listener.Stop();
+            _cts.Dispose();
+        }
+    }
+}

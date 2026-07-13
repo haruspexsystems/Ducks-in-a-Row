@@ -1,0 +1,13 @@
+node_modules/
+dist/
+*.local
+.vite/
+
+# TypeScript incremental build cache (produced by `tsc -b`)
+*.tsbuildinfo
+
+# design-sync: generated build inputs, written by .design-sync/prep.mjs (never
+# hand-edited, never committed). .ds-entry.ts is a copy of the durable barrel
+# .design-sync/ds-entry.ts; .ds-compiled.css is the compiled Tailwind cfg.cssEntry.
+.ds-entry.ts
+.ds-compiled.css

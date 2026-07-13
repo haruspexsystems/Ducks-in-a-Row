@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <AssemblyName>AdcsQiProbe</AssemblyName>
+    <RootNamespace>AdcsQiProbe</RootNamespace>
+    <Description>Diagnostic for Certus issues #14 and #15. Activates the CertRequest and CertView coclasses through the Activator and CoCreateInstance paths, queries the v1, v2, and v3 IIDs to see which interfaces the objects expose, and exercises four managed dispatch models (IUnknown, Dual, IDispatch, dynamic) against a live CA to find which one invokes a v1 method without crashing.</Description>
+  </PropertyGroup>
+
+</Project>

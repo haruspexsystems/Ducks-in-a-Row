@@ -1,0 +1,37 @@
+/* dashboard-theme.css — fonts + keyframes the dashboard relies on.
+   Tailwind handles everything else. Import once (DashboardPage already does). */
+
+/* Fonts are self-hosted via @fontsource and imported in main.tsx, so there is
+   no external font request at runtime. */
+
+.md-dashboard {
+  font-family: 'Hanken Grotesk', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.md-dashboard .md-mono {
+  font-family: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', monospace;
+  font-feature-settings: 'tnum' 1;
+}
+
+/* Used as Tailwind arbitrary animations, e.g. animate-[mdFlow_7s_linear_infinite] */
+@keyframes mdFlow {
+  to { transform: translateX(-240px); }
+}
+@keyframes mdRipple {
+  0% { transform: scaleX(0.6); opacity: 0.5; }
+  70% { opacity: 0.15; }
+  100% { transform: scaleX(1.5); opacity: 0; }
+}
+@keyframes mdPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .md-dashboard *,
+  .md-dashboard *::before,
+  .md-dashboard *::after {
+    animation: none !important;
+  }
+}

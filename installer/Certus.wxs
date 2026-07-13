@@ -1,0 +1,272 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+  Ducks in a Row: WiX v4 MSI Installer
+
+  Installs the Ducks in a Row Windows Service:
+    Copies publish output to Program Files\Ducks in a Row
+    Creates the data directory (default ProgramData\Ducks in a Row) for
+    database, logs, and runtime configuration; the administrator can choose
+    another location and the choice is recorded in the registry
+    Registers the DucksInARow Windows Service (auto start)
+
+  Build (normally via build.ps1, which supplies ProductVersion from
+  Directory.Build.props):
+    dotnet publish src/Certus.Service -c Release -r win-x64
+    wix build installer/Certus.wxs -d ProductVersion=0.1.0.0 -o artifacts/Ducks-in-a-Row.msi -bindpath artifacts/publish
+-->
+
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:fire="http://wixtoolset.org/schemas/v4/wxs/firewall"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <!-- Fallback for direct wix invocations; build.ps1 always defines it. -->
+  <?ifndef ProductVersion ?>
+  <?define ProductVersion = "0.1.0.0" ?>
+  <?endif ?>
+
+  <Package
+    Name="Ducks in a Row"
+    Manufacturer="Haruspex Systems B.V."
+    Version="$(var.ProductVersion)"
+    UpgradeCode="8A3D7F2E-5B1C-4E9A-B6D8-2F4A7C1E3B5D"
+    Scope="perMachine">
+
+    <SummaryInformation
+      Description="Ducks in a Row ACME-to-ADCS Certificate Proxy"
+      Manufacturer="Haruspex Systems B.V." />
+
+    <!--
+      AllowSameVersionUpgrades: development and QA rebuild the same version
+      number; without it a rebuild installs beside the previous product
+      (duplicate ARP rows) and the shared components then break uninstall
+      (refcounts never reach zero, so the service is neither stopped nor
+      removed). With it, one install of this MSI also removes ALL related
+      products sharing the UpgradeCode — including the historical duplicates.
+    -->
+    <MajorUpgrade
+      AllowSameVersionUpgrades="yes"
+      DowngradeErrorMessage="A newer version of Ducks in a Row is already installed."
+      Schedule="afterInstallInitialize" />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!--
+      Install wizard. The dialog sequence itself (Welcome, destination, data
+      folder, service options, progress, completion) lives in CertusUi.wxs.
+      WIXUI_INSTALLDIR / WIXUI_DATADIR tell the destination style dialogs which
+      directory property to edit (hand authored dialog set, so we set them
+      directly instead of via a built-in dialog set attribute).
+    -->
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <Property Id="WIXUI_DATADIR" Value="DATAFOLDER" />
+    <UIRef Id="CertusInstallUI" />
+
+    <!--
+      START_SERVICE controls whether the service is started immediately after the
+      files are copied. Default on. It is a public, secure property so an
+      unattended install can override it, e.g.
+        msiexec /i Ducks-in-a-Row.msi /qn START_SERVICE=0
+      The service is always registered (auto start on boot) regardless; this only
+      governs starting it now. The service-options dialog binds its checkbox here.
+    -->
+    <Property Id="START_SERVICE" Value="1" Secure="yes" />
+
+    <!--
+      Remember the directory the user chose. Without this, a major upgrade would
+      reinstall to the default location and orphan the previous files. The
+      RegistrySearch pre-fills INSTALLFOLDER on upgrade; the PersistInstallDir
+      component below writes the value during install. The search deliberately
+      reads only the new registry hive: rebrand installs must not inherit the
+      old Program Files\Certus location.
+    -->
+    <Property Id="INSTALLFOLDER" Secure="yes">
+      <RegistrySearch Id="RememberedInstallDir"
+                      Root="HKLM"
+                      Key="Software\Haruspex Systems\Ducks in a Row"
+                      Name="InstallDir"
+                      Type="raw" />
+    </Property>
+
+    <!--
+      The data directory (database, logs, runtime configuration, HTTPS
+      certificate). Chosen on the DataDirDlg screen or unattended:
+        msiexec /i Ducks-in-a-Row.msi /qn DATAFOLDER=D:\DucksData
+      The service resolves it through the DataDirectory registry value written
+      by PersistDataDir below. Remembered across upgrades like INSTALLFOLDER;
+      moving the data directory on upgrade is not supported (the remembered
+      value wins over the command line then — AppSearch ordering).
+    -->
+    <Property Id="DATAFOLDER" Secure="yes">
+      <RegistrySearch Id="RememberedDataDir"
+                      Root="HKLM"
+                      Key="Software\Haruspex Systems\Ducks in a Row"
+                      Name="DataDirectory"
+                      Type="raw" />
+    </Property>
+
+    <!--
+      Branding assets (you provide). Drop the files into installer/branding/ and
+      uncomment to brand the wizard and Add/Remove Programs entry. Until then the
+      wizard uses the stock WiX images so the build still succeeds. Required:
+        branding/banner.bmp  top banner          493 x 58 px,  24-bit BMP
+        branding/dialog.bmp  welcome/exit image   493 x 312 px, 24-bit BMP
+        branding/ducks.ico   product / ARP icon
+    -->
+    <!--
+    <WixVariable Id="WixUIBannerBmp" Value="branding/banner.bmp" />
+    <WixVariable Id="WixUIDialogBmp" Value="branding/dialog.bmp" />
+    <Icon Id="DucksIcon" SourceFile="branding/ducks.ico" />
+    <Property Id="ARPPRODUCTICON" Value="DucksIcon" />
+    -->
+
+    <!-- Installation directory: Program Files\Ducks in a Row -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Ducks in a Row" />
+    </StandardDirectory>
+
+    <!-- Start Menu program group for the web UI shortcut -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="CertusStartMenuDir" Name="Ducks in a Row" />
+    </StandardDirectory>
+
+    <!-- Data directory: ProgramData\Ducks in a Row unless the user chose another -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DATAFOLDER" Name="Ducks in a Row">
+        <Directory Id="LOGSFOLDER" Name="logs" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Features -->
+    <Feature Id="MainFeature" Title="Ducks in a Row Service" Level="1">
+      <ComponentGroupRef Id="PublishFiles" />
+      <ComponentRef Id="DataDirectory" />
+      <ComponentRef Id="LogsDirectory" />
+      <ComponentRef Id="ServiceComponent" />
+      <ComponentRef Id="StartServiceControl" />
+      <ComponentRef Id="PersistInstallDir" />
+      <ComponentRef Id="PersistDataDir" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+
+    <!--
+      Component GUIDs below are new with the rebrand: every keypath moved
+      (directories, service, registry hive), and component rules say a GUID
+      follows its keypath. Sharing the old GUIDs with the legacy products
+      would resurrect the refcount problems this release fixes.
+    -->
+
+    <!-- Create data directory. No RemoveFolder on purpose: the database and
+         configuration survive uninstall. -->
+    <Component Id="DataDirectory" Directory="DATAFOLDER" Guid="00BB1215-0A03-48CC-BE07-3281CB24CEF3">
+      <CreateFolder />
+    </Component>
+
+    <!-- Create logs directory -->
+    <Component Id="LogsDirectory" Directory="LOGSFOLDER" Guid="FB45691B-01D9-4ADB-9F5F-454FF93138B8">
+      <CreateFolder />
+    </Component>
+
+    <!-- Windows Service registration (ServiceExe listed separately from harvested files) -->
+    <Component Id="ServiceComponent" Directory="INSTALLFOLDER" Guid="765B4E7C-8AC3-4E41-B811-0326C86D7B21">
+      <File Id="ServiceExe" Source="DucksInARow.Service.exe" KeyPath="yes" />
+      <ServiceInstall
+        Id="DucksService"
+        Name="DucksInARow"
+        DisplayName="Ducks in a Row Certificate Proxy"
+        Description="Ducks in a Row ACME-to-ADCS certificate proxy. Provides RFC 8555 ACME protocol access to Active Directory Certificate Services."
+        Type="ownProcess"
+        Start="auto"
+        ErrorControl="normal"
+        Account="LocalSystem" />
+      <ServiceControl
+        Id="StartDucksService"
+        Name="DucksInARow"
+        Stop="both"
+        Remove="uninstall"
+        Wait="yes" />
+      <!--
+        Legacy hygiene: machines that ran the duplicate stacked installs of the
+        Certus era can be left with an orphaned CertusService whose product
+        rows no longer stop it. Stopping and deleting a service that does not
+        exist is a no op, so this is safe on clean machines. Remove="install"
+        only — this product's own uninstall must not touch the legacy name.
+      -->
+      <ServiceControl
+        Id="CleanupLegacyCertusService"
+        Name="CertusService"
+        Stop="both"
+        Remove="install"
+        Wait="yes" />
+      <fire:FirewallException
+        Id="CertusFirewall"
+        Name="Ducks in a Row Certificate Proxy"
+        Port="5000"
+        Protocol="tcp"
+        Profile="all"
+        Scope="any"
+        Description="Allow inbound TCP connections to the Ducks in a Row ACME proxy on port 5000" />
+      <fire:FirewallException
+        Id="CertusFirewallHttps"
+        Name="Ducks in a Row Certificate Proxy (HTTPS)"
+        Port="5001"
+        Protocol="tcp"
+        Profile="all"
+        Scope="any"
+        Description="Allow inbound TCP connections to the Ducks in a Row ACME proxy on HTTPS port 5001" />
+    </Component>
+
+    <!--
+      Start the service now, only when START_SERVICE=1. Kept in its own component
+      so the start is conditional while registration (in ServiceComponent above)
+      stays unconditional. Stop/Remove are left to ServiceComponent so they always
+      run on uninstall. Wait="no" so a slow start cannot hang or fail the install;
+      the service serves the setup page even before the CA is configured.
+    -->
+    <Component Id="StartServiceControl" Directory="INSTALLFOLDER"
+               Guid="C8AA9B19-AEF4-44B2-BA82-79F231B57FD8"
+               Condition="START_SERVICE = 1">
+      <RegistryValue Root="HKLM" Key="Software\Haruspex Systems\Ducks in a Row"
+                     Name="StartServiceMarker" Type="integer" Value="1" KeyPath="yes" />
+      <ServiceControl Id="StartDucksNow" Name="DucksInARow"
+                      Start="install" Stop="none" Remove="none" Wait="no" />
+    </Component>
+
+    <!-- Persist the chosen install directory for in-place upgrades -->
+    <Component Id="PersistInstallDir" Directory="INSTALLFOLDER"
+               Guid="CDADDD70-6AC6-44FB-ADBA-D10BC68C1806">
+      <RegistryValue Root="HKLM" Key="Software\Haruspex Systems\Ducks in a Row"
+                     Name="InstallDir" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+    </Component>
+
+    <!--
+      Persist the chosen data directory. This is where the service reads it
+      from at runtime (CertusPaths resolves registry DataDirectory, then the
+      ProgramData default), and where the RegistrySearch above remembers it on
+      upgrade. Declarative registry write; no custom actions.
+    -->
+    <Component Id="PersistDataDir" Directory="DATAFOLDER"
+               Guid="8FC68C99-D255-43D0-BC69-AE90642C722F">
+      <RegistryValue Root="HKLM" Key="Software\Haruspex Systems\Ducks in a Row"
+                     Name="DataDirectory" Type="string" Value="[DATAFOLDER]" KeyPath="yes" />
+    </Component>
+
+    <!--
+      Start Menu shortcut to the web UI. This is the durable "it is installed"
+      signal and the everyday entry point; the completion dialog is transient.
+    -->
+    <Component Id="StartMenuShortcut" Directory="CertusStartMenuDir"
+               Guid="40A7F2A6-F1FF-44A4-9AA8-164365B3639A">
+      <util:InternetShortcut Id="CertusWebUiShortcut"
+                             Name="Ducks in a Row"
+                             Target="http://localhost:5000/"
+                             Type="url" />
+      <RemoveFolder Id="RemoveCertusStartMenuDir" Directory="CertusStartMenuDir" On="uninstall" />
+      <RegistryValue Root="HKLM" Key="Software\Haruspex Systems\Ducks in a Row"
+                     Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+  </Package>
+
+</Wix>

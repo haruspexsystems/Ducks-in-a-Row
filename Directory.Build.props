@@ -1,0 +1,49 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+
+    <!-- Reproducible builds and source-path privacy (issue #104). Deterministic
+         is the SDK default; set explicitly for intent. ContinuousIntegrationBuild
+         is gated to Release/CI so local Debug builds keep real paths for
+         debugging. The PathMap below (applied only on that path) rewrites the
+         repo root to /_/ so PDBs never record the build host's absolute path or
+         username.
+
+         The .NET 8 SDK bundles Source Link and turns it on by default: with
+         ContinuousIntegrationBuild it would query git, derive its own path map,
+         and embed a Source Link blob pointing at the remote. We deliberately opt
+         out of that (issue #104 chose an explicit PathMap, no Source Link) so the
+         build has no git coupling, works from a source-only tree, and carries no
+         missing-SourceRoot warning under TreatWarningsAsErrors. The explicit
+         PathMap is then the sole path normalizer. -->
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true' or '$(Configuration)' == 'Release'">true</ContinuousIntegrationBuild>
+    <EnableSourceControlManagerQueries>false</EnableSourceControlManagerQueries>
+    <DeterministicSourcePaths>false</DeterministicSourcePaths>
+
+    <!-- Shared version properties. VersionPrefix alone is what release/Publish-Release.ps1
+         and build.ps1 read for the WiX ProductVersion (a strict four part numeric,
+         no prerelease suffix). VersionSuffix only feeds AssemblyInformationalVersion,
+         so the running app can report the real "0.9.0-beta.1" style version (see
+         SettingsController.GetInfo) without ever touching the MSI version. Update
+         both together with the release tag; drop VersionSuffix entirely for a
+         non prerelease version like 1.0.0. -->
+    <VersionPrefix>0.9.0</VersionPrefix>
+    <VersionSuffix>beta.1</VersionSuffix>
+    <Product>Ducks in a Row</Product>
+    <Company>Haruspex Systems B.V.</Company>
+    <Copyright>Copyright © Haruspex Systems B.V. 2026</Copyright>
+    <Description>ACME-to-ADCS proxy — Make ADCS work like Let's Encrypt for your internal network.</Description>
+  </PropertyGroup>
+
+  <!-- Applied only on the deterministic (Release/CI) path. $(MSBuildThisFileDirectory)
+       is the repo root with a trailing separator, so an absolute source path
+       maps to /_/src/... with no C:\Users fragment (issue #104). -->
+  <PropertyGroup Condition="'$(ContinuousIntegrationBuild)' == 'true'">
+    <PathMap>$(MSBuildThisFileDirectory)=/_/</PathMap>
+  </PropertyGroup>
+</Project>

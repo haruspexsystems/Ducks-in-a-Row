@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <!-- The host exe name is user visible (Task Manager, services binPath,
+         Event Viewer source), so it carries the product name. Namespaces and
+         the other Certus.* assemblies are internal and keep their names. -->
+    <AssemblyName>DucksInARow.Service</AssemblyName>
+    <RootNamespace>Certus.Service</RootNamespace>
+    <Description>Ducks in a Row ACME-to-ADCS Proxy - Windows Service</Description>
+    <Authors>Haruspex Systems B.V.</Authors>
+    <!-- Suppress CS0436: Program type conflict with Certus.Web reference -->
+    <NoWarn>CS0436</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" />
+    <PackageReference Include="Serilog.AspNetCore" />
+    <PackageReference Include="Serilog.Sinks.Console" />
+    <PackageReference Include="Serilog.Sinks.File" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Certus.Core\Certus.Core.csproj" />
+    <ProjectReference Include="..\Certus.Adcs\Certus.Adcs.csproj" />
+    <!-- Reference Web for controller + middleware assembly discovery -->
+    <ProjectReference Include="..\Certus.Web\Certus.Web.csproj">
+      <Private>true</Private>
+    </ProjectReference>
+  </ItemGroup>
+
+</Project>

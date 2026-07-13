@@ -1,0 +1,57 @@
+<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Entity Framework Core + SQLite -->
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.13" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Design" Version="8.0.13" />
+
+    <!-- Registry read of the installer chosen data directory. Certus.Core
+         targets plain net8.0, so the registry API needs the package (the
+         net8.0-windows projects get it from the framework). -->
+    <PackageVersion Include="Microsoft.Win32.Registry" Version="5.0.0" />
+
+    <!-- Settings overlay (settings.json in the data directory) written by the
+         setup wizard and inserted into host configuration by Certus.Core. -->
+    <PackageVersion Include="Microsoft.Extensions.Configuration.Json" Version="8.0.1" />
+
+    <!-- Logging -->
+    <PackageVersion Include="Serilog.AspNetCore" Version="8.0.3" />
+    <PackageVersion Include="Serilog.Sinks.Console" Version="6.0.0" />
+    <PackageVersion Include="Serilog.Sinks.File" Version="6.0.0" />
+
+    <!-- Crypto (JWS/JWK, X.509, CSR) -->
+    <PackageVersion Include="BouncyCastle.Cryptography" Version="2.6.2" />
+
+    <!-- DNS resolution for ACME DNS-01 challenge validation -->
+    <PackageVersion Include="DnsClient" Version="1.8.0" />
+
+    <!-- Email (SMTP) for expiry alerts. MimeKit is pinned explicitly so the
+         transitive version stays traceable in source — defense against silent
+         version drift biting us again. -->
+    <PackageVersion Include="MailKit" Version="4.16.0" />
+    <PackageVersion Include="MimeKit" Version="4.16.0" />
+
+    <!-- Windows Service hosting -->
+    <PackageVersion Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.1" />
+
+    <!-- Windows Integrated Authentication (Negotiate / Kerberos / NTLM) for the
+         dashboard and setup APIs (issue #27, SEC-F1) -->
+    <PackageVersion Include="Microsoft.AspNetCore.Authentication.Negotiate" Version="8.0.13" />
+
+    <!-- Active Directory lookup for ADCS template displayName resolution
+         (issue #17). Windows-only; Certus.Adcs already targets net8.0-windows. -->
+    <PackageVersion Include="System.DirectoryServices" Version="8.0.0" />
+
+    <!-- Testing -->
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageVersion Include="xunit" Version="2.9.3" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageVersion Include="NSubstitute" Version="5.3.0" />
+    <PackageVersion Include="FluentAssertions" Version="7.1.0" />
+    <PackageVersion Include="Microsoft.AspNetCore.Mvc.Testing" Version="8.0.13" />
+    <PackageVersion Include="coverlet.collector" Version="6.0.2" />
+  </ItemGroup>
+</Project>

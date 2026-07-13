@@ -1,0 +1,12 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply antialiased text-slate-900;
+    /* Hanken Grotesk is self-hosted via @fontsource (see main.tsx) and is the
+       dashboard's typeface; applying it here keeps every page in step. */
+    font-family: 'Hanken Grotesk', system-ui, -apple-system, sans-serif;
+  }
+}

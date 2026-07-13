@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+  Ducks in a Row: Burn bootstrapper bundle (issue #87)
+
+  Chains the ASP.NET Core 8 Hosting Bundle (x64) ahead of the Ducks in a Row
+  MSI so a clean server, online or offline, needs exactly one file. The
+  Hosting Bundle payload is embedded (Compressed) and Permanent: this product
+  never uninstalls the shared runtime, and Windows Update keeps servicing it.
+
+  The bundle shows no wizard of its own on first install. The MSI package
+  uses bal:DisplayInternalUICondition so the existing CertusUi.wxs wizard
+  appears instead. The MSI is registered with ARPSYSTEMCOMPONENT=1 when it is
+  installed through the bundle, so Apps and Features shows a single entry
+  (the bundle). The bare MSI installed on its own keeps its normal entry.
+
+  Build (normally via build.ps1, which supplies every define and downloads
+  the pinned Hosting Bundle exe into installer/redist first):
+    wix build installer/Bundle.wxs
+      -d ProductVersion=0.1.0.0
+      -d HostingBundleVersion=8.0.28
+      -d HostingBundleMajor=8
+      -d HostingBundleExe=installer/redist/dotnet-hosting-8.0.28-win.exe
+      -d MsiPath=artifacts/Ducks-in-a-Row.msi
+      -o artifacts/Ducks-in-a-Row-Setup.exe
+      -ext WixToolset.Bal.wixext -ext WixToolset.Netfx.wixext -arch x64
+-->
+
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
+     xmlns:netfx="http://wixtoolset.org/schemas/v4/wxs/netfx">
+
+  <!-- Fallback for direct wix invocations; build.ps1 always defines it. -->
+  <?ifndef ProductVersion ?>
+  <?define ProductVersion = "0.1.0.0" ?>
+  <?endif ?>
+
+  <!--
+    UpgradeCode is the bundle's own upgrade identity and is deliberately NOT
+    the MSI UpgradeCode (8A3D7F2E-5B1C-4E9A-B6D8-2F4A7C1E3B5D). Never change
+    either one. A newer bundle version upgrades the older bundle; the MSI
+    inside handles its own major upgrade through the MSI UpgradeCode.
+  -->
+  <Bundle Name="Ducks in a Row"
+          Manufacturer="Haruspex Systems B.V."
+          Version="$(var.ProductVersion)"
+          UpgradeCode="C50043FC-FFD1-4EE2-9417-A5F4E77C0864"
+          Compressed="yes">
+
+    <!-- Burn writes a log per run; the prefix makes it findable in %TEMP%. -->
+    <Log Prefix="DucksInARow-Setup" Extension="log" />
+
+    <!-- Refuse 32 bit Windows up front instead of failing inside the x64 MSI. -->
+    <bal:Condition Condition="VersionNT64"
+                   Message="Ducks in a Row requires a 64-bit version of Windows." />
+
+    <BootstrapperApplication>
+      <!--
+        hyperlinkLicense with an empty LicenseUrl shows no license link at
+        all, matching the MSI wizard, which also omits the license screen.
+        SuppressOptionsUI hides the bundle's own install folder option;
+        folder choices belong to the MSI wizard (InstallDirDlg, DataDirDlg).
+      -->
+      <bal:WixStandardBootstrapperApplication
+          Theme="hyperlinkLicense"
+          LicenseUrl=""
+          SuppressOptionsUI="yes" />
+    </BootstrapperApplication>
+
+    <!--
+      Sets AspNetCoreRuntimeVersion to the highest installed x64 ASP.NET Core
+      runtime with the pinned major version, or leaves it undefined when none
+      exists. This checks the runtime itself (Microsoft.AspNetCore.App), which
+      is the right check for a Kestrel service; IIS and ANCM are not involved.
+      HostingBundleMajor comes from build.ps1, derived from the same pin as
+      the payload, so the search, the detect floor below, and the embedded exe
+      can never drift apart when the runtime major moves.
+    -->
+    <netfx:DotNetCoreSearch Id="AspNetCoreRuntimeSearch"
+                            RuntimeType="aspnet"
+                            Platform="x64"
+                            MajorVersion="$(var.HostingBundleMajor)"
+                            Variable="AspNetCoreRuntimeVersion" />
+
+    <Chain>
+      <!--
+        The shared runtime. Permanent: uninstalling Ducks in a Row must never
+        rip the runtime out from under other applications, and Windows Update
+        services it from here on (so no UninstallArguments either).
+        DetectCondition skips the install when any 8.0.x runtime at or above
+        the floor is already present; an undefined search variable makes the
+        condition false, so a clean box installs. Exit codes: 3010 means
+        success but a reboot is wanted (offer it at the end of the chain);
+        1641 means the installer already started a reboot.
+      -->
+      <ExePackage Id="AspNetCoreHostingBundle"
+                  DisplayName="ASP.NET Core $(var.HostingBundleVersion) Hosting Bundle (x64)"
+                  SourceFile="$(var.HostingBundleExe)"
+                  Compressed="yes"
+                  Permanent="yes"
+                  Vital="yes"
+                  DetectCondition="AspNetCoreRuntimeVersion &gt;= v$(var.HostingBundleMajor).0.0"
+                  InstallArguments="/install /quiet /norestart">
+        <ExitCode Value="3010" Behavior="scheduleReboot" />
+        <ExitCode Value="1641" Behavior="forceReboot" />
+      </ExePackage>
+
+      <!--
+        The existing MSI, unchanged. DisplayInternalUICondition shows the
+        MSI's own CertusUi.wxs wizard on first install of the bundle
+        (WixBundleInstalled = 0, which also covers an upgrade launched by
+        double clicking a newer bundle); repair, modify, and uninstall of the
+        installed bundle run the MSI quietly under Burn's own progress UI.
+        WixBundleInstalled is used instead of the numeric WixBundleAction
+        enum, whose values shifted between WiX v3 and v4.
+        ARPSYSTEMCOMPONENT=1 hides the MSI's Apps and Features row only when
+        installed through the bundle. Permanent defaults to no, so
+        uninstalling the bundle removes the MSI.
+      -->
+      <MsiPackage Id="DucksInARowMsi"
+                  SourceFile="$(var.MsiPath)"
+                  Compressed="yes"
+                  Vital="yes"
+                  bal:DisplayInternalUICondition="WixBundleInstalled = 0">
+        <MsiProperty Name="ARPSYSTEMCOMPONENT" Value="1" />
+      </MsiPackage>
+    </Chain>
+  </Bundle>
+</Wix>

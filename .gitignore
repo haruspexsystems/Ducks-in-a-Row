@@ -1,0 +1,63 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.ncrunchproject
+
+# Node / React frontend
+node_modules/
+dist/
+build/
+.next/
+.cache/
+src/Certus.Web/wwwroot/
+
+# SQLite
+*.db
+*.db-shm
+*.db-wal
+
+# Secrets / env
+.env
+.env.*
+*.pfx
+*.p12
+secrets.json
+appsettings.Development.json
+
+# Build artifacts
+artifacts/
+
+# Setup bundle payload cache: the pinned ASP.NET Core Hosting Bundle exe
+# (about 100 MB), downloaded and hash verified by build.ps1, never committed
+installer/redist/
+
+# Code review reports (local only)
+reviews/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# VS Code (user-specific only; workspace config is committed)
+.vscode/*.code-snippets
+.history/
+
+# graphify knowledge graph: a local aid only, rebuilt by a git hook, never committed
+graphify-out/
+
+# design-sync (claude.ai/design import): generated build output, staged converter
+# scripts, and machine state. The durable inputs under .design-sync/ (config.json,
+# NOTES.md, conventions.md, ds-entry.ts, tailwind.cssgen.cjs, prep.mjs, previews/)
+# ARE committed; only the generated/scratch paths below are ignored.
+.ds-sync/
+ds-bundle/
+.design-sync/.cache/
+.design-sync/learnings/
+.design-sync/node_modules
+
+# Claude worktrees
+.claude/worktrees/
