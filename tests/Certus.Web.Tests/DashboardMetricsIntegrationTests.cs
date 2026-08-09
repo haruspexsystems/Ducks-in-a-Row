@@ -105,17 +105,17 @@ public class DashboardMetricsIntegrationTests
     }
 
     [Fact]
-    public async Task Validation_ReturnsAllThreeCanonicalMethods()
+    public async Task Validation_ReturnsAllFourCanonicalMethods()
     {
         var response = await _client.GetAsync("/api/dashboard/validation");
         response.StatusCode.Should().Be(HttpStatusCode.OK);
 
         var body = await ParseJsonAsync(response);
         body.ValueKind.Should().Be(JsonValueKind.Array);
-        body.GetArrayLength().Should().Be(3);
+        body.GetArrayLength().Should().Be(4);
 
         var types = body.EnumerateArray().Select(m => m.GetProperty("type").GetString()).ToList();
-        types.Should().BeEquivalentTo(new[] { "http-01", "dns-01", "tls-alpn-01" });
+        types.Should().BeEquivalentTo(new[] { "http-01", "dns-01", "tls-alpn-01", "device-attest-01" });
 
         foreach (var method in body.EnumerateArray())
         {
@@ -161,8 +161,25 @@ public class DashboardMetricsIntegrationTests
         registrations.GetArrayLength().Should().Be(30);
         renewals.GetArrayLength().Should().Be(30);
 
-        // The four seeded certs were all requested within the last 30 days.
-        registrations.EnumerateArray().Sum(d => d.GetInt32()).Should().BeGreaterThanOrEqualTo(4);
+        // The expectation is computed from the shared database rather than
+        // hardcoded, honouring this file's tolerance rule: sibling tests in
+        // the collection legitimately add certificates (the revocation tests
+        // do), and class ordering decides who runs first. The regression from
+        // issue #151 keeps its teeth because the expectation counts only
+        // Issued and Revoked rows: SeedAsync guarantees a Pending row inside
+        // the window, so an endpoint that counted requests again would sum
+        // higher than this expectation.
+        int expected;
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<CertusDbContext>();
+            var since = DateTime.UtcNow.Date.AddDays(-29);
+            expected = await db.SyncedCertificates.CountAsync(c =>
+                (c.Status == "Issued" || c.Status == "Revoked") && c.RequestDate >= since);
+        }
+
+        expected.Should().BeGreaterThanOrEqualTo(3, "the seed adds three certificates in window");
+        registrations.EnumerateArray().Sum(d => d.GetInt32()).Should().Be(expected);
 
         // Renewals are not yet distinguishable — the series is all zero.
         renewals.EnumerateArray().Should().OnlyContain(d => d.GetInt32() == 0);

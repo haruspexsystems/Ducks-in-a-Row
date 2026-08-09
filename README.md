@@ -9,7 +9,7 @@ client to request certificates from an internal ADCS certificate authority.
 
 ## Status
 
-**Version 0.9.0-beta.1.** The feature set is complete and in real-world testing
+**Version 0.10.0-beta.1.** The feature set is complete and in real-world testing
 before a 1.0 release. The installer is not code signed yet. Windows SmartScreen and
 Microsoft Defender will warn you when you run it. This is expected. Verify the
 download against the SHA256 checksum on the release page. A signed 1.0 will
@@ -30,6 +30,18 @@ expires.
 - **Directory per template:** `/acme/{template}/directory` exposes each ADCS
   template as its own ACME endpoint.
 - **All three challenge types:** HTTP-01, DNS-01, and TLS-ALPN-01.
+- **External account binding:** pre-issued credentials gate who may register,
+  with off, optional, and required modes, show-once secrets, revocation that
+  suspends a credential's accounts, per-credential domain namespaces that
+  limit what each credential's accounts may order, and an optional AD
+  principal link that records who each credential was issued to.
+- **Allowed domains:** an optional policy restricting which DNS names ACME
+  clients may order, each entry covering a domain and its subdomains, enforced
+  immediately and surfaced on the dashboard activity feed.
+- **Device attestation:** ACME `device-attest-01` issues to hardware attested
+  devices that present a permanent identifier instead of a DNS name. Off by
+  default and fails closed, with an allowlist and pinned trust anchors. Apple
+  attestation in this release.
 - **Dashboard:** a React interface showing the full certificate inventory read
   from the ADCS CA database.
 - **Expiry alerts:** email (SMTP) and webhook notifications before certificates
@@ -63,9 +75,30 @@ for a full walkthrough.
 
 ## Prerequisites
 
-- Windows Server (required for ADCS COM interop).
+- Windows Server (required for ADCS COM interop). Verified on Server 2019 and
+  Server 2025. **On Server 2022, install current Windows updates first**: the
+  .NET 10 runtime requires Control-flow Enforcement Technology there, and a
+  Server 2022 installation that has not been serviced since early 2022 does not
+  provide it. Build 20348.587 is confirmed too old; check yours with `winver`.
+  Server 2019 predates the requirement and is unaffected; Server 2025 ships
+  with it. See Troubleshooting below for what the failure looks like.
 - Domain-joined (required for DCOM authentication to the CA).
 - Reachable ADCS certificate authority with the templates you want to expose.
+
+## Troubleshooting the install
+
+**MSI Error 1920, "Verify that you have sufficient privileges to start system
+services".** This almost never means what it says. The installer is already
+elevated; the message appears because the service started and then exited
+before it could signal Windows. The real error is in the service's own log at
+`C:\ProgramData\Ducks in a Row\logs\ducks-<date>.log`. Read that first.
+
+If the log is empty or absent, the service crashed before its logger started.
+On Server 2022 the usual cause is the missing Control-flow Enforcement support
+described under Prerequisites: the process faults inside `coreclr.dll` with
+exception code `0x80131506`, and running the service executable directly from
+a command prompt prints the actual reason. Install current Windows updates and
+retry.
 
 ## License
 
@@ -89,7 +122,7 @@ rather than build.
 
 ### Toolchain
 
-- [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)
+- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
 - [Node.js](https://nodejs.org/) (for the React frontend)
 - [WiX Toolset](https://wixtoolset.org/) (`dotnet tool install --global wix`,
   for the MSI and the setup bundle). `build.ps1` installs the required WiX

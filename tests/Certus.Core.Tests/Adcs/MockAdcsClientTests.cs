@@ -47,7 +47,8 @@ public class MockAdcsClientTests : IDisposable
         var chain = await _client.GetCaCertificateChainAsync();
 
         chain.Should().ContainSingle();
-        using var root = new System.Security.Cryptography.X509Certificates.X509Certificate2(chain[0]);
+        using var root = System.Security.Cryptography.X509Certificates.X509CertificateLoader
+            .LoadCertificate(chain[0]);
         root.Subject.Should().Contain("TestCA");
         root.Subject.Should().Be(root.Issuer, "the mock CA is a one tier, self signed root");
     }
@@ -265,8 +266,8 @@ public class MockAdcsClientTests : IDisposable
         var cert = await _client.GetCertificateAsync(submit.RequestId);
         // Revoke with the X509Certificate2 serial form: uppercase and a
         // leading 00 pad, the way the ACME revoke endpoint supplies it.
-        using var x509 = new System.Security.Cryptography.X509Certificates.X509Certificate2(
-            cert.CertificateDer!);
+        using var x509 = System.Security.Cryptography.X509Certificates.X509CertificateLoader
+            .LoadCertificate(cert.CertificateDer!);
 
         await _client.RevokeCertificateAsync(x509.SerialNumber, reason: 4);
 

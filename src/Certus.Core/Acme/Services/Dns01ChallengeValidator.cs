@@ -28,11 +28,13 @@ public sealed class Dns01ChallengeValidator : IChallengeValidator
     public string ChallengeType => "dns-01";
 
     public async Task<ChallengeValidationResult> ValidateAsync(
-        string domain,
-        string token,
-        string accountThumbprint,
+        ChallengeValidationContext context,
         CancellationToken cancellationToken = default)
     {
+        var domain = context.IdentifierValue;
+        var token = context.Token;
+        var accountThumbprint = context.AccountThumbprint;
+
         // RFC 8555 §8.4: the key authorization is token.thumbprint
         var keyAuth = $"{token}.{accountThumbprint}";
 

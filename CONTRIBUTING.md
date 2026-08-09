@@ -29,7 +29,7 @@ this note will be removed at that point.
 ## Development setup
 
 See [docs/dev-setup.md](docs/dev-setup.md) for the full toolchain. In short you
-need the .NET 8 SDK, Node.js for the React frontend, and the WiX Toolset for the
+need the .NET 10 SDK, Node.js for the React frontend, and the WiX Toolset for the
 installer.
 
 ```bash

@@ -8,7 +8,7 @@ import type {
   IconName,
   HealthStatus,
 } from './types';
-import type { CertificateStats } from '@/types';
+import { relativeTime, type CertificateStats } from '@/types';
 import {
   fetchStats,
   fetchFleetHealth,
@@ -18,6 +18,8 @@ import {
   type ActivityItemResponse,
   type ValidationMethodResponse,
 } from '@/api/client';
+import { fetchAlertConfig } from '@/api/alerts';
+import { DEFAULT_EXPIRY_WARNING_DAYS } from '@/hooks/useExpiryWarningDays';
 
 // ── Query keys ──────────────────────────────────────────────────────
 export const dashboardKeys = {
@@ -26,13 +28,17 @@ export const dashboardKeys = {
 };
 
 // ── Presentation mapping ────────────────────────────────────────────
-// The backend returns raw data payloads; icon, colour, and humanised time
-// choices live here so the API stays free of view concerns.
+// The backend returns raw data payloads; icon and colour choices live here
+// so the API stays free of view concerns. The humanised time helper moved
+// to the shared types module for the header sync context (issue #157).
 
-const VALIDATION_META: Record<string, { label: string; color: string; note: string }> = {
-  'http-01': { label: 'HTTP-01', color: '#6366F1', note: 'Most common' },
-  'dns-01': { label: 'DNS-01', color: '#0EA5E9', note: 'Wildcards' },
-  'tls-alpn-01': { label: 'TLS-ALPN-01', color: '#8B5CF6', note: 'Port 443' },
+// `color` is the 500 step (legible on white); `colorDark` is the 400 step of the
+// same hue, which clears WCAG AA against the dark card where the 500 does not.
+const VALIDATION_META: Record<string, { label: string; color: string; colorDark: string; note: string }> = {
+  'http-01': { label: 'HTTP-01', color: '#6366F1', colorDark: '#818CF8', note: 'Most common' },
+  'dns-01': { label: 'DNS-01', color: '#0EA5E9', colorDark: '#38BDF8', note: 'Wildcards' },
+  'tls-alpn-01': { label: 'TLS-ALPN-01', color: '#8B5CF6', colorDark: '#A78BFA', note: 'Port 443' },
+  'device-attest-01': { label: 'DEVICE-ATTEST-01', color: '#14B8A6', colorDark: '#2DD4BF', note: 'Apple devices' },
 };
 
 const ICON_BY_TYPE: Record<ActivityType, IconName> = {
@@ -41,6 +47,7 @@ const ICON_BY_TYPE: Record<ActivityType, IconName> = {
   warning: 'alert',
   expired: 'clock',
   revoked: 'ban',
+  rejected: 'ban',
 };
 
 const STATUS_BY_TYPE: Record<ActivityType, HealthStatus> = {
@@ -49,6 +56,8 @@ const STATUS_BY_TYPE: Record<ActivityType, HealthStatus> = {
   warning: 'warning',
   expired: 'danger',
   revoked: 'danger',
+  // Amber, not red: a rejection is the domain policy working as designed.
+  rejected: 'warning',
 };
 
 /** Health-segment tones the widgets can render; an unknown tone maps to `pending`. */
@@ -57,12 +66,16 @@ function normalizeTone(tone: string): HealthStatus | 'pending' {
   return HEALTH_TONES.has(tone as HealthStatus | 'pending') ? (tone as HealthStatus | 'pending') : 'pending';
 }
 
-/** Certificate-centric stat cards (full CA inventory, not just proxy traffic). */
-function mapStats(s: CertificateStats): StatCard[] {
+/**
+ * Certificate-centric stat cards (full CA inventory, not just proxy traffic).
+ * warningDays comes from the alert configuration so the "Expiring Soon" caption
+ * describes the number above it (issue #152).
+ */
+function mapStats(s: CertificateStats, warningDays: number): StatCard[] {
   return [
     { key: 'total',     label: 'Total Certificates', value: s.totalCertificates,  icon: 'layers', tone: 'total',     sub: 'All certificates in the CA database' },
     { key: 'issued',    label: 'Issued',             value: s.issuedCertificates, icon: 'check',  tone: 'success',   sub: 'Active, valid certificates' },
-    { key: 'expiring',  label: 'Expiring Soon',      value: s.expiringSoon,       icon: 'alert',  tone: 'warning',   sub: 'Within 30 days' },
+    { key: 'expiring',  label: 'Expiring Soon',      value: s.expiringSoon,       icon: 'alert',  tone: 'warning',   sub: `Within ${warningDays} days` },
     { key: 'expired',   label: 'Expired',            value: s.expired,             icon: 'clock',  tone: 'danger',    sub: 'Past expiration' },
     { key: 'revoked',   label: 'Revoked',            value: s.revokedCertificates, icon: 'ban',    tone: 'revoked',   sub: 'Revoked by the CA' },
   ];
@@ -73,24 +86,10 @@ function mapValidation(items: ValidationMethodResponse[]): ValidationMethod[] {
   // (scaled to the real max in the widget) agree, whatever order the API returns.
   return items
     .map((m) => {
-      const meta = VALIDATION_META[m.type] ?? { label: m.type, color: '#94A3B8', note: '' };
-      return { id: m.type, label: meta.label, count: m.count, color: meta.color, note: meta.note };
+      const meta = VALIDATION_META[m.type] ?? { label: m.type, color: '#94A3B8', colorDark: '#94A3B8', note: '' };
+      return { id: m.type, label: meta.label, count: m.count, color: meta.color, colorDark: meta.colorDark, note: meta.note };
     })
     .sort((a, b) => b.count - a.count);
-}
-
-function relativeTime(iso: string): string {
-  const then = Date.parse(iso);
-  if (Number.isNaN(then)) return '';
-  const minutes = Math.round((Date.now() - then) / 60_000);
-  if (minutes < 1) return 'just now';
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.round(hours / 24);
-  if (days === 1) return 'Yesterday';
-  if (days < 7) return `${days}d ago`;
-  return new Date(then).toLocaleDateString();
 }
 
 function mapActivity(items: ActivityItemResponse[]): ActivityItem[] {
@@ -111,16 +110,31 @@ function mapActivity(items: ActivityItemResponse[]): ActivityItem[] {
 
 // ── Fetcher ─────────────────────────────────────────────────────────
 async function fetchDashboard(): Promise<DashboardData> {
-  const [stats, health, validation, activity, registrations] = await Promise.all([
+  const [stats, health, validation, activity, registrations, warningDays] = await Promise.all([
     fetchStats(),
     fetchFleetHealth(),
     fetchValidationMethods(),
     fetchActivity(20),
     fetchRegistrations(30),
+    // The expiry window the backend applied to the counts above, so the card
+    // captions and the deep links describe the same certificates the numbers do.
+    //
+    // Non-fatal on purpose. Promise.all rejects as a whole, and DashboardPage
+    // replaces the entire page with an error notice when this query fails. The
+    // other five calls carry the data the page is actually made of; this one
+    // only sets a caption and a deep link bound, so a hiccup on the alert
+    // configuration endpoint must not blank the stats, charts, and activity
+    // feed that all arrived fine. It degrades to the same default
+    // useExpiryWarningDays falls back to.
+    fetchAlertConfig().then(
+      (c) => c.expiryWarningDays,
+      () => DEFAULT_EXPIRY_WARNING_DAYS
+    ),
   ]);
 
   return {
-    stats: mapStats(stats),
+    stats: mapStats(stats, warningDays),
+    warningDays,
     health: {
       score: health.score,
       segments: health.segments.map((s) => ({

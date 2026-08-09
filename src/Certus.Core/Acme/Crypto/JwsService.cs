@@ -117,6 +117,33 @@ public sealed class JwsService
     }
 
     /// <summary>
+    /// MAC algorithms accepted for the externalAccountBinding inner JWS
+    /// (RFC 8555 §7.3.4), which is the only MAC signed structure in ACME.
+    /// Issued EAB secrets are 32 bytes, so mainstream clients sign with
+    /// HS256; HS384 and HS512 are accepted for clients that choose the
+    /// algorithm from the key length.
+    /// </summary>
+    public static readonly string[] SupportedMacAlgorithms = ["HS256", "HS384", "HS512"];
+
+    /// <summary>
+    /// Verifies an HMAC over the JWS signing input in constant time. Returns
+    /// false for an algorithm outside <see cref="SupportedMacAlgorithms"/>
+    /// rather than throwing, so an unexpected value fails closed.
+    /// </summary>
+    public static bool VerifyMac(string alg, byte[] key, byte[] signingInput, byte[] signature)
+    {
+        byte[]? computed = alg switch
+        {
+            "HS256" => HMACSHA256.HashData(key, signingInput),
+            "HS384" => HMACSHA384.HashData(key, signingInput),
+            "HS512" => HMACSHA512.HashData(key, signingInput),
+            _ => null
+        };
+
+        return computed != null && CryptographicOperations.FixedTimeEquals(computed, signature);
+    }
+
+    /// <summary>
     /// Computes the JWK Thumbprint per RFC 7638.
     /// The thumbprint is the SHA-256 hash of the canonical JWK representation.
     /// </summary>

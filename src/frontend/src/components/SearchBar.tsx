@@ -38,23 +38,23 @@ export function SearchBar({ value, onChange, placeholder = 'Search certificates.
 
   return (
     <div className="relative">
-      <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+      <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-faint" />
       <input
         type="text"
         value={localValue}
         onChange={(e) => handleChange(e.target.value)}
         placeholder={placeholder}
-        className="w-full pl-10 pr-8 py-2 bg-white border border-slate-300 rounded-lg text-sm
-                   placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-certus-500
+        className="w-full pl-10 pr-8 py-2 bg-surface border border-hairline-strong rounded-lg text-sm
+                   placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-certus-500
                    focus:border-certus-500 transition-colors"
       />
       {localValue && (
         <button
           onClick={() => handleChange('')}
           aria-label="Clear search"
-          className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded hover:bg-slate-100"
+          className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded hover:bg-sunken-strong"
         >
-          <X className="h-4 w-4 text-slate-400" />
+          <X className="h-4 w-4 text-faint" />
         </button>
       )}
     </div>

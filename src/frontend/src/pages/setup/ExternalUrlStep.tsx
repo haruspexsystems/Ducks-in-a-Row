@@ -86,6 +86,32 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
     return () => clearInterval(timer);
   }, [certPhase]);
 
+  // Mirror the certificate flow into the wizard state the shell's navigation
+  // reads. During the busy phases every fetch from this page fails (the
+  // service is down or restarting), and in continueElsewhere this origin
+  // never answers again, so the shell locks Back and replaces Next with the
+  // continue navigation. continueUnlocked resets on every phase change and
+  // is granted again below only when the countdown runs out, so a re-entry
+  // after a completed countdown starts locked.
+  useEffect(() => {
+    onUpdate({
+      urlStepBusy:
+        certPhase === 'enrolling' ||
+        certPhase === 'restarting' ||
+        certPhase === 'revalidating',
+      continueElsewhereUrl: certPhase === 'continueElsewhere' ? continueUrl : null,
+      continueUnlocked: false,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [certPhase, continueUrl]);
+
+  useEffect(() => {
+    if (certPhase === 'continueElsewhere' && continueCountdown === 0) {
+      onUpdate({ continueUnlocked: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [certPhase, continueCountdown]);
+
   const handleValidate = async () => {
     if (!state.externalUrl) return;
 
@@ -274,6 +300,10 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
   const selectedTemplate = state.selectedTemplates[0];
   const certBusy =
     certPhase === 'enrolling' || certPhase === 'restarting' || certPhase === 'revalidating';
+  // Once the continue panel shows, this origin is done for: editing the URL
+  // resets the phase to idle, which would unlock Next against a page whose
+  // every fetch fails. Freeze the input instead; the panel says where to go.
+  const frozen = certPhase === 'continueElsewhere';
 
   // Trailing slashes are stripped like ReviewStep does for the real
   // directory URL, so the preview never shows a double slash.
@@ -284,22 +314,22 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-xl font-bold text-slate-900">External URL</h2>
-        <p className="text-sm text-slate-500 mt-1">
+        <h2 className="text-xl font-bold text-ink">External URL</h2>
+        <p className="text-sm text-muted mt-1">
           This is the base URL that ACME clients will use to reach the Ducks in a Row server.
           It must be reachable from every machine that needs to request certificates.
         </p>
       </div>
 
-      <div className="bg-slate-50 border border-slate-200 rounded-lg p-4">
+      <div className="bg-sunken border border-hairline rounded-lg p-4">
         <div className="flex items-start gap-3">
-          <Globe className="h-5 w-5 text-slate-400 mt-0.5" />
-          <div className="text-sm text-slate-700 space-y-1">
+          <Globe className="h-5 w-5 text-faint mt-0.5" />
+          <div className="text-sm text-ink-soft space-y-1">
             <p>ACME clients will construct directory URLs like:</p>
-            <code className="block bg-white border border-slate-200 rounded px-3 py-1.5 text-xs font-mono text-certus-700 mt-1">
+            <code className="block bg-surface border border-hairline rounded px-3 py-1.5 text-xs font-mono text-certus-700 dark:text-certus-300 mt-1">
               {directoryPreview}
             </code>
-            <p className="text-xs text-slate-500 mt-2">
+            <p className="text-xs text-muted mt-2">
               Use HTTPS for production, and include the port. The service listens on 5001 for
               HTTPS (5000 for HTTP) instead of 443, because IIS and the ADCS web roles often
               occupy 443 on Windows servers and a port collision would stop the service from
@@ -311,7 +341,7 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
       </div>
 
       <div className="space-y-3">
-        <label className="block text-sm font-medium text-slate-700">
+        <label className="block text-sm font-medium text-ink-soft">
           Server URL
         </label>
         <div className="flex gap-2">
@@ -319,14 +349,16 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
             type="url"
             value={state.externalUrl}
             onChange={(e) => handleUrlChange(e.target.value)}
+            disabled={frozen}
             placeholder="https://certus.example.com:5001"
-            className="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm
-                       placeholder:text-slate-400 focus:outline-none focus:ring-2
-                       focus:ring-certus-500 focus:border-certus-500"
+            className="flex-1 px-3 py-2 border border-hairline-strong rounded-lg text-sm
+                       placeholder:text-faint focus:outline-none focus:ring-2
+                       focus:ring-certus-500 focus:border-certus-500
+                       disabled:opacity-50 disabled:cursor-not-allowed"
           />
           <button
             onClick={handleValidate}
-            disabled={validating || certBusy || !state.externalUrl}
+            disabled={validating || certBusy || frozen || !state.externalUrl}
             className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white
                        bg-certus-600 rounded-lg hover:bg-certus-700 disabled:opacity-50 transition-colors"
           >
@@ -341,13 +373,13 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
 
       {/* Validation success. The copy states only what was actually checked. */}
       {state.urlValidated && !probeFailed && (
-        <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-4 flex items-start gap-3">
+        <div className="bg-emerald-50 dark:bg-emerald-500/10 border border-emerald-200 dark:border-emerald-500/30 rounded-lg p-4 flex items-start gap-3">
           <CheckCircle2 className="h-5 w-5 text-emerald-600 mt-0.5" />
           <div>
-            <p className="text-sm font-semibold text-emerald-900">
+            <p className="text-sm font-semibold text-emerald-900 dark:text-emerald-200">
               {probe?.reachable ? 'Server reachable' : 'URL accepted'}
             </p>
-            <p className="text-xs text-emerald-700 mt-0.5">
+            <p className="text-xs text-emerald-700 dark:text-emerald-300 mt-0.5">
               {probe?.reachable
                 ? `The server answered at ${probe.dialedAuthority}. `
                 : probe && !probe.attempted
@@ -363,29 +395,29 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
       {/* The probe could not reach the URL: warn, explain, offer an explicit
           confirm. Never a hard block. */}
       {probeFailed && (
-        <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 flex items-start gap-3">
+        <div className="bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/30 rounded-lg p-4 flex items-start gap-3">
           <ShieldAlert className="h-5 w-5 text-amber-600 mt-0.5" />
           <div className="space-y-2">
-            <p className="text-sm font-semibold text-amber-900">
+            <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">
               The URL did not answer from the server
             </p>
-            <p className="text-sm text-amber-800">{probe?.failureDetail}</p>
-            <p className="text-xs text-amber-700">
+            <p className="text-sm text-amber-800 dark:text-amber-300">{probe?.failureDetail}</p>
+            <p className="text-xs text-amber-700 dark:text-amber-300">
               This usually means the URL is missing the port the service listens on.
               It can still be correct when a reverse proxy or NAT rule forwards{' '}
               <code className="font-mono">{probe?.dialedAuthority}</code> to the service,
               because such setups can be unreachable from the server itself.
             </p>
             {state.urlValidated ? (
-              <p className="text-xs font-semibold text-amber-900">
+              <p className="text-xs font-semibold text-amber-900 dark:text-amber-200">
                 Confirmed. Setup will use this URL as entered.
               </p>
             ) : (
               <button
                 onClick={handleConfirmAnyway}
                 className="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold
-                           text-amber-900 bg-amber-100 border border-amber-300 rounded-lg
-                           hover:bg-amber-200 transition-colors"
+                           text-amber-900 dark:text-amber-200 bg-amber-100 dark:bg-amber-500/15 border border-amber-300 rounded-lg
+                           hover:bg-amber-200 dark:bg-amber-500/25 transition-colors"
               >
                 Use this URL anyway
               </button>
@@ -398,14 +430,14 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
           validate (the shipped self signed fallback does not). Offer to
           enroll a real one from the CA with the selected template. */}
       {certificateWarning && certPhase === 'idle' && (
-        <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 flex items-start gap-3">
+        <div className="bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/30 rounded-lg p-4 flex items-start gap-3">
           <ShieldAlert className="h-5 w-5 text-amber-600 mt-0.5" />
           <div className="space-y-2">
-            <p className="text-sm font-semibold text-amber-900">
+            <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">
               The server's TLS certificate is not trusted
             </p>
-            <p className="text-sm text-amber-800">{certificateWarning}</p>
-            <p className="text-xs text-amber-700">
+            <p className="text-sm text-amber-800 dark:text-amber-300">{certificateWarning}</p>
+            <p className="text-xs text-amber-700 dark:text-amber-300">
               Ducks in a Row can request a certificate for{' '}
               <code className="font-mono">{new URL(state.externalUrl || 'https://x').hostname}</code>{' '}
               from your CA right now, install it, and restart itself to serve it. This also
@@ -423,7 +455,7 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
               Get a certificate using the {selectedTemplate} template
             </button>
             {certMessage && (
-              <p className="text-xs text-red-700 whitespace-pre-line">{certMessage}</p>
+              <p className="text-xs text-red-700 dark:text-red-300 whitespace-pre-line">{certMessage}</p>
             )}
           </div>
         </div>
@@ -431,15 +463,15 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
 
       {/* Certificate flow progress */}
       {certBusy && (
-        <div className="bg-slate-50 border border-slate-200 rounded-lg p-4 flex items-start gap-3">
+        <div className="bg-sunken border border-hairline rounded-lg p-4 flex items-start gap-3">
           <Loader2 className="h-5 w-5 text-certus-500 mt-0.5 animate-spin" />
           <div>
-            <p className="text-sm font-semibold text-slate-900">
+            <p className="text-sm font-semibold text-ink">
               {certPhase === 'enrolling' && 'Requesting a certificate from the CA'}
               {certPhase === 'restarting' && 'Certificate installed, the service is restarting'}
               {certPhase === 'revalidating' && 'Service is back, checking the URL again'}
             </p>
-            <p className="text-xs text-slate-500 mt-0.5">
+            <p className="text-xs text-muted mt-0.5">
               {certPhase === 'restarting'
                 ? 'This page reconnects automatically; it usually takes a few seconds.'
                 : 'This should only take a moment.'}
@@ -451,20 +483,20 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
       {/* Issued certificate does not cover the external URL host (template
           builds the subject from AD). Explicit decision, never automatic. */}
       {certPhase === 'mismatch' && mismatch && (
-        <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 flex items-start gap-3">
+        <div className="bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/30 rounded-lg p-4 flex items-start gap-3">
           <ShieldAlert className="h-5 w-5 text-amber-600 mt-0.5" />
           <div className="space-y-2">
-            <p className="text-sm font-semibold text-amber-900">
+            <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">
               The issued certificate does not match the server URL
             </p>
-            <p className="text-sm text-amber-800">
+            <p className="text-sm text-amber-800 dark:text-amber-300">
               The CA issued a certificate for{' '}
               <code className="font-mono">{mismatch.issuedNames.join(', ') || '(no names)'}</code>,
               but the server URL host is{' '}
               <code className="font-mono">{new URL(state.externalUrl || 'https://x').hostname}</code>.
               ACME clients checking that URL would reject it.
             </p>
-            <p className="text-xs text-amber-700">
+            <p className="text-xs text-amber-700 dark:text-amber-300">
               This happens when the template builds the subject from Active Directory. Either
               change the server URL to match the issued name, or select "Supply in the request"
               on the Subject Name tab of the template in the Certificate Templates console and
@@ -474,22 +506,22 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
               <button
                 onClick={handleApplyMismatched}
                 className="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold
-                           text-amber-900 bg-amber-100 border border-amber-300 rounded-lg
-                           hover:bg-amber-200 transition-colors"
+                           text-amber-900 dark:text-amber-200 bg-amber-100 dark:bg-amber-500/15 border border-amber-300 rounded-lg
+                           hover:bg-amber-200 dark:bg-amber-500/25 transition-colors"
               >
                 Install it anyway
               </button>
               <button
                 onClick={handleDiscardMismatched}
                 className="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold
-                           text-slate-700 bg-white border border-slate-300 rounded-lg
-                           hover:bg-slate-50 transition-colors"
+                           text-ink-soft bg-surface border border-hairline-strong rounded-lg
+                           hover:bg-sunken transition-colors"
               >
                 Discard the certificate
               </button>
             </div>
             {certMessage && (
-              <p className="text-xs text-red-700 whitespace-pre-line">{certMessage}</p>
+              <p className="text-xs text-red-700 dark:text-red-300 whitespace-pre-line">{certMessage}</p>
             )}
           </div>
         </div>
@@ -498,13 +530,13 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
       {/* The new certificate does not cover the host this page is on; after
           the restart this origin stops answering TLS for this browser. */}
       {certPhase === 'continueElsewhere' && continueUrl && (
-        <div className="bg-certus-50 border border-certus-200 rounded-lg p-4 flex items-start gap-3">
+        <div className="bg-certus-50 dark:bg-certus-500/10 border border-certus-200 dark:border-certus-500/30 rounded-lg p-4 flex items-start gap-3">
           <ExternalLink className="h-5 w-5 text-certus-600 mt-0.5" />
           <div className="space-y-2">
-            <p className="text-sm font-semibold text-certus-900">
+            <p className="text-sm font-semibold text-certus-900 dark:text-certus-200">
               Certificate installed, continue at the server URL
             </p>
-            <p className="text-sm text-certus-800">
+            <p className="text-sm text-certus-800 dark:text-certus-300">
               The service is restarting with the new certificate. It does not cover{' '}
               <code className="font-mono">{window.location.hostname}</code>, so this page will
               lose its connection. Your progress is saved; continue setup at:
@@ -528,16 +560,16 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
               </a>
             )}
             {continueCountdown > 0 ? (
-              <p className="text-xs text-certus-700">
+              <p className="text-xs text-certus-700 dark:text-certus-300">
                 The service is restarting. The link unlocks in {continueCountdown}s.
               </p>
             ) : (
-              <p className="text-xs text-certus-700">
+              <p className="text-xs text-certus-700 dark:text-certus-300">
                 The service should be back now. If the page does not answer, wait a few
                 seconds and try again. Your progress is saved.
               </p>
             )}
-            <p className="text-xs text-certus-700">
+            <p className="text-xs text-certus-700 dark:text-certus-300">
               If the browser warns about the certificate at the new address, the machine you
               are browsing from does not trust your CA root certificate yet. Domain machines
               receive it through Group Policy (run{' '}
@@ -550,13 +582,13 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
 
       {/* Console/development run: installed but the service cannot restart itself. */}
       {certPhase === 'manualRestart' && (
-        <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 flex items-start gap-3">
+        <div className="bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/30 rounded-lg p-4 flex items-start gap-3">
           <AlertTriangle className="h-5 w-5 text-amber-600 mt-0.5" />
           <div>
-            <p className="text-sm font-semibold text-amber-900">
+            <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">
               Certificate installed, restart needed
             </p>
-            <p className="text-xs text-amber-700 mt-0.5">
+            <p className="text-xs text-amber-700 dark:text-amber-300 mt-0.5">
               The service could not restart itself. Restart it manually
               (<code className="font-mono">Restart-Service DucksInARow</code>), then validate
               the URL again.
@@ -567,13 +599,13 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
 
       {/* Certificate flow finished and the URL was re validated. */}
       {certPhase === 'installed' && (
-        <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-4 flex items-start gap-3">
+        <div className="bg-emerald-50 dark:bg-emerald-500/10 border border-emerald-200 dark:border-emerald-500/30 rounded-lg p-4 flex items-start gap-3">
           <BadgeCheck className="h-5 w-5 text-emerald-600 mt-0.5" />
           <div>
-            <p className="text-sm font-semibold text-emerald-900">
+            <p className="text-sm font-semibold text-emerald-900 dark:text-emerald-200">
               Certificate installed and in use
             </p>
-            <p className="text-xs text-emerald-700 mt-0.5">
+            <p className="text-xs text-emerald-700 dark:text-emerald-300 mt-0.5">
               {certificateWarning
                 ? 'The service restarted with the new certificate, but it still does not ' +
                   'validate from the server itself — check that this machine trusts your ' +
@@ -586,11 +618,11 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
 
       {/* Warnings */}
       {warnings.length > 0 && (
-        <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 flex items-start gap-3">
+        <div className="bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/30 rounded-lg p-4 flex items-start gap-3">
           <AlertTriangle className="h-5 w-5 text-amber-600 mt-0.5" />
           <div>
-            <p className="text-sm font-semibold text-amber-900">Warnings</p>
-            <ul className="text-sm text-amber-700 mt-1 list-disc list-inside">
+            <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">Warnings</p>
+            <ul className="text-sm text-amber-700 dark:text-amber-300 mt-1 list-disc list-inside">
               {warnings.map((w, i) => <li key={i}>{w}</li>)}
             </ul>
           </div>
@@ -599,9 +631,9 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
 
       {/* Error */}
       {error && (
-        <div className="bg-red-50 border border-red-200 rounded-lg p-4 flex items-start gap-3">
+        <div className="bg-red-50 dark:bg-red-500/10 border border-red-200 dark:border-red-500/30 rounded-lg p-4 flex items-start gap-3">
           <AlertTriangle className="h-5 w-5 text-red-500 mt-0.5" />
-          <p className="text-sm text-red-700">{error}</p>
+          <p className="text-sm text-red-700 dark:text-red-300">{error}</p>
         </div>
       )}
     </div>

@@ -23,6 +23,10 @@ public class Http01ChallengeValidatorTests
         new(new HttpClient(new MockHttpHandler(handler)),
             NullLogger<Http01ChallengeValidator>.Instance);
 
+    private static ChallengeValidationContext Context(
+        string domain = TestDomain, string token = TestToken, string thumbprint = TestThumbprint) =>
+        new("dns", domain, token, thumbprint, "test-template");
+
     [Fact]
     public void ChallengeType_IsHttp01()
     {
@@ -45,7 +49,7 @@ public class Http01ChallengeValidatorTests
             };
         });
 
-        var result = await sut.ValidateAsync(TestDomain, TestToken, TestThumbprint);
+        var result = await sut.ValidateAsync(Context());
 
         result.IsValid.Should().BeTrue();
         requestedUrl.Should().Be($"http://{TestDomain}/.well-known/acme-challenge/{TestToken}");
@@ -59,7 +63,7 @@ public class Http01ChallengeValidatorTests
             Content = new StringContent("not-the-key-authorization")
         });
 
-        var result = await sut.ValidateAsync(TestDomain, TestToken, TestThumbprint);
+        var result = await sut.ValidateAsync(Context());
 
         result.IsValid.Should().BeFalse();
         result.Transient.Should().BeFalse(); // a wrong answer is genuine, not retryable
@@ -71,7 +75,7 @@ public class Http01ChallengeValidatorTests
     {
         var sut = CreateValidator(_ => new HttpResponseMessage(HttpStatusCode.NotFound));
 
-        var result = await sut.ValidateAsync(TestDomain, TestToken, TestThumbprint);
+        var result = await sut.ValidateAsync(Context());
 
         result.IsValid.Should().BeFalse();
         result.Transient.Should().BeFalse(); // the server answered; 404 is a genuine failure
@@ -86,7 +90,7 @@ public class Http01ChallengeValidatorTests
         var sut = CreateValidator(_ => throw new HttpRequestException(
             "blocked", new AddressBlockedException("blocked.example.com")));
 
-        var result = await sut.ValidateAsync(TestDomain, TestToken, TestThumbprint);
+        var result = await sut.ValidateAsync(Context());
 
         result.IsValid.Should().BeFalse();
         result.Transient.Should().BeFalse();
@@ -98,7 +102,7 @@ public class Http01ChallengeValidatorTests
     {
         var sut = CreateValidator(_ => throw new HttpRequestException("connection refused"));
 
-        var result = await sut.ValidateAsync(TestDomain, TestToken, TestThumbprint);
+        var result = await sut.ValidateAsync(Context());
 
         result.IsValid.Should().BeFalse();
         result.Transient.Should().BeTrue(); // no response received — a transport failure
@@ -111,7 +115,7 @@ public class Http01ChallengeValidatorTests
         // A timeout surfaces as TaskCanceledException while the caller's token is not cancelled.
         var sut = CreateValidator(_ => throw new TaskCanceledException());
 
-        var result = await sut.ValidateAsync(TestDomain, TestToken, TestThumbprint);
+        var result = await sut.ValidateAsync(Context());
 
         result.IsValid.Should().BeFalse();
         result.Transient.Should().BeTrue();

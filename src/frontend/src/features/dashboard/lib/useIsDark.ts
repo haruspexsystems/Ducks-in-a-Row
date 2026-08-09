@@ -4,9 +4,13 @@ import { useEffect, useState } from 'react';
  * Reactively reports whether the dashboard is in dark mode, so SVG charts can
  * pick the right (non-class) colors. Driven solely by Tailwind's `class`
  * strategy (a `.dark` class on <html>), so the charts always stay in lockstep
- * with the page. There is no dark mode toggle in this MVP, so this is false in
- * practice; the OS preference fallback was removed to avoid dark charts on a
- * light page (a dark toggle is tracked in the delta doc).
+ * with the page.
+ *
+ * The class is written by `lib/theme.ts` (the header toggle) and seeded before
+ * first paint by `public/theme-init.js`. Do not reintroduce a
+ * `prefers-color-scheme` fallback here: the OS preference is read once, at
+ * seeding time, and a live media query is what would let these charts render
+ * dark on a light page.
  */
 export function useIsDark(): boolean {
   const read = () => {

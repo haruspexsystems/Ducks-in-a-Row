@@ -191,7 +191,7 @@ public sealed class CaCertificatesController : ControllerBase
             return null;
         }
 
-        return derChain.Select(der => new X509Certificate2(der)).ToList();
+        return derChain.Select(der => X509CertificateLoader.LoadCertificate(der)).ToList();
     }
 
     private ObjectResult CaUnavailable() => StatusCode(503, new

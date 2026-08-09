@@ -23,6 +23,17 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The synthetic attestation and device CSR builders are shared with
+         Certus.Core.Tests as source links: that project targets
+         net10.0-windows (for Certus.Adcs), so this net10.0 project cannot
+         reference its assembly. -->
+    <Compile Include="..\Certus.Core.Tests\Acme\Attestation\SyntheticAttestationBuilder.cs"
+             Link="DeviceAttest\SyntheticAttestationBuilder.cs" />
+    <Compile Include="..\Certus.Core.Tests\Acme\Attestation\DeviceCsrBuilder.cs"
+             Link="DeviceAttest\DeviceCsrBuilder.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Using Include="Xunit" />
     <Using Include="FluentAssertions" />
   </ItemGroup>

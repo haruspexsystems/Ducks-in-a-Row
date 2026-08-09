@@ -5,25 +5,40 @@
 
   <ItemGroup>
     <!-- Entity Framework Core + SQLite -->
-    <PackageVersion Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.13" />
-    <PackageVersion Include="Microsoft.EntityFrameworkCore.Design" Version="8.0.13" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.10" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.10" />
 
-    <!-- Registry read of the installer chosen data directory. Certus.Core
-         targets plain net8.0, so the registry API needs the package (the
-         net8.0-windows projects get it from the framework). -->
-    <PackageVersion Include="Microsoft.Win32.Registry" Version="5.0.0" />
+    <!-- EF Sqlite 10.0.10 pulls SQLitePCLRaw.bundle_e_sqlite3 2.1.11, whose
+         native SQLite carries the high severity advisory GHSA-2m69-gcr7-jv3q
+         (vulnerable at and below 2.1.11). Certus.Core references the bundle
+         directly to lift the whole SQLitePCLRaw set to 2.1.12, the first
+         version outside the advisory range, staying on the 2.1.x line EF
+         targets rather than the 3.x major. -->
+    <PackageVersion Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.12" />
 
     <!-- Settings overlay (settings.json in the data directory) written by the
          setup wizard and inserted into host configuration by Certus.Core. -->
-    <PackageVersion Include="Microsoft.Extensions.Configuration.Json" Version="8.0.1" />
+    <PackageVersion Include="Microsoft.Extensions.Configuration.Json" Version="10.0.10" />
 
-    <!-- Logging -->
-    <PackageVersion Include="Serilog.AspNetCore" Version="8.0.3" />
-    <PackageVersion Include="Serilog.Sinks.Console" Version="6.0.0" />
-    <PackageVersion Include="Serilog.Sinks.File" Version="6.0.0" />
+    <!-- Logging. The sink pins are the floors Serilog.AspNetCore 10.0.0
+         declares; lower pins fail restore as NU1605 downgrades. -->
+    <PackageVersion Include="Serilog.AspNetCore" Version="10.0.0" />
+    <PackageVersion Include="Serilog.Sinks.Console" Version="6.1.1" />
+    <PackageVersion Include="Serilog.Sinks.File" Version="7.0.0" />
 
     <!-- Crypto (JWS/JWK, X.509, CSR) -->
     <PackageVersion Include="BouncyCastle.Cryptography" Version="2.6.2" />
+
+    <!-- CBOR parsing for ACME device-attest-01 attestation objects
+         (draft-ietf-acme-device-attest-08). First party parser; the
+         attestation verifier consumes it. -->
+    <PackageVersion Include="System.Formats.Cbor" Version="10.0.10" />
+
+    <!-- Encryption at rest for EAB MAC secrets. The hosts get the Data
+         Protection implementation from the ASP.NET Core shared framework;
+         Certus.Core (plain net10.0) needs only the abstractions for its
+         ISecretProtector implementation. -->
+    <PackageVersion Include="Microsoft.AspNetCore.DataProtection.Abstractions" Version="10.0.10" />
 
     <!-- DNS resolution for ACME DNS-01 challenge validation -->
     <PackageVersion Include="DnsClient" Version="1.8.0" />
@@ -35,15 +50,19 @@
     <PackageVersion Include="MimeKit" Version="4.16.0" />
 
     <!-- Windows Service hosting -->
-    <PackageVersion Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.1" />
+    <PackageVersion Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.10" />
 
     <!-- Windows Integrated Authentication (Negotiate / Kerberos / NTLM) for the
-         dashboard and setup APIs (issue #27, SEC-F1) -->
-    <PackageVersion Include="Microsoft.AspNetCore.Authentication.Negotiate" Version="8.0.13" />
+         dashboard and setup APIs (issue #27, SEC-F1). History: the 8.0.x era
+         pinned 8.0.29, the first 8.0.x clearing the Negotiate handler
+         advisories GHSA-2p3q-h3hg-jcqq (CVE-2026-47303) and GHSA-8prm-248r-h957
+         (CVE-2026-47300), which affected 8.0.0 through 8.0.28 (issues #149,
+         #165). Every 10.0.x release postdates both fixes. -->
+    <PackageVersion Include="Microsoft.AspNetCore.Authentication.Negotiate" Version="10.0.10" />
 
     <!-- Active Directory lookup for ADCS template displayName resolution
-         (issue #17). Windows-only; Certus.Adcs already targets net8.0-windows. -->
-    <PackageVersion Include="System.DirectoryServices" Version="8.0.0" />
+         (issue #17). Windows-only; Certus.Adcs already targets net10.0-windows. -->
+    <PackageVersion Include="System.DirectoryServices" Version="10.0.10" />
 
     <!-- Testing -->
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
@@ -51,7 +70,7 @@
     <PackageVersion Include="xunit.runner.visualstudio" Version="2.8.2" />
     <PackageVersion Include="NSubstitute" Version="5.3.0" />
     <PackageVersion Include="FluentAssertions" Version="7.1.0" />
-    <PackageVersion Include="Microsoft.AspNetCore.Mvc.Testing" Version="8.0.13" />
+    <PackageVersion Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.10" />
     <PackageVersion Include="coverlet.collector" Version="6.0.2" />
   </ItemGroup>
 </Project>

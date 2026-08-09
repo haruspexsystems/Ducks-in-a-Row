@@ -13,7 +13,7 @@
   Build (normally via build.ps1, which supplies ProductVersion from
   Directory.Build.props):
     dotnet publish src/Certus.Service -c Release -r win-x64
-    wix build installer/Certus.wxs -d ProductVersion=0.1.0.0 -o artifacts/Ducks-in-a-Row.msi -bindpath artifacts/publish
+    wix build installer/Certus.wxs -d ProductVersion=0.10.0.0 -o artifacts/Ducks-in-a-Row.msi -bindpath artifacts/publish
 -->
 
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
@@ -23,7 +23,7 @@
 
   <!-- Fallback for direct wix invocations; build.ps1 always defines it. -->
   <?ifndef ProductVersion ?>
-  <?define ProductVersion = "0.1.0.0" ?>
+  <?define ProductVersion = "0.10.0.0" ?>
   <?endif ?>
 
   <Package

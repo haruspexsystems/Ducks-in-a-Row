@@ -21,8 +21,13 @@ public sealed class ChallengeValidationService : BackgroundService
     private readonly ILogger<ChallengeValidationService> _logger;
     private readonly ChallengeValidationOptions _options;
 
-    /// <summary>How often to poll for pending challenges.</summary>
-    private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(5);
+    /// <summary>
+    /// How often to poll for pending challenges. Configured through
+    /// <see cref="ChallengeValidationOptions.PollIntervalSeconds"/> (default 5),
+    /// clamped so a bad value can neither spin the database nor stall
+    /// validation for good.
+    /// </summary>
+    private readonly TimeSpan _pollInterval;
 
     public ChallengeValidationService(
         IServiceScopeFactory scopeFactory,
@@ -32,6 +37,8 @@ public sealed class ChallengeValidationService : BackgroundService
         _scopeFactory = scopeFactory;
         _logger = logger;
         _options = options.Value;
+        _pollInterval = TimeSpan.FromSeconds(
+            Math.Clamp(_options.PollIntervalSeconds, 0.1, 3600));
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -55,7 +62,7 @@ public sealed class ChallengeValidationService : BackgroundService
 
             try
             {
-                await Task.Delay(PollInterval, stoppingToken);
+                await Task.Delay(_pollInterval, stoppingToken);
             }
             catch (OperationCanceledException)
             {
@@ -72,6 +79,7 @@ public sealed class ChallengeValidationService : BackgroundService
         var db = scope.ServiceProvider.GetRequiredService<CertusDbContext>();
         var validators = scope.ServiceProvider.GetServices<IChallengeValidator>();
         var orderService = scope.ServiceProvider.GetRequiredService<OrderService>();
+        var auditService = scope.ServiceProvider.GetRequiredService<DomainPolicyAuditService>();
 
         // Find all challenges in "processing" state
         var challenges = await db.AcmeChallenges
@@ -90,7 +98,8 @@ public sealed class ChallengeValidationService : BackgroundService
 
         foreach (var challenge in challenges)
         {
-            await ValidateSingleChallengeAsync(db, validators, orderService, challenge, cancellationToken);
+            await ValidateSingleChallengeAsync(
+                db, validators, orderService, auditService, challenge, cancellationToken);
         }
     }
 
@@ -98,6 +107,7 @@ public sealed class ChallengeValidationService : BackgroundService
         CertusDbContext db,
         IEnumerable<IChallengeValidator> validators,
         OrderService orderService,
+        DomainPolicyAuditService auditService,
         Data.Entities.AcmeChallenge challenge,
         CancellationToken cancellationToken)
     {
@@ -140,7 +150,14 @@ public sealed class ChallengeValidationService : BackgroundService
 
         challenge.LastAttemptAt = DateTime.UtcNow;
         var result = await validator.ValidateAsync(
-            domain, challenge.Token, accountThumbprint, cancellationToken);
+            new ChallengeValidationContext(
+                authz.IdentifierType,
+                authz.IdentifierValue,
+                challenge.Token,
+                accountThumbprint,
+                order.TemplateId,
+                challenge.AttestationObject),
+            cancellationToken);
 
         if (result.IsValid)
         {
@@ -148,6 +165,16 @@ public sealed class ChallengeValidationService : BackgroundService
             challenge.ValidatedAt = DateTime.UtcNow;
             // At least one valid challenge makes the authorization valid.
             authz.Status = "valid";
+
+            // A device attestation carries the attested identity; persist it on the
+            // authorization so finalize can bind the CSR key to the attested key.
+            if (result.Attested is { } attested)
+            {
+                authz.AttestedSpki = attested.SpkiBase64;
+                authz.AttestationFormat = attested.Format;
+                authz.AttestedPropertiesJson = attested.PropertiesJson;
+            }
+
             _logger.LogInformation(
                 "Challenge {ChallengeId} ({Type}) for {Domain} validated successfully",
                 challenge.ChallengeId, challenge.Type, domain);
@@ -171,8 +198,10 @@ public sealed class ChallengeValidationService : BackgroundService
             challenge.Status = "invalid";
             challenge.ErrorJson = JsonSerializer.Serialize(new AcmeError
             {
-                // Distinguish "we never got a usable answer" from "the answer was wrong".
-                Type = result.Transient ? AcmeErrorType.Connection : AcmeErrorType.IncorrectResponse,
+                // A validator supplied type (badAttestationStatement) wins; otherwise
+                // distinguish "we never got a usable answer" from "the answer was wrong".
+                Type = result.ErrorType
+                    ?? (result.Transient ? AcmeErrorType.Connection : AcmeErrorType.IncorrectResponse),
                 Detail = result.ErrorDetail ?? "Challenge validation failed."
             });
 
@@ -189,5 +218,24 @@ public sealed class ChallengeValidationService : BackgroundService
 
         // Recalculate order status using the scoped OrderService (real logger and ADCS client).
         await orderService.RecalculateOrderStatusAsync(authz.OrderId, cancellationToken);
+
+        // A terminal device attestation failure gets an audit row, like a domain
+        // policy refusal at newOrder or finalize: the challenge turning invalid is
+        // otherwise visible only in this log. Last in the unit on purpose: RecordAsync
+        // is best effort on the shared scoped DbContext, and a failed audit insert
+        // would stay tracked, so nothing that matters may save after it. No client
+        // address here: the worker validates asynchronously.
+        if (!result.IsValid && challenge.Status == "invalid"
+            && challenge.Type == DeviceAttest01ChallengeValidator.TypeName)
+        {
+            await auditService.RecordAsync(
+                order.Account.AccountId,
+                order.TemplateId,
+                new[] { new AcmeIdentifier { Type = authz.IdentifierType, Value = authz.IdentifierValue } },
+                new[] { authz.IdentifierValue },
+                clientIp: null,
+                stage: "challenge-device",
+                cancellationToken);
+        }
     }
 }

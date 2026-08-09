@@ -37,6 +37,11 @@ export interface SetupConfigResponse {
    * on, e.g. "https://certus.home.local:5001".
    */
   suggestedExternalUrl?: string;
+  /** The domain restriction recorded in the wizard file (draft or completed). */
+  allowedDomainsEnabled?: boolean;
+  allowedDomains?: string[];
+  /** The machine's AD domain as an allowed domain suggestion; null in a workgroup. */
+  suggestedAllowedDomain?: string | null;
   /**
    * The step id a saved draft should resume at ('url', 'review'). Null when
    * no draft recorded one or setup is complete.
@@ -183,6 +188,8 @@ export async function saveWizardDraft(draft: {
   caConnectionString?: string;
   enabledTemplates?: string[];
   externalUrl?: string;
+  allowedDomainsEnabled?: boolean;
+  allowedDomains?: string[];
   wizardStep?: string;
 }): Promise<void> {
   await fetchJson('/api/setup/draft', {
@@ -236,6 +243,8 @@ export async function completeSetup(config: {
   caConnectionString?: string;
   enabledTemplates: string[];
   externalUrl: string;
+  allowedDomainsEnabled?: boolean;
+  allowedDomains?: string[];
   confirmUnreachableExternalUrl?: boolean;
 }): Promise<SetupCompleteOutcome> {
   const url = '/api/setup/complete';
@@ -248,7 +257,10 @@ export async function completeSetup(config: {
     return { kind: 'unreachableUrl', refusal: (await response.json()) as SetupUnreachableUrlResponse };
   }
   if (!response.ok) {
-    throw new ApiError(response.status, response.statusText, url);
+    // The server sends the actual reason as { error } (a validation message
+    // or the setup lock); show that instead of the bare status text.
+    const body = (await response.json().catch(() => null)) as { error?: string } | null;
+    throw new ApiError(response.status, body?.error ?? response.statusText, url);
   }
   return { kind: 'completed', result: (await response.json()) as SetupCompleteResult };
 }

@@ -20,6 +20,7 @@ const VERB: Record<ActivityType, string> = {
   expired: 'Expired',
   revoked: 'Revoked',
   warning: 'Warning',
+  rejected: 'Rejected',
 };
 
 const columnHelper = createColumnHelper<ActivityItem>();

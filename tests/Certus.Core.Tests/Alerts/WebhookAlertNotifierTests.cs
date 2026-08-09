@@ -161,6 +161,159 @@ public class WebhookAlertNotifierTests
         sut.IsEnabled.Should().BeTrue();
     }
 
+    [Fact]
+    public async Task SendTestAlert_PostsTheDistinctTestEvent()
+    {
+        // A receiver must be able to tell a test from a real warning without
+        // guessing. The event name says so and the boolean says so again, so a
+        // handler can filter on either.
+        string? body = null;
+        var handler = new MockHttpHandler((request) =>
+        {
+            body = request.Content?.ReadAsStringAsync().Result;
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK);
+        });
+
+        var options = Options.Create(new AlertOptions
+        {
+            Webhook = new WebhookOptions { Url = "https://hooks.example.com/alerts" }
+        });
+        var sut = new WebhookAlertNotifier(
+            options, new HttpClient(handler), NullLogger<WebhookAlertNotifier>.Instance);
+
+        var result = await sut.SendTestAlertAsync(new TestAlert("CONTOSO\\alice", DateTime.UtcNow));
+
+        result.Success.Should().BeTrue();
+        var payload = JsonSerializer.Deserialize<JsonElement>(body!);
+        payload.GetProperty("event").GetString().Should().Be("test.alert");
+        payload.GetProperty("test").GetBoolean().Should().BeTrue();
+        // No certificate list at all, so a receiver that blindly iterates
+        // certificates fails loudly rather than filing a fake expiry warning.
+        payload.TryGetProperty("certificates", out _).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task SendTestAlert_PayloadDoesNotCarryTheTriggeringUser()
+    {
+        // This body goes to whatever third party relay the operator configured.
+        // A directory account name in it would make the test button a small
+        // username disclosure channel.
+        string? body = null;
+        var handler = new MockHttpHandler((request) =>
+        {
+            body = request.Content?.ReadAsStringAsync().Result;
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK);
+        });
+
+        var options = Options.Create(new AlertOptions
+        {
+            Webhook = new WebhookOptions { Url = "https://hooks.example.com/alerts" }
+        });
+        var sut = new WebhookAlertNotifier(
+            options, new HttpClient(handler), NullLogger<WebhookAlertNotifier>.Instance);
+
+        await sut.SendTestAlertAsync(new TestAlert("CONTOSO\\alice", DateTime.UtcNow));
+
+        body.Should().NotContain("alice");
+        body.Should().NotContain("CONTOSO");
+    }
+
+    [Fact]
+    public async Task SendTestAlert_IsHmacSignedIdenticallyToARealAlert()
+    {
+        // The point of the test send is to exercise the path a real alert takes.
+        // A test that skipped signing would prove nothing about it.
+        string? signatureHeader = null;
+        string? body = null;
+
+        var handler = new MockHttpHandler((request) =>
+        {
+            signatureHeader = request.Headers.TryGetValues("X-Certus-Signature", out var values)
+                ? values.First() : null;
+            body = request.Content?.ReadAsStringAsync().Result;
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK);
+        });
+
+        const string secret = "my-webhook-secret";
+        var options = Options.Create(new AlertOptions
+        {
+            Webhook = new WebhookOptions { Url = "https://hooks.example.com/alerts", Secret = secret }
+        });
+        var sut = new WebhookAlertNotifier(
+            options, new HttpClient(handler), NullLogger<WebhookAlertNotifier>.Instance);
+
+        await sut.SendTestAlertAsync(new TestAlert("CONTOSO\\alice", DateTime.UtcNow));
+
+        var expectedHash = HMACSHA256.HashData(
+            Encoding.UTF8.GetBytes(secret), Encoding.UTF8.GetBytes(body!));
+        signatureHeader.Should().Be($"sha256={Convert.ToHexString(expectedHash).ToLowerInvariant()}");
+    }
+
+    [Fact]
+    public async Task SendTestAlert_IncludesTheConfiguredCustomHeaders()
+    {
+        string? customHeader = null;
+        var handler = new MockHttpHandler((request) =>
+        {
+            customHeader = request.Headers.TryGetValues("X-Custom-Token", out var values)
+                ? values.First() : null;
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK);
+        });
+
+        var options = Options.Create(new AlertOptions
+        {
+            Webhook = new WebhookOptions
+            {
+                Url = "https://hooks.example.com/alerts",
+                Headers = new Dictionary<string, string> { ["X-Custom-Token"] = "bearer-token-123" }
+            }
+        });
+        var sut = new WebhookAlertNotifier(
+            options, new HttpClient(handler), NullLogger<WebhookAlertNotifier>.Instance);
+
+        await sut.SendTestAlertAsync(new TestAlert("CONTOSO\\alice", DateTime.UtcNow));
+
+        customHeader.Should().Be("bearer-token-123");
+    }
+
+    [Fact]
+    public async Task SendTestAlert_WhenNotConfigured_ReturnsFailure()
+    {
+        var options = Options.Create(new AlertOptions { Webhook = null });
+        var sut = new WebhookAlertNotifier(
+            options, new HttpClient(), NullLogger<WebhookAlertNotifier>.Instance);
+
+        var result = await sut.SendTestAlertAsync(new TestAlert("CONTOSO\\alice", DateTime.UtcNow));
+
+        result.Success.Should().BeFalse();
+        result.ErrorMessage.Should().Contain("not configured");
+    }
+
+    [Fact]
+    public async Task SendTestAlert_ReceiverRejects_ReportsTheStatusItAnswered()
+    {
+        // The dashboard keys off this prefix to tell "the endpoint was reached
+        // and answered badly" apart from "the request never arrived", so an
+        // operator is not sent off to fix a webhook that is delivering fine.
+        var handler = new MockHttpHandler((_) =>
+            new HttpResponseMessage(System.Net.HttpStatusCode.InternalServerError)
+            {
+                Content = new StringContent("cannot read certificates of undefined")
+            });
+
+        var options = Options.Create(new AlertOptions
+        {
+            Webhook = new WebhookOptions { Url = "https://hooks.example.com/alerts" }
+        });
+        var sut = new WebhookAlertNotifier(
+            options, new HttpClient(handler), NullLogger<WebhookAlertNotifier>.Instance);
+
+        var result = await sut.SendTestAlertAsync(new TestAlert("CONTOSO\\alice", DateTime.UtcNow));
+
+        result.Success.Should().BeFalse();
+        result.ErrorMessage.Should().StartWith("Webhook returned 500");
+    }
+
     /// <summary>Simple mock HTTP handler for testing.</summary>
     private class MockHttpHandler : HttpMessageHandler
     {

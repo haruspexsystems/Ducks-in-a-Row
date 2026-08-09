@@ -1,9 +1,11 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using System.Text.RegularExpressions;
+using Certus.Core.Adcs;
+using Certus.Core.Alerts;
 using Certus.Core.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace Certus.Core.Services;
 
@@ -20,15 +22,23 @@ public sealed class DashboardMetricsService
 {
     private readonly CertusDbContext _db;
     private readonly ILogger<DashboardMetricsService> _logger;
+    private readonly AlertOptions _alertOptions;
 
     /// <summary>The validation methods we always surface, in display order.</summary>
     private static readonly string[] CanonicalChallengeTypes =
-        { "http-01", "dns-01", "tls-alpn-01" };
+        { "http-01", "dns-01", "tls-alpn-01", "device-attest-01" };
 
-    public DashboardMetricsService(CertusDbContext db, ILogger<DashboardMetricsService> logger)
+    // IOptions rather than IOptionsMonitor, for the reason given on
+    // CertificateQueryService: the donut and the stat card beside it must read
+    // the same window as the alerting engine.
+    public DashboardMetricsService(
+        CertusDbContext db,
+        ILogger<DashboardMetricsService> logger,
+        IOptions<AlertOptions> alertOptions)
     {
         _db = db;
         _logger = logger;
+        _alertOptions = alertOptions.Value;
     }
 
     /// <summary>
@@ -38,13 +48,16 @@ public sealed class DashboardMetricsService
     public async Task<FleetHealthDto> GetFleetHealthAsync(CancellationToken cancellationToken = default)
     {
         var now = DateTime.UtcNow;
-        var in30Days = now.AddDays(30);
+        // Same operator-configured window the stat card beside this donut uses
+        // (issue #152). These two render on one screen, so a literal here would
+        // just relocate the contradiction rather than remove it.
+        var warningCutoff = now.AddDays(_alertOptions.ExpiryWarningDays);
 
         var valid = await _db.SyncedCertificates
-            .CountAsync(c => c.Status == "Issued" && c.NotAfter > in30Days, cancellationToken);
+            .CountAsync(c => c.Status == "Issued" && c.NotAfter > warningCutoff, cancellationToken);
 
         var expiring = await _db.SyncedCertificates
-            .CountAsync(c => c.Status == "Issued" && c.NotAfter <= in30Days && c.NotAfter > now, cancellationToken);
+            .CountAsync(c => c.Status == "Issued" && c.NotAfter <= warningCutoff && c.NotAfter > now, cancellationToken);
 
         var expired = await _db.SyncedCertificates
             .CountAsync(c => c.Status == "Issued" && c.NotAfter <= now, cancellationToken);
@@ -73,8 +86,9 @@ public sealed class DashboardMetricsService
 
     /// <summary>
     /// Count of successful validations grouped by challenge type. Always returns
-    /// all three canonical methods (zero when unused) so the widget is stable.
-    /// Reflects proxy-issued challenges only.
+    /// every canonical method (zero when unused) so the widget is stable.
+    /// device-attest-01 is included and reads zero on installs without a device
+    /// attestation profile. Reflects proxy-issued challenges only.
     /// </summary>
     public async Task<IReadOnlyList<ValidationMethodDto>> GetValidationMethodsAsync(
         CancellationToken cancellationToken = default)
@@ -93,12 +107,16 @@ public sealed class DashboardMetricsService
     }
 
     /// <summary>
-    /// A best effort recent activity feed synthesized from four sources:
-    /// issued ACME certificates, expiry alerts (warnings), certificates from
-    /// the synced inventory that have since expired, and certificates the CA
-    /// has revoked. Ordered newest first.
+    /// A best effort recent activity feed from five sources: issued ACME
+    /// certificates, expiry alerts (warnings), certificates from the synced
+    /// inventory that have since expired, certificates the CA has revoked,
+    /// and orders refused by the allowed domain policy. Ordered newest
+    /// first.
     ///
-    /// This is a synthesis, not a durable event log — see the delta doc.
+    /// The first four are synthesized from state tables, not a durable event
+    /// log (see the delta doc); the policy rejections are the one durable
+    /// source, because a refusal never creates a certificate row to
+    /// synthesize from.
     /// </summary>
     public async Task<IReadOnlyList<ActivityItemDto>> GetActivityAsync(
         int take = 20, CancellationToken cancellationToken = default)
@@ -114,7 +132,7 @@ public sealed class DashboardMetricsService
             .Select(c => new { c.IssuedAt, c.Order.IdentifiersJson, c.Order.TemplateId })
             .ToListAsync(cancellationToken);
 
-        var items = new List<ActivityItemDto>(take * 4);
+        var items = new List<ActivityItemDto>(take * 5);
 
         foreach (var c in issued)
         {
@@ -180,10 +198,55 @@ public sealed class DashboardMetricsService
                 Timestamp: c.RevokedAt!.Value));
         }
 
+        // Rejected: orders a domain policy refused, either the global allow
+        // list or an EAB credential's namespace.
+        var rejections = await _db.DomainPolicyRejections
+            .OrderByDescending(r => r.OccurredAt)
+            .Take(take)
+            .Select(r => new { r.Id, r.OccurredAt, r.RejectedIdentifiers, r.Stage })
+            .ToListAsync(cancellationToken);
+
+        foreach (var r in rejections)
+        {
+            // The stage names which policy refused, so the label can point the
+            // admin at the page that fixes it: the "-device" stages are the
+            // device attestation gate (the ACME page's device attestation
+            // card), the "-eab" stages are a credential's domain namespace
+            // (the ACME page), the "-guard" stage is the TLS capability
+            // ceiling's finalize leaf check (the template configuration),
+            // the bare stages are the global allow list (Settings). Labeling
+            // them the same would send the admin to the wrong page. Every
+            // suffix branch must stay above the bare fallback.
+            var source =
+                r.Stage.EndsWith("-device", StringComparison.Ordinal)
+                    ? "blocked by the device attestation policy"
+                : r.Stage.EndsWith("-eab", StringComparison.Ordinal)
+                    ? "blocked by the EAB credential's domain namespace"
+                : r.Stage.EndsWith("-guard", StringComparison.Ordinal)
+                    ? "blocked by the TLS certificate guardrail"
+                : "blocked by the domain allow list";
+            items.Add(new ActivityItemDto(
+                Id: $"rejected-{r.Id}",
+                Type: "rejected",
+                Cn: FirstRejectedIdentifier(r.RejectedIdentifiers),
+                Tmpl: source,
+                Timestamp: r.OccurredAt));
+        }
+
         return items
             .OrderByDescending(i => i.Timestamp)
             .Take(take)
             .ToList();
+    }
+
+    /// <summary>
+    /// The first name from the comma joined rejected identifier column, for
+    /// the activity feed's one line summary.
+    /// </summary>
+    private static string FirstRejectedIdentifier(string commaJoined)
+    {
+        var comma = commaJoined.IndexOf(',');
+        return comma < 0 ? commaJoined : commaJoined[..comma];
     }
 
     /// <summary>
@@ -200,8 +263,18 @@ public sealed class DashboardMetricsService
 
         // Pull the dates in range and bucket in memory — avoids SQLite date-function
         // translation quirks and keeps the query trivially indexable.
+        //
+        // Certificates only. Since issue #151 the sync also stores pending,
+        // denied, and failed requests, and every one of them carries a
+        // RequestDate inside this window by construction, because the request
+        // passes are bounded to the same recent history. Without this filter a
+        // denial would be counted as a certificate issued that day.
+        //
+        // Revoked counts: it was still issued on the day it was issued, and a
+        // trend of what the CA produced must not rewrite its own history every
+        // time an operator revokes something.
         var requestDates = await _db.SyncedCertificates
-            .Where(c => c.RequestDate >= since)
+            .Where(c => (c.Status == "Issued" || c.Status == "Revoked") && c.RequestDate >= since)
             .Select(c => c.RequestDate)
             .ToListAsync(cancellationToken);
 
@@ -218,12 +291,21 @@ public sealed class DashboardMetricsService
         return new RegistrationSeriesDto(registrations, renewals);
     }
 
-    /// <summary>Extracts the CN from a subject DN, falling back to the raw string.</summary>
+    /// <summary>
+    /// Extracts the CN from a subject DN, falling back to the raw string.
+    ///
+    /// The fallback is reached often rather than rarely: a SAN only certificate
+    /// is stored with a bare name and no "CN=" at all, and the feed shows that
+    /// name verbatim.
+    ///
+    /// Until issue #231 this read up to the first comma, which cut a common name
+    /// that carried a quoted one in half. <see cref="DistinguishedNameParser"/>
+    /// is now the one place that decides where a name ends.
+    /// </summary>
     private static string ExtractCn(string subject)
     {
         if (string.IsNullOrWhiteSpace(subject)) return "Unknown";
-        var match = Regex.Match(subject, "CN=([^,]+)", RegexOptions.IgnoreCase);
-        return match.Success ? match.Groups[1].Value.Trim() : subject;
+        return DistinguishedNameParser.CommonName(subject) ?? subject;
     }
 
     /// <summary>Returns the first identifier value from an ACME identifiers JSON array.</summary>

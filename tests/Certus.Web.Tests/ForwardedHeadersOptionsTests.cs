@@ -38,7 +38,7 @@ public class ForwardedHeadersOptionsTests
             ForwardedHeaders.XForwardedFor
             | ForwardedHeaders.XForwardedHost
             | ForwardedHeaders.XForwardedProto);
-        result.KnownNetworks.Should().BeEmpty();
+        result.KnownIPNetworks.Should().BeEmpty();
         result.KnownProxies.Should().HaveCount(2);
         result.KnownProxies.Should().Contain(IPAddress.Parse("10.0.0.5"));
         result.KnownProxies.Should().Contain(IPAddress.Parse("::1"));

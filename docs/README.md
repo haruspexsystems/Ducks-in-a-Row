@@ -9,6 +9,8 @@ work like Let's Encrypt.
   first certificate.
 - **[Connecting ACME clients](acme-clients.md):** certbot, win-acme, Caddy,
   Traefik, and Posh-ACME, with the directory URL pattern and challenge types.
+- **[Device attestation](device-attestation.md):** issue certificates to Apple
+  managed devices with the `device-attest-01` challenge.
 - **[Troubleshooting](troubleshooting.md):** health states, common failures,
   and how to read the logs.
 - **[Glossary](glossary.md):** plain explanations of ACME, ADCS, templates,
@@ -19,6 +21,8 @@ work like Let's Encrypt.
 - **[Installation and Configuration Guide](Ducks-in-a-Row-Installation-Guide.pdf):**
   the full reference covering install, configuration, ADCS permissions, alerts,
   and uninstall.
+- **[Hardening](hardening.md):** optional lockdowns and the tradeoffs behind
+  the defaults, starting with challenge validation egress.
 - **[Development setup](dev-setup.md):** building and testing from source.
 
 ## Project

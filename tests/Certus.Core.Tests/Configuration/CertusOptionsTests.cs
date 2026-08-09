@@ -55,4 +55,45 @@ public class CertusOptionsTests
 
         options.DatabasePath.Should().Be(CertusPaths.InMemoryDatabase);
     }
+
+    // ---- CaDisplayName (issue #157) --------------------------------------
+
+    [Theory]
+    [InlineData("CAHOST\\My Issuing CA", "My Issuing CA")]
+    [InlineData("ca.home.local\\Home-CA-01", "Home-CA-01")]
+    [InlineData("  ca.home.local\\Home-CA-01  ", "Home-CA-01")]
+    public void CaDisplayName_ParsesTheNameHalfOfTheConnectionString(
+        string connectionString, string expected)
+    {
+        new CertusOptions { CaConnectionString = connectionString }
+            .CaDisplayName.Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void CaDisplayName_NothingConfigured_IsNull(string? connectionString)
+    {
+        // appsettings ships the key as explicit JSON null; the header says
+        // unknown rather than inventing a name.
+        new CertusOptions { CaConnectionString = connectionString }
+            .CaDisplayName.Should().BeNull();
+    }
+
+    [Fact]
+    public void CaDisplayName_NoBackslash_ReturnsTheWholeString()
+    {
+        new CertusOptions { CaConnectionString = "StandaloneCA" }
+            .CaDisplayName.Should().Be("StandaloneCA");
+    }
+
+    [Theory]
+    [InlineData("CAHOST\\")]
+    [InlineData("CAHOST\\   ")]
+    public void CaDisplayName_EmptyNameHalf_FallsBackToTheWholeString(string connectionString)
+    {
+        new CertusOptions { CaConnectionString = connectionString }
+            .CaDisplayName.Should().Be("CAHOST\\");
+    }
 }

@@ -18,7 +18,10 @@ We collect no telemetry, so we rely on you to tell us what works and what to
 build next. Every channel below is user initiated and private to what you choose
 to send:
 
-- **In the app** — use the "Send feedback" link on the dashboard Settings page.
+- **In the app** — use the "Send feedback" link at the foot of any dashboard
+  page, or of the setup wizard. It opens a draft in your own mail client, so
+  you see and edit everything before it is sent. The same link is on the
+  Settings page alongside the version you may want to quote.
 - **By email** — write to feedback@haruspex.systems.
 - **Feature ideas and discussion** — open a thread in
   [GitHub Discussions](https://github.com/haruspexsystems/Ducks-in-a-Row/discussions).

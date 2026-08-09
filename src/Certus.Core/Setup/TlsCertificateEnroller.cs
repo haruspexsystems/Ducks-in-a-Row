@@ -142,7 +142,7 @@ public sealed class TlsCertificateEnroller
                     $"but it could not be retrieved (status: {issued.Status}).");
             }
 
-            using var leaf = new X509Certificate2(issued.CertificateDer);
+            using var leaf = X509CertificateLoader.LoadCertificate(issued.CertificateDer);
             using var withKey = key switch
             {
                 RSA rsa => leaf.CopyWithPrivateKey(rsa),

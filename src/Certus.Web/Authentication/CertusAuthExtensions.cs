@@ -156,8 +156,10 @@ public static class CertusAuthExtensions
 
         // Clear the framework defaults so the configured proxies are the complete
         // allowlist. An unlisted peer's forwarded header is ignored and its
-        // connection address stays the client.
-        forwardedOptions.KnownNetworks.Clear();
+        // connection address stays the client. KnownIPNetworks replaced the
+        // obsolete KnownNetworks in ASP.NET Core 10; both view the same
+        // backing list, so clearing it still removes the loopback default.
+        forwardedOptions.KnownIPNetworks.Clear();
         forwardedOptions.KnownProxies.Clear();
 
         foreach (var entry in options.TrustedProxies)

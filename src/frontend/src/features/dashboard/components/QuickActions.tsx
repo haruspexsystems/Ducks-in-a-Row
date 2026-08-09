@@ -5,10 +5,12 @@ import { useIsDark } from '../lib/useIsDark';
 import { List, TriangleAlert, Ban, Clock, ArrowRight, type LucideIcon } from 'lucide-react';
 
 interface QuickActionsProps {
-  issued: number;
+  total: number;
   expiring: number;
   expired: number;
   revoked: number;
+  /** The operator's "expiring soon" window in days (issue #152). */
+  warningDays: number;
 }
 
 interface QA {
@@ -20,22 +22,25 @@ interface QA {
   to: string;
 }
 
-export function QuickActions({ issued, expiring, expired, revoked }: QuickActionsProps) {
+export function QuickActions({ total, expiring, expired, revoked, warningDays }: QuickActionsProps) {
   const dark = useIsDark();
 
-  // Deep links into the certificate list using the expiry filter the API already
-  // supports (NotAfter <= expiringBefore, NotAfter >= expiringAfter). Computed at
-  // render so "now" is current.
-  const nowIso = new Date().toISOString();
-  const in30Iso = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-  const expiredTo = `/certificates?${new URLSearchParams({ expiringBefore: nowIso }).toString()}`;
-  const expiringSoonTo = `/certificates?${new URLSearchParams({ expiringAfter: nowIso, expiringBefore: in30Iso }).toString()}`;
-
+  // Deep links into the certificate list's state chips (issue #155). These used
+  // to be a pair of timestamps computed here, which had two problems: a shared
+  // or bookmarked link froze "now", so an "expiring soon" link slid into the
+  // past and began returning expired certificates; and filtering on the expiry
+  // date alone also returned revoked certificates that happened to be past
+  // their NotAfter, which the card beside it never counted. The symbolic name
+  // resolves on the server against the same predicate the card is counted
+  // with, so the number and the rows behind it now always agree.
+  //
+  // warningDays is still the caption's, not the filter's: the server owns the
+  // window (issue #152).
   const cards: QA[] = [
-    { tone: 'total',   Icon: List,          title: 'View Certificates', sub: `${issued.toLocaleString()} issued · browse all`, big: null,     to: '/certificates?status=Issued' },
-    { tone: 'warning', Icon: TriangleAlert, title: 'Expiring Soon',     sub: 'Review within 30 days',                          big: expiring, to: expiringSoonTo },
-    { tone: 'danger',  Icon: Clock,         title: 'Expired',           sub: 'Past expiration date',                           big: expired,  to: expiredTo },
-    { tone: 'revoked', Icon: Ban,           title: 'Revoked',           sub: 'Revoked by the CA',                              big: revoked,  to: '/certificates?status=Revoked' },
+    { tone: 'total',   Icon: List,          title: 'View Certificates', sub: `${total.toLocaleString()} total · browse all`, big: null,     to: '/certificates' },
+    { tone: 'warning', Icon: TriangleAlert, title: 'Expiring Soon',     sub: `Review within ${warningDays} days`,            big: expiring, to: '/certificates?state=expiring' },
+    { tone: 'danger',  Icon: Clock,         title: 'Expired',           sub: 'Past expiration date',                         big: expired,  to: '/certificates?state=expired' },
+    { tone: 'revoked', Icon: Ban,           title: 'Revoked',           sub: 'Revoked by the CA',                            big: revoked,  to: '/certificates?state=revoked' },
   ];
 
   return (

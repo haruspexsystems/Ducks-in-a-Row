@@ -1,9 +1,16 @@
 import { ApiError, CSRF_HEADERS, fetchJson } from './client';
 import type { SetupUnreachableUrlResponse } from './setup';
 
-/** The running application's release version, e.g. "0.9.0-beta.1". */
+/**
+ * The running application's release version, e.g. "0.10.0-beta.1", and the
+ * commit it was built from (issue #112). commit is null when the build
+ * carried no stamp, which is what a build from the release source snapshot
+ * looks like. Treat it as an opaque string rather than a bare 40 character
+ * sha: a build from a dirty working tree carries a ".dirty" suffix.
+ */
 export interface SystemInfo {
   version: string;
+  commit?: string | null;
 }
 
 /** Fetch the running application version (admin only). */
@@ -113,6 +120,148 @@ export async function waitForExternalUrlApplied(
 }
 
 /**
+ * The allowed domain policy as stored in the wizard status file, plus the
+ * machine's AD domain as a suggestion for the "Add my AD domain" button
+ * (null when the server is not domain joined).
+ */
+export interface AllowedDomainsSettings {
+  enabled: boolean;
+  domains: string[];
+  adDomain?: string | null;
+}
+
+/** Fetch the allowed domain policy (admin only). */
+export async function fetchAllowedDomainsSettings(): Promise<AllowedDomainsSettings> {
+  return fetchJson('/api/settings/allowed-domains');
+}
+
+/** One refused entry from a save, with the server's plain language reason. */
+export interface InvalidDomainEntry {
+  entry: string;
+  reason: string;
+}
+
+/** Successful update response. */
+export interface AllowedDomainsUpdateResult {
+  enabled: boolean;
+  /** The normalized list as stored (lowercase punycode, de-duplicated). */
+  domains: string[];
+  message: string;
+}
+
+/**
+ * An update either saves, or is refused with per entry reasons. Unlike the
+ * external URL there is no restart leg: the issuance policy hot reads the
+ * file, so a save is in force for the next order.
+ */
+export type AllowedDomainsUpdateOutcome =
+  | { kind: 'updated'; result: AllowedDomainsUpdateResult }
+  | { kind: 'invalid'; error: string; invalidEntries: InvalidDomainEntry[] };
+
+/**
+ * Change the allowed domain policy. Plain fetch instead of fetchJson because
+ * the 400 refusal carries the per entry reasons the settings card shows
+ * (fetchJson throws away non 2xx bodies).
+ */
+export async function updateAllowedDomains(
+  enabled: boolean,
+  domains: string[],
+): Promise<AllowedDomainsUpdateOutcome> {
+  const endpoint = '/api/settings/allowed-domains';
+  const response = await fetch(endpoint, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...CSRF_HEADERS },
+    body: JSON.stringify({ enabled, domains }),
+  });
+  if (response.status === 400) {
+    const body = (await response.json().catch(() => null)) as
+      | { error?: string; invalidEntries?: InvalidDomainEntry[] }
+      | null;
+    return {
+      kind: 'invalid',
+      error: body?.error ?? 'The entries were not accepted.',
+      invalidEntries: body?.invalidEntries ?? [],
+    };
+  }
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as { error?: string } | null;
+    throw new ApiError(response.status, body?.error ?? response.statusText, endpoint);
+  }
+  return { kind: 'updated', result: (await response.json()) as AllowedDomainsUpdateResult };
+}
+
+/** The dashboard revocation scope modes, always under the TLS guardrail. */
+export type RevocationScopeMode = 'ducks-managed' | 'custom' | 'all';
+
+/**
+ * The revocation scope as stored: the mode, the custom template list (kept
+ * across mode switches), and the enabled ACME template set, which is what
+ * ducks-managed covers on top of certificates Ducks itself issued.
+ */
+export interface RevocationScopeSettings {
+  mode: RevocationScopeMode;
+  customTemplates: string[];
+  enabledTemplates: string[];
+}
+
+/** Fetch the revocation scope (admin only). */
+export async function fetchRevocationScope(): Promise<RevocationScopeSettings> {
+  return fetchJson('/api/settings/revocation-scope');
+}
+
+/** A template entry the API refused, with its reason. */
+export interface InvalidTemplateEntry {
+  entry: string;
+  reason: string;
+}
+
+/**
+ * An update either saves, or is refused with per entry reasons. No restart
+ * leg: the eligibility gate hot reads the file, so a save is in force for
+ * the next revocation attempt.
+ */
+export type RevocationScopeUpdateOutcome =
+  | { kind: 'updated'; mode: RevocationScopeMode; customTemplates: string[]; message: string }
+  | { kind: 'invalid'; error: string; invalidEntries: InvalidTemplateEntry[] };
+
+/**
+ * Change the revocation scope. Plain fetch instead of fetchJson because the
+ * 400 refusal carries the per entry reasons the settings card shows
+ * (fetchJson throws away non 2xx bodies).
+ */
+export async function updateRevocationScope(
+  mode: RevocationScopeMode,
+  customTemplates: string[],
+): Promise<RevocationScopeUpdateOutcome> {
+  const endpoint = '/api/settings/revocation-scope';
+  const response = await fetch(endpoint, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...CSRF_HEADERS },
+    body: JSON.stringify({ mode, customTemplates }),
+  });
+  if (response.status === 400) {
+    const body = (await response.json().catch(() => null)) as
+      | { error?: string; invalidEntries?: InvalidTemplateEntry[] }
+      | null;
+    return {
+      kind: 'invalid',
+      error: body?.error ?? 'The entries were not accepted.',
+      invalidEntries: body?.invalidEntries ?? [],
+    };
+  }
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as { error?: string } | null;
+    throw new ApiError(response.status, body?.error ?? response.statusText, endpoint);
+  }
+  const result = (await response.json()) as {
+    mode: RevocationScopeMode;
+    customTemplates: string[];
+    message: string;
+  };
+  return { kind: 'updated', ...result };
+}
+
+/**
  * The webserver HTTPS certificate as the settings overlay records it.
  * configured false means no CA issued certificate was ever set up (the
  * service serves the self signed fallback). inStore false with configured
@@ -132,6 +281,37 @@ export interface HttpsCertificateInfo {
   renewTemplate?: string | null;
   /** True when the overlay thumbprint is not the one this process serves. */
   restartPending?: boolean;
+  /** The thumbprint this process actually serves right now. */
+  servedThumbprint?: string | null;
+  /**
+   * Expiry of the certificate still being served while a restart is pending.
+   * This is what the notice escalates on: the renewed certificate is fine, the
+   * one in use is the one running out.
+   */
+  servedNotAfter?: string | null;
+  autoRenewal?: HttpsCertificateAutoRenewal;
+}
+
+/**
+ * State of the background renewal (issue #105). It never restarts the service
+ * itself, so a successful renewal shows up as restartPending until someone
+ * applies it. `failed` singles out the outcomes worth acting on, as opposed to
+ * the routine "nothing to do" passes that also record an attempt.
+ */
+export interface HttpsCertificateAutoRenewal {
+  enabled: boolean;
+  windowDays: number;
+  lastAttemptAt?: string | null;
+  lastOutcome?:
+    | 'installed'
+    | 'sanMismatch'
+    | 'pending'
+    | 'denied'
+    | 'failed'
+    | 'notApplicable'
+    | null;
+  lastMessage?: string | null;
+  failed: boolean;
 }
 
 /** Fetch the webserver HTTPS certificate state (admin only). */
@@ -178,6 +358,32 @@ export async function renewHttpsCertificate(): Promise<RenewHttpsCertificateResu
     throw new ApiError(response.status, reason ?? response.statusText, endpoint);
   }
   return (await response.json()) as RenewHttpsCertificateResult;
+}
+
+/** Outcome of applying a certificate the background renewal already enrolled. */
+export interface ApplyHttpsCertificateResult {
+  thumbprint: string;
+  restartScheduled: boolean;
+  message: string;
+}
+
+/**
+ * Apply a certificate the background renewal enrolled: the overlay already
+ * points at it, so this only schedules the restart that starts serving it.
+ * Refused with 409 when nothing is pending.
+ */
+export async function applyHttpsCertificate(): Promise<ApplyHttpsCertificateResult> {
+  const endpoint = '/api/settings/https-certificate/apply';
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...CSRF_HEADERS },
+    body: '{}',
+  });
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as { error?: string } | null;
+    throw new ApiError(response.status, body?.error ?? response.statusText, endpoint);
+  }
+  return (await response.json()) as ApplyHttpsCertificateResult;
 }
 
 /**

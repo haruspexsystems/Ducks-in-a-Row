@@ -38,14 +38,17 @@ public class TemplateServiceTests : IDisposable
 
     private TemplateService BuildService(params TemplateInfo[] templates)
     {
-        return BuildService(enabledTemplates: null, templates);
+        // The policy fails closed (issue #101), so this overload enables every
+        // template it registers: these tests exercise name resolution, not the
+        // enabled set gate.
+        return BuildService(templates.Select(t => t.Name).ToArray(), templates);
     }
 
     /// <summary>
     /// Builds the service against a temp data directory. When
     /// <paramref name="enabledTemplates"/> is set, a wizard status file carrying
-    /// that list is written where the policy reads it; null means no file, the
-    /// pre wizard state where everything is allowed.
+    /// that list is written where the policy reads it; null means no file,
+    /// which exposes nothing (issue #101).
     /// </summary>
     private TemplateService BuildService(string[]? enabledTemplates, params TemplateInfo[] templates)
     {
@@ -62,7 +65,9 @@ public class TemplateServiceTests : IDisposable
         }
 
         var policy = new EnabledTemplatesPolicy(
-            Options.Create(options), NullLogger<EnabledTemplatesPolicy>.Instance);
+            Options.Create(options),
+            Options.Create(new AcmeOptions()),
+            NullLogger<EnabledTemplatesPolicy>.Instance);
         var mock = new MockAdcsClient(templates: templates);
         return new TemplateService(mock, policy, NullLogger<TemplateService>.Instance);
     }
@@ -142,6 +147,22 @@ public class TemplateServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task ResolveAsync_NoStatusFile_ReturnsDisabled()
+    {
+        // Issue #101: with no wizard status file nothing is exposed. The
+        // template still resolves so the caller reports a clear 403 disabled
+        // response, not a 404.
+        var sut = BuildService(
+            enabledTemplates: null,
+            new TemplateInfo("WebServerACME", "Web Server ACME", "1.2.3"));
+
+        var resolution = await sut.ResolveAsync("WebServerACME");
+
+        resolution.Access.Should().Be(TemplateAccess.Disabled);
+        resolution.Template!.Name.Should().Be("WebServerACME");
+    }
+
+    [Fact]
     public async Task ResolveAsync_TemplateOutsideEnabledSet_ReturnsDisabledWithTemplate()
     {
         // Issue #85: the CA publishes both templates but only one was enabled
@@ -194,5 +215,49 @@ public class TemplateServiceTests : IDisposable
             new TemplateInfo("WebServerACME", "Web Server ACME", "1.2.3"));
 
         (await sut.ResolveAsync("NotATemplate")).Access.Should().Be(TemplateAccess.Unknown);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_EnabledTemplateWithVerifiedDangerousEku_IsBlockedByCeiling()
+    {
+        // The template is in the enabled set, but its verified AD metadata
+        // carries code signing next to server auth: the ceiling refuses it
+        // before an order can exist, with the template attached so the
+        // caller can log the match.
+        var sut = BuildService(
+            enabledTemplates: ["Sneaky"],
+            new TemplateInfo("Sneaky", "Sneaky Template", "1.2.5",
+                ExtendedKeyUsages: ["1.3.6.1.5.5.7.3.1", "1.3.6.1.5.5.7.3.3"]));
+
+        var resolution = await sut.ResolveAsync("Sneaky");
+
+        resolution.Access.Should().Be(TemplateAccess.BlockedByCeiling);
+        resolution.Template!.Name.Should().Be("Sneaky");
+    }
+
+    [Fact]
+    public async Task ResolveAsync_EnabledTemplateWithUnverifiedMetadata_StaysEnabled()
+    {
+        // Null EKU metadata means the AD lookup could not verify, which is a
+        // routine condition (not domain joined, no read rights) and must not
+        // block issuance; the finalize leaf check is the guarantee behind it.
+        var sut = BuildService(
+            enabledTemplates: ["WebServerACME"],
+            new TemplateInfo("WebServerACME", "Web Server ACME", "1.2.3",
+                ExtendedKeyUsages: null));
+
+        (await sut.ResolveAsync("WebServerACME")).Access.Should().Be(TemplateAccess.Enabled);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_EnabledTemplateInsideTheCeiling_StaysEnabled()
+    {
+        // Verified metadata inside the ceiling changes nothing.
+        var sut = BuildService(
+            enabledTemplates: ["WebServerACME"],
+            new TemplateInfo("WebServerACME", "Web Server ACME", "1.2.3",
+                ExtendedKeyUsages: ["1.3.6.1.5.5.7.3.1", "1.3.6.1.5.5.7.3.2"]));
+
+        (await sut.ResolveAsync("WebServerACME")).Access.Should().Be(TemplateAccess.Enabled);
     }
 }

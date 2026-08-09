@@ -1,4 +1,5 @@
 using System.Data;
+using Certus.Core.Adcs;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
@@ -30,6 +31,11 @@ namespace Certus.Core.Data;
 /// </summary>
 public static class DatabaseInitializer
 {
+    // EF turns a Contains over a list into one parameter per element, and
+    // SQLite's older default ceiling is 999. Same reasoning, and the same value,
+    // as SupersessionLinker.UpdateChunkSize.
+    private const int SubjectUpdateChunkSize = 500;
+
     /// <summary>
     /// Ensure the database exists and its schema is current. Throws
     /// <see cref="InvalidOperationException"/> with operator instructions when
@@ -65,6 +71,8 @@ public static class DatabaseInitializer
             }
         }
 
+        SanitizeStoredSubjects(db, logger);
+
         if (enableWalMode)
         {
             // WAL improves concurrent read/write performance. The mode is
@@ -73,6 +81,65 @@ public static class DatabaseInitializer
             db.Database.ExecuteSqlRaw("PRAGMA journal_mode=WAL;");
             logger.LogInformation("SQLite WAL mode enabled");
         }
+    }
+
+    /// <summary>
+    /// Rewrites any stored certificate subject that still carries the control or
+    /// format characters the sanitizer strips, or that overflows the column
+    /// (issue #224).
+    ///
+    /// The sync usually heals these on its own: the issued and revoked passes
+    /// read the whole CA every cycle and overwrite the subject in place. Three
+    /// kinds of row never get that treatment, which is what this pass is for.
+    /// A subject that sanitizes away to nothing is skipped by UpdateEntity, on
+    /// purpose, so a blank pass cannot erase a good name. A request row resolved
+    /// longer ago than RequestHistoryDays falls outside the only bounded passes,
+    /// so rows poisoned before issue #186 shipped were never revisited either.
+    /// And nothing deletes a SyncedCertificate, so a row the CA has since
+    /// archived keeps whatever it last held forever.
+    ///
+    /// Not a migration, for a reason worth stating: <see cref="StampAllMigrations"/>
+    /// marks every migration as applied without running it, so a data fix in an
+    /// Up() method would be silently skipped on exactly the oldest databases,
+    /// the ones most likely to be carrying an unsanitized value. It is C# rather
+    /// than SQL because SQLite has no Unicode category function.
+    ///
+    /// Unconditional rather than one shot, so it stays a proven no op on every
+    /// later start and self heals anything a future regression writes.
+    /// </summary>
+    private static void SanitizeStoredSubjects(CertusDbContext db, ILogger logger)
+    {
+        // Untracked projection first, so the common case (nothing to fix) reads
+        // two short columns and allocates no entities at all. Only the rows that
+        // actually change are loaded for real, below.
+        var replacements = db.SyncedCertificates
+            .AsNoTracking()
+            .Select(c => new { c.Id, c.Subject })
+            .ToList()
+            // Null means the whole subject was strippable. The column is
+            // required, so an empty string is the established "nothing here"
+            // value, and the ACME backfill treats it as a row to name.
+            .Select(row => (row.Id, Cleaned: CertificateTextSanitizer.SanitizeSubject(row.Subject) ?? "", row.Subject))
+            .Where(row => !string.Equals(row.Cleaned, row.Subject, StringComparison.Ordinal))
+            .ToDictionary(row => row.Id, row => row.Cleaned);
+
+        if (replacements.Count == 0)
+            return;
+
+        // Chunked for the same reason SupersessionLinker chunks: EF turns a
+        // Contains over a list into one parameter per element, against SQLite's
+        // older default ceiling of 999.
+        foreach (var chunk in replacements.Keys.Chunk(SubjectUpdateChunkSize))
+        {
+            var ids = chunk.ToList();
+            foreach (var entity in db.SyncedCertificates.Where(c => ids.Contains(c.Id)))
+                entity.Subject = replacements[entity.Id];
+        }
+
+        db.SaveChanges();
+        logger.LogInformation(
+            "Sanitized {Count} stored certificate subject(s) that carried control or format "
+            + "characters, or exceeded the column width", replacements.Count);
     }
 
     /// <summary>

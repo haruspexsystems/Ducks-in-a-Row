@@ -1,7 +1,9 @@
 using System.Reflection;
 using System.Text.Json;
+using Certus.Core.Acme.Services;
 using Certus.Core.Adcs;
 using Certus.Core.Configuration;
+using Certus.Core.Services;
 using Certus.Core.Setup;
 using Certus.Web.Authentication;
 using Microsoft.AspNetCore.Authorization;
@@ -27,7 +29,8 @@ public sealed class SettingsController : ControllerBase
 {
     private readonly SetupService _setupService;
     private readonly IServiceRestarter _serviceRestarter;
-    private readonly TlsCertificateEnroller _tlsEnroller;
+    private readonly HttpsCertificateRenewalService _renewal;
+    private readonly HttpsCertificateAutoRenewalService _autoRenewal;
     private readonly IHttpsCertificateStore _certificateStore;
     private readonly CertusOptions _certusOptions;
     private readonly IConfiguration _configuration;
@@ -36,7 +39,8 @@ public sealed class SettingsController : ControllerBase
     public SettingsController(
         SetupService setupService,
         IServiceRestarter serviceRestarter,
-        TlsCertificateEnroller tlsEnroller,
+        HttpsCertificateRenewalService renewal,
+        HttpsCertificateAutoRenewalService autoRenewal,
         IHttpsCertificateStore certificateStore,
         IOptions<CertusOptions> certusOptions,
         IConfiguration configuration,
@@ -44,7 +48,8 @@ public sealed class SettingsController : ControllerBase
     {
         _setupService = setupService;
         _serviceRestarter = serviceRestarter;
-        _tlsEnroller = tlsEnroller;
+        _renewal = renewal;
+        _autoRenewal = autoRenewal;
         _certificateStore = certificateStore;
         _certusOptions = certusOptions.Value;
         _configuration = configuration;
@@ -52,24 +57,38 @@ public sealed class SettingsController : ControllerBase
     }
 
     /// <summary>
-    /// GET /api/settings/info — the running application version, for the
-    /// Settings page. Reads AssemblyInformationalVersion, which carries the
-    /// full release string ("0.9.0-beta.1") from Directory.Build.props'
-    /// VersionPrefix and VersionSuffix combined. The MSI's ProductVersion is
-    /// a separate, strictly numeric value WiX requires (see build.ps1); this
-    /// endpoint is the only place the prerelease label is meant to show up
-    /// at runtime.
+    /// GET /api/settings/info returns the running application version and the
+    /// commit it was built from, for the Settings page. Reads
+    /// AssemblyInformationalVersion, which carries the full release string
+    /// ("0.10.0-beta.1") from Directory.Build.props' VersionPrefix and
+    /// VersionSuffix combined, plus a "+&lt;sha&gt;" stamp when build.ps1
+    /// resolved a commit (issue #112). BuildVersionInfo splits the two so the
+    /// page can show a clean version and keep the sha as its own field.
+    ///
+    /// The MSI's ProductVersion is a separate, strictly numeric value WiX
+    /// requires (see build.ps1). It carries neither the prerelease label nor
+    /// the commit, and cannot: Windows Installer versions are four numeric
+    /// fields. This endpoint is the only place either shows up at runtime.
+    ///
+    /// commit is null on a build with no stamp, which is a supported build
+    /// (the release source snapshot has no .git). The page hides the row.
     /// </summary>
     [HttpGet("info")]
     public IActionResult GetInfo()
     {
-        var version = typeof(SettingsController).Assembly
+        var informationalVersion = typeof(SettingsController).Assembly
             .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
-            .InformationalVersion
-            ?? typeof(SettingsController).Assembly.GetName().Version?.ToString()
-            ?? "unknown";
+            .InformationalVersion;
 
-        return Ok(new { version });
+        var (version, commit) = BuildVersionInfo.Split(informationalVersion);
+
+        if (string.IsNullOrEmpty(version))
+        {
+            version = typeof(SettingsController).Assembly.GetName().Version?.ToString()
+                ?? "unknown";
+        }
+
+        return Ok(new { version, commit });
     }
 
     /// <summary>
@@ -196,6 +215,159 @@ public sealed class SettingsController : ControllerBase
     }
 
     /// <summary>
+    /// GET /api/settings/allowed-domains: the domain restriction in force,
+    /// read fresh from the wizard status file (which is where a PUT writes
+    /// it and where the issuance policy hot reads it), plus the machine's AD
+    /// domain as the suggestion behind the "Add my AD domain" button.
+    /// adDomain is null on a machine that is not domain joined.
+    /// </summary>
+    [HttpGet("allowed-domains")]
+    public IActionResult GetAllowedDomains()
+    {
+        var status = _setupService.GetStatus();
+        return Ok(new
+        {
+            enabled = status.AllowedDomainsEnabled,
+            domains = status.AllowedDomains,
+            adDomain = AdDomainSuggestion.Get(),
+        });
+    }
+
+    /// <summary>
+    /// PUT /api/settings/allowed-domains: change the domain restriction
+    /// after setup. Entries are validated and normalized (lowercase punycode
+    /// A labels, bare domains only, no wildcards), and turning the
+    /// restriction on requires at least one usable entry, so the fail open
+    /// state the issuance policy tolerates in hand edited files can never be
+    /// written through this API. Applies immediately: AllowedDomainsPolicy
+    /// hot reads the file, so unlike the external URL no restart is
+    /// involved.
+    /// </summary>
+    [HttpPut("allowed-domains")]
+    public IActionResult UpdateAllowedDomains([FromBody] UpdateAllowedDomainsRequest request)
+    {
+        // Before setup the wizard is the single write path for the status
+        // file; this endpoint exists for the life of the install after it.
+        var status = _setupService.GetStatus();
+        if (!status.SetupCompleted || !_setupService.IsCaEffectivelyConfigured)
+            return Conflict(new { error = "Setup has not been completed. Configure allowed domains in the setup wizard." });
+
+        var (normalized, invalid) = AllowedDomainsPolicy.ValidateAndNormalize(request.Domains ?? []);
+
+        if (invalid.Count > 0)
+            return BadRequest(new
+            {
+                error = "Some entries are not usable domain names.",
+                invalidEntries = invalid
+                    .Select(i => new { entry = i.Entry, reason = i.Reason })
+                    .ToList(),
+            });
+
+        if (request.Enabled && normalized.Count == 0)
+            return BadRequest(new { error = "Add at least one domain, or turn the restriction off." });
+
+        if (!_setupService.UpdateAllowedDomains(request.Enabled, normalized))
+            return Conflict(new
+            {
+                error = "The wizard status file could not be read back as completed, " +
+                        "so nothing was changed. Check the service log for the file path.",
+            });
+
+        _logger.LogInformation("Allowed domains updated from the dashboard settings page");
+
+        return Ok(new
+        {
+            enabled = request.Enabled,
+            domains = normalized,
+            message = "Saved. New orders use the updated policy immediately.",
+        });
+    }
+
+    /// <summary>
+    /// GET /api/settings/revocation-scope: the dashboard revocation scope,
+    /// read fresh from the wizard status file (which is where a PUT writes
+    /// it and where the eligibility gate hot reads it). enabledTemplates
+    /// rides along so the card can say what ducks-managed covers.
+    /// </summary>
+    [HttpGet("revocation-scope")]
+    public IActionResult GetRevocationScope()
+    {
+        var status = _setupService.GetStatus();
+        var mode = RevocationScopePolicy.TryParseMode(status.RevocationScope, out var parsed)
+            ? parsed
+            : RevocationScopeMode.DucksManaged;
+        return Ok(new
+        {
+            mode = RevocationScopePolicy.ModeName(mode),
+            customTemplates = status.RevocableTemplates,
+            enabledTemplates = status.EnabledTemplates,
+        });
+    }
+
+    /// <summary>
+    /// PUT /api/settings/revocation-scope: change which certificates the
+    /// dashboard may revoke, always under the TLS capability ceiling, which
+    /// no mode can widen. Template names are validated for the characters
+    /// the ADCS attribute rules refuse, with the validator's own reason per
+    /// refused entry; blank entries are dropped rather than refused, because
+    /// the card's checkbox flow cannot produce them and a hand written call
+    /// gains nothing from the failure. Names the CA does not currently
+    /// publish are stored as given, because the CA may be unreachable at
+    /// save time and the list must survive (the card flags unmatched
+    /// entries). An empty custom list is allowed and means dashboard
+    /// revocation is disabled entirely, which fails safe. Applies
+    /// immediately: RevocationScopePolicy hot reads the file.
+    /// </summary>
+    [HttpPut("revocation-scope")]
+    public IActionResult UpdateRevocationScope([FromBody] UpdateRevocationScopeRequest request)
+    {
+        // Before setup the wizard is the single write path for the status
+        // file; this endpoint exists for the life of the install after it.
+        // Guard first, then validate, the UpdateAllowedDomains order.
+        var status = _setupService.GetStatus();
+        if (!status.SetupCompleted || !_setupService.IsCaEffectivelyConfigured)
+            return Conflict(new { error = "Setup has not been completed. Finish the setup wizard first." });
+
+        if (!RevocationScopePolicy.TryParseMode(request.Mode, out var mode))
+            return BadRequest(new { error = "Mode must be one of: ducks-managed, custom, all." });
+
+        var templates = (request.CustomTemplates ?? [])
+            .Select(t => t?.Trim() ?? string.Empty)
+            .Where(t => t.Length > 0)
+            .ToList();
+        var invalid = new List<object>();
+        foreach (var template in templates)
+        {
+            if (!AdcsRequestAttributes.TryValidateTemplateName(template, out var reason))
+                invalid.Add(new { entry = template, reason = reason ?? "Not a usable template name." });
+        }
+        if (invalid.Count > 0)
+        {
+            return BadRequest(new
+            {
+                error = "Some entries are not usable template names.",
+                invalidEntries = invalid,
+            });
+        }
+
+        if (!_setupService.UpdateRevocationScope(mode, templates))
+            return Conflict(new
+            {
+                error = "The wizard status file could not be read back as completed, " +
+                        "so nothing was changed. Check the service log for the file path.",
+            });
+
+        _logger.LogInformation("Revocation scope updated from the dashboard settings page");
+
+        return Ok(new
+        {
+            mode = RevocationScopePolicy.ModeName(mode),
+            customTemplates = templates,
+            message = "Saved. The scope applies to the next revocation immediately.",
+        });
+    }
+
+    /// <summary>
     /// GET /api/settings/https-certificate — the webserver certificate the
     /// settings overlay points at, with its store presence, names, validity
     /// window, the template it was enrolled with, and the template a renewal
@@ -218,10 +390,36 @@ public sealed class SettingsController : ControllerBase
 
         var thumbprint = overlay.HttpsCertificateThumbprint;
         if (string.IsNullOrWhiteSpace(thumbprint))
-            return Ok(new { configured = false });
+        {
+            // Nothing was ever enrolled, so the service is on its self signed
+            // fallback. Hand the dashboard the template a first provision would
+            // use (the recorded one, or the first enabled template) so the
+            // settings page can offer enrollment instead of pointing at the
+            // wizard, which SEC-G1 has locked on a completed install.
+            return Ok(new
+            {
+                configured = false,
+                renewTemplate = overlay.HttpsCertificateTemplate
+                    ?? _setupService.GetStatus().EnabledTemplates.FirstOrDefault(),
+            });
+        }
 
         var status = _setupService.GetStatus();
+        var restartPending = !string.Equals(
+            thumbprint, _certusOptions.HttpsCertificateThumbprint,
+            StringComparison.OrdinalIgnoreCase);
+
+        // While a restart is pending the overlay names the new certificate and
+        // the process is still serving the old one, so report both: the
+        // dashboard's escalating notice keys on how long the *served*
+        // certificate has left, not the one waiting in the wings.
         using var certificate = _certificateStore.Find(thumbprint);
+        using var servedCertificate = restartPending
+            && !string.IsNullOrWhiteSpace(_certusOptions.HttpsCertificateThumbprint)
+                ? _certificateStore.Find(_certusOptions.HttpsCertificateThumbprint)
+                : null;
+
+        var attempt = _autoRenewal.LastAttempt;
 
         return Ok(new
         {
@@ -237,11 +435,35 @@ public sealed class SettingsController : ControllerBase
             template = overlay.HttpsCertificateTemplate,
             renewTemplate = overlay.HttpsCertificateTemplate
                 ?? status.EnabledTemplates.FirstOrDefault(),
-            restartPending = !string.Equals(
-                thumbprint, _certusOptions.HttpsCertificateThumbprint,
-                StringComparison.OrdinalIgnoreCase),
+            restartPending,
+            servedThumbprint = _certusOptions.HttpsCertificateThumbprint,
+            servedNotAfter = servedCertificate?.NotAfter,
+            autoRenewal = new
+            {
+                enabled = _autoRenewal.Enabled,
+                windowDays = _autoRenewal.RenewalWindowDays,
+                lastAttemptAt = attempt?.AttemptedAt,
+                lastOutcome = attempt is null ? null : Describe(attempt.Outcome),
+                lastMessage = attempt?.Message,
+                // A failure the operator should act on, as opposed to the
+                // routine "nothing to do" passes, which also record an attempt.
+                failed = attempt is not null
+                    && attempt.Outcome != HttpsCertificateRenewalOutcome.Installed
+                    && attempt.Outcome != HttpsCertificateRenewalOutcome.NotApplicable,
+            },
         });
     }
+
+    /// <summary>The camelCase outcome name the dashboard switches on.</summary>
+    private static string Describe(HttpsCertificateRenewalOutcome outcome) => outcome switch
+    {
+        HttpsCertificateRenewalOutcome.Installed => "installed",
+        HttpsCertificateRenewalOutcome.SanMismatch => "sanMismatch",
+        HttpsCertificateRenewalOutcome.Pending => "pending",
+        HttpsCertificateRenewalOutcome.Denied => "denied",
+        HttpsCertificateRenewalOutcome.NotApplicable => "notApplicable",
+        _ => "failed",
+    };
 
     /// <summary>
     /// POST /api/settings/https-certificate/renew — re enroll the webserver
@@ -259,44 +481,14 @@ public sealed class SettingsController : ControllerBase
     [HttpPost("https-certificate/renew")]
     public async Task<IActionResult> RenewHttpsCertificate(CancellationToken ct)
     {
-        var status = _setupService.GetStatus();
-        if (!status.SetupCompleted || !_setupService.IsCaEffectivelyConfigured)
-            return Conflict(new { error = "Setup has not been completed. Enroll the certificate in the setup wizard." });
-
-        if (_setupService.CaMode == "mock")
-            return BadRequest(new { error = "Certificate renewal is not available with the mock CA" });
-
-        var caConnectionString = _certusOptions.CaConnectionString;
-        if (string.IsNullOrWhiteSpace(caConnectionString))
-            return Conflict(new { error = "No CA connection string is in effect" });
-
-        SettingsOverlay.OverlaySettings overlay;
+        HttpsCertificateRenewalResult result;
         try
         {
-            overlay = SettingsOverlay.Load(_setupService.SettingsOverlayPath);
+            result = await _renewal.RenewAsync(Request.Host.Host, ct);
         }
         catch (JsonException ex)
         {
             return OverlayUnreadable(ex);
-        }
-
-        var externalUrl = string.IsNullOrEmpty(_certusOptions.ExternalUrl)
-            ? overlay.ExternalUrl
-            : _certusOptions.ExternalUrl;
-        if (string.IsNullOrWhiteSpace(externalUrl))
-            return Conflict(new { error = "No external URL is configured. Set it in the External URL section first." });
-
-        var template = overlay.HttpsCertificateTemplate ?? status.EnabledTemplates.FirstOrDefault();
-        if (string.IsNullOrWhiteSpace(template))
-            return Conflict(new { error = "No template is recorded for the webserver certificate and none is enabled." });
-
-        var previousThumbprint = overlay.HttpsCertificateThumbprint;
-
-        TlsEnrollmentResult result;
-        try
-        {
-            result = await _tlsEnroller.EnrollAsync(
-                caConnectionString, template, externalUrl, Request.Host.Host, ct);
         }
         catch (CaUnavailableException ex)
         {
@@ -304,57 +496,55 @@ public sealed class SettingsController : ControllerBase
             return StatusCode(503, new { error = true, message = "The certificate authority is unavailable. Try again shortly." });
         }
 
-        if (result.Status != TlsEnrollmentStatus.Installed)
+        switch (result.Outcome)
         {
-            return Ok(new
-            {
-                outcome = result.Status switch
+            case HttpsCertificateRenewalOutcome.NotApplicable:
+                return result.Blocker == HttpsCertificateRenewalBlocker.MockCa
+                    ? BadRequest(new { error = result.Message })
+                    : Conflict(new { error = result.Message });
+
+            case HttpsCertificateRenewalOutcome.Pending:
+            case HttpsCertificateRenewalOutcome.Denied:
+            case HttpsCertificateRenewalOutcome.Failed:
+                return Ok(new
                 {
-                    TlsEnrollmentStatus.Pending => "pending",
-                    TlsEnrollmentStatus.Denied => "denied",
-                    _ => "failed",
-                },
-                requestId = result.RequestId,
-                message = result.Message,
-            });
-        }
+                    outcome = result.Outcome switch
+                    {
+                        HttpsCertificateRenewalOutcome.Pending => "pending",
+                        HttpsCertificateRenewalOutcome.Denied => "denied",
+                        _ => "failed",
+                    },
+                    requestId = result.RequestId,
+                    message = result.Message,
+                });
 
-        if (!result.ExternalHostCovered)
-        {
-            TryRemoveFromStore(result.Thumbprint!, "the freshly issued certificate");
-            _logger.LogWarning(
-                "Certificate renewal with template {Template} issued names ({Names}) that do not " +
-                "cover the external URL host; the certificate was removed again",
-                template, string.Join(", ", result.IssuedNames ?? []));
-            return Ok(new
-            {
-                outcome = "sanMismatch",
-                issuedNames = result.IssuedNames,
-                requestId = result.RequestId,
-                message = "The CA issued a certificate that does not cover the external URL host, " +
-                          "so it was not applied. Check the Subject Name tab of the " +
-                          $"{template} template (\"Supply in the request\").",
-            });
+            case HttpsCertificateRenewalOutcome.SanMismatch:
+                return Ok(new
+                {
+                    outcome = "sanMismatch",
+                    issuedNames = result.IssuedNames,
+                    requestId = result.RequestId,
+                    message = result.Message,
+                });
         }
-
-        _setupService.SetHttpsCertificateThumbprint(result.Thumbprint!, template);
 
         // The overlay now points at the new certificate, so the superseded
-        // one only clutters the store. Best effort in truth, not just in
-        // comment: a store failure here (a transient AV or ACL lock on
-        // LocalMachine\My) must not turn an otherwise successful renewal
-        // into an unhandled error, and must not skip scheduling the restart
-        // that applies the new certificate the overlay already points at.
+        // one only clutters the store. Safe here and only here: this endpoint
+        // restarts immediately, so the process stops serving the superseded
+        // certificate within seconds. The background renewal service must
+        // never do this, because its host keeps serving that certificate
+        // until an administrator applies the new one.
+        var previousThumbprint = result.PreviousThumbprint;
         if (!string.IsNullOrWhiteSpace(previousThumbprint) &&
             !string.Equals(previousThumbprint, result.Thumbprint, StringComparison.OrdinalIgnoreCase))
         {
-            TryRemoveFromStore(previousThumbprint, "the superseded certificate");
+            _renewal.TryRemoveFromStore(previousThumbprint, "the superseded certificate");
         }
 
         var restartScheduled = _serviceRestarter.TryScheduleRestart();
         _logger.LogInformation(
             "Webserver certificate renewed with template {Template}: {Thumbprint} replaces {Previous}",
-            template, result.Thumbprint, previousThumbprint ?? "(none)");
+            result.Template, result.Thumbprint, previousThumbprint ?? "(none)");
 
         return Ok(new
         {
@@ -366,25 +556,51 @@ public sealed class SettingsController : ControllerBase
     }
 
     /// <summary>
-    /// Remove a certificate from the store without letting a store failure
-    /// (a transient AV or ACL lock) turn into an unhandled 500 partway
-    /// through a renewal that has already succeeded. A leftover certificate
-    /// is only visible in certlm.msc; a swallowed exception here must never
-    /// stop the caller from scheduling the restart that applies the new one.
+    /// POST /api/settings/https-certificate/apply — schedule the restart that
+    /// starts serving a certificate the background renewal already enrolled
+    /// and wrote into the overlay (issue #105). Writes nothing: the overlay
+    /// already points at the new certificate, so this only applies what is
+    /// recorded. Refused when nothing is pending, so the button can never
+    /// bounce the service for no reason.
     /// </summary>
-    private void TryRemoveFromStore(string thumbprint, string description)
+    [HttpPost("https-certificate/apply")]
+    public IActionResult ApplyHttpsCertificate()
     {
+        string? overlayThumbprint;
         try
         {
-            _certificateStore.Remove(thumbprint);
+            overlayThumbprint = SettingsOverlay.Load(_setupService.SettingsOverlayPath)
+                .HttpsCertificateThumbprint;
         }
-        catch (Exception ex)
+        catch (JsonException ex)
         {
-            _logger.LogWarning(ex,
-                "Could not remove {Description} ({Thumbprint}) from the certificate store; " +
-                "it will remain until removed by hand",
-                description, thumbprint);
+            return OverlayUnreadable(ex);
         }
+
+        if (string.IsNullOrWhiteSpace(overlayThumbprint) ||
+            string.Equals(overlayThumbprint, _certusOptions.HttpsCertificateThumbprint,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return Conflict(new
+            {
+                error = "No renewed certificate is waiting to be applied.",
+            });
+        }
+
+        var restartScheduled = _serviceRestarter.TryScheduleRestart();
+        _logger.LogInformation(
+            "Applying renewed webserver certificate {Thumbprint} from the dashboard; " +
+            "restart scheduled: {RestartScheduled}",
+            overlayThumbprint, restartScheduled);
+
+        return Ok(new
+        {
+            thumbprint = overlayThumbprint,
+            restartScheduled,
+            message = restartScheduled
+                ? "The service is restarting to serve the renewed certificate."
+                : "Restart the service to serve the renewed certificate.",
+        });
     }
 
     /// <summary>
@@ -412,3 +628,22 @@ public sealed class SettingsController : ControllerBase
 public sealed record UpdateExternalUrlRequest(
     string Url,
     bool ConfirmUnreachableExternalUrl = false);
+
+/// <summary>
+/// Request body for changing the allowed domain policy. Domains may be null
+/// or empty when Enabled is false (turning the restriction off keeps no
+/// list); turning it on requires at least one usable entry.
+/// </summary>
+public sealed record UpdateAllowedDomainsRequest(
+    bool Enabled,
+    List<string>? Domains = null);
+
+/// <summary>
+/// Request body for changing the revocation scope. CustomTemplates is kept
+/// whatever the mode, so toggling away from custom and back does not lose
+/// the list; an empty list under custom disables dashboard revocation
+/// entirely, which fails safe.
+/// </summary>
+public sealed record UpdateRevocationScopeRequest(
+    string? Mode,
+    List<string>? CustomTemplates = null);

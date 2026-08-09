@@ -160,8 +160,60 @@ public enum CertificateStatus
 }
 
 /// <summary>
+/// Cryptographic detail read out of a certificate's DER encoding by
+/// <see cref="CertificateDerParser"/>. Every member is nullable: a certificate
+/// need not carry an EKU or key usage extension, and an algorithm whose
+/// strength is not a modulus or curve size has no key size to report.
+///
+/// Codes are stored exactly as the certificate carries them (OIDs, the RFC 5280
+/// key usage bit field) and are labelled for display in the dashboard, the same
+/// way revocation reason codes are. Persisting resolved names instead would bake
+/// the CA host's Windows locale into the database, because Oid.FriendlyName
+/// answers from the operating system's OID table.
+/// </summary>
+/// <param name="KeyAlgorithm">
+/// A short stable token for the subject public key algorithm ("RSA", "ECDSA"),
+/// or the raw algorithm OID when it is not one we name.
+/// </param>
+/// <param name="KeySizeBits">Key size in bits, or null when it does not apply.</param>
+/// <param name="SignatureAlgorithmOid">The signature algorithm OID.</param>
+/// <param name="Sha256Thumbprint">Uppercase hex SHA-256 thumbprint, not the SHA-1 one.</param>
+/// <param name="ExtendedKeyUsageOids">EKU OIDs in certificate order, joined with ", ".</param>
+/// <param name="KeyUsage">The raw X509KeyUsageFlags bit field.</param>
+public sealed record CertificateCryptoDetail(
+    string? KeyAlgorithm,
+    int? KeySizeBits,
+    string? SignatureAlgorithmOid,
+    string? Sha256Thumbprint,
+    string? ExtendedKeyUsageOids,
+    int? KeyUsage);
+
+/// <summary>
 /// Summary information about a certificate from the CA database.
 /// </summary>
+/// <param name="CryptoDetail">
+/// Detail parsed from the certificate's own DER, which the CA view already
+/// returns in its RawCertificate column, so populating it costs no extra CA
+/// round trip. Null when the row carried no certificate blob or the blob did
+/// not decode; the sync treats that as "nothing new to say" and leaves any
+/// detail it captured on an earlier pass alone.
+/// </param>
+/// <param name="DispositionMessage">
+/// The CA's own explanation of what happened to the request, verbatim. Null on
+/// issued and revoked rows, where the CA supplies no explanation worth showing.
+/// </param>
+/// <param name="StatusCode">
+/// The HRESULT the CA recorded against the request. Null on issued and revoked
+/// rows, and null when the CA recorded zero, which means success.
+/// </param>
+/// <param name="RawCertificate">
+/// The certificate's DER encoding, the same bytes <paramref name="CryptoDetail"/>
+/// was parsed from, carried through so the sync can persist them for the single
+/// certificate download (issue #158). Non null only when those bytes decoded as
+/// a certificate, so an undecodable blob is never stored. Null exactly when
+/// <paramref name="CryptoDetail"/> is null, and treated the same way: nothing
+/// new to say, leave whatever an earlier pass captured alone.
+/// </param>
 public sealed record CertificateInfo(
     int RequestId,
     string SerialNumber,
@@ -174,15 +226,36 @@ public sealed record CertificateInfo(
     string? Requestor,
     DateTime RequestDate,
     DateTime? RevokedWhen = null,
-    int? RevokedReason = null);
+    int? RevokedReason = null,
+    CertificateCryptoDetail? CryptoDetail = null,
+    string? DispositionMessage = null,
+    int? StatusCode = null,
+    byte[]? RawCertificate = null);
 
 /// <summary>
 /// Query parameters for searching the CA certificate database.
 /// </summary>
+/// <param name="SubmittedAfter">
+/// Restricts the view to requests submitted at or after this instant. The
+/// certificate sync uses it to bound how far back the pending pass reaches,
+/// since that disposition accumulates without limit on a busy CA while the
+/// issued inventory is what the dashboard is actually for.
+/// </param>
+/// <param name="ResolvedAfter">
+/// Restricts the view to requests the CA decided at or after this instant.
+/// The sync bounds its denied and failed passes on this rather than
+/// <paramref name="SubmittedAfter"/> (issue #187): a request submitted before
+/// the history window and denied inside it is invisible to a SubmittedWhen
+/// bound, so its local row would say Pending forever. A pending request has
+/// no ResolvedWhen yet, so this bound must never be applied to the pending
+/// pass or it returns nothing.
+/// </param>
 public sealed record CertificateQuery(
     string? TemplateName = null,
     string? SubjectContains = null,
     CertificateStatus? Status = null,
     DateTime? ExpiringBefore = null,
     int Skip = 0,
-    int Take = 50);
+    int Take = 50,
+    DateTime? SubmittedAfter = null,
+    DateTime? ResolvedAfter = null);

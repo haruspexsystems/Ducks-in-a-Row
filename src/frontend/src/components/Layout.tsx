@@ -1,13 +1,17 @@
 import { Link, Outlet, useLocation } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { FlaskConical, LayoutDashboard, List, Settings } from 'lucide-react';
+import { FlaskConical, KeyRound, LayoutDashboard, List, Settings } from 'lucide-react';
 import { DuckMark } from '@/features/dashboard/components/DuckMark';
-import { ACCENT, NAV_BG, NAV_BORDER } from '@/features/dashboard/lib/colors';
+import { ACCENT } from '@/features/dashboard/lib/colors';
 import { fetchSetupConfig } from '@/api/setup';
+import { HttpsCertificateNoticeBanner } from '@/components/HttpsCertificateNoticeBanner';
+import { SupportFooter } from '@/components/SupportFooter';
+import { ThemeToggle } from '@/components/ThemeToggle';
 
 const navItems = [
   { path: '/', label: 'Dashboard', icon: LayoutDashboard },
   { path: '/certificates', label: 'Certificates', icon: List },
+  { path: '/acme', label: 'ACME', icon: KeyRound },
   { path: '/settings', label: 'Settings', icon: Settings },
 ];
 
@@ -44,10 +48,13 @@ export function Layout() {
   const location = useLocation();
 
   return (
-    <div className="min-h-screen bg-[#F6F7F9]">
+    <div className="min-h-screen bg-bg">
       <MockCaBanner />
-      {/* Top navigation bar — deep-slate brand chrome */}
-      <header className="border-b" style={{ background: NAV_BG, borderColor: NAV_BORDER }}>
+      <HttpsCertificateNoticeBanner />
+      {/* Top navigation bar — deep-slate brand chrome, identical in both themes.
+          Driven by tokens rather than inline styles: an inline style attribute
+          cannot respond to the `.dark` class at all. */}
+      <header className="border-b bg-nav-bg border-nav-border">
         <div className="max-w-screen-2xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex items-center justify-between h-16">
             {/* Brand */}
@@ -91,6 +98,7 @@ export function Layout() {
                   </Link>
                 );
               })}
+              <ThemeToggle />
             </nav>
           </div>
         </div>
@@ -100,6 +108,10 @@ export function Layout() {
       <main className="max-w-screen-2xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
         <Outlet />
       </main>
+
+      {/* Reaching us is the same one glance away from every page, because
+          nothing is collected and a channel nobody can find is no channel. */}
+      <SupportFooter />
     </div>
   );
 }

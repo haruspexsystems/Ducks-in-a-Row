@@ -30,7 +30,7 @@ export interface FleetHealth {
   segments: HealthSegment[];
 }
 
-export type ActivityType = 'issued' | 'renewed' | 'expired' | 'revoked' | 'warning';
+export type ActivityType = 'issued' | 'renewed' | 'expired' | 'revoked' | 'warning' | 'rejected';
 
 export interface ActivityItem {
   id: string;
@@ -56,13 +56,27 @@ export interface ValidationMethod {
   id: string;
   label: string;
   count: number;
+  /** Bar and label color on a light surface. */
   color: string;
+  /**
+   * The same hue lightened for a dark surface. The light values are mid-tone
+   * 500 steps that sit right on the WCAG AA boundary against white and fall
+   * under it against the dark card, so the label needs a brighter step rather
+   * than the same hex in both themes.
+   */
+  colorDark: string;
   note: string;
 }
 
 /** Everything the dashboard renders, as one fetchable payload. */
 export interface DashboardData {
   stats: StatCard[];
+  /**
+   * The "expiring soon" window in days that the backend applied to these
+   * counts (issue #152). Carried alongside the data so the quick action deep
+   * link filters the list to the same window the stat card counted.
+   */
+  warningDays: number;
   health: FleetHealth;
   registrations: RegistrationSeries;
   validation: ValidationMethod[];

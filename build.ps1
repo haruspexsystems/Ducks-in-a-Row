@@ -29,6 +29,13 @@
 .PARAMETER Runtime
     Target runtime identifier. Default: win-x64
 
+.PARAMETER CommitSha
+    The commit identifier to stamp into the published assemblies' version
+    metadata (issue #112). Overrides the automatic resolution described in
+    Resolve-CommitSha below. Passing it explicitly always wins, so
+    -CommitSha "" forces a build with no stamp even in a git checkout, which
+    is how to reproduce a release source snapshot build without deleting .git.
+
 .EXAMPLE
     .\build.ps1
     .\build.ps1 -SkipFrontend -SkipMsi
@@ -41,7 +48,8 @@ param(
     [switch]$SkipMsi,
     [switch]$SkipBundle,
     [switch]$IncludeTests,
-    [string]$Runtime = "win-x64"
+    [string]$Runtime = "win-x64",
+    [string]$CommitSha = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -64,18 +72,82 @@ $InstallerDir = Join-Path $RepoRoot "installer"
 # is pinned to an exact version and SHA-512 here, downloaded on demand, and
 # cached in installer/redist (gitignored) so later builds reuse it. Always
 # bump the version and the hash together; the published hash for each release
-# is in https://builds.dotnet.microsoft.com/dotnet/release-metadata/8.0/releases.json
-$HostingBundleVersion = "8.0.28"
-$HostingBundleSha512 = "b192a0a73c5fc5c3ea5f3d8ab05020261b456cd34c692558fe996d8c2fd1ffe31dbb3a53d815fae863a1c2586ada77ffea01cfa935f7bbe2983741940cecc692"
+# is in https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json
+$HostingBundleVersion = "10.0.10"
+$HostingBundleSha512 = "11e66d71e01a32794051437124df4f63585d40ff80b837a9520e4a0bf9ce18b750765e25398b42455745183b972fa0541426fdf4f9ea253d61e129302f21460e"
 $HostingBundleUrl = "https://builds.dotnet.microsoft.com/dotnet/aspnetcore/Runtime/$HostingBundleVersion/dotnet-hosting-$HostingBundleVersion-win.exe"
 $RedistDir = Join-Path $InstallerDir "redist"
 $HostingBundleExe = Join-Path $RedistDir "dotnet-hosting-$HostingBundleVersion-win.exe"
+
+# ---- Commit stamp (issue #112) ----------------------------------------------
+# Resolves the commit identity to stamp into the published assemblies. This
+# script owns the git lookup, not MSBuild: Directory.Build.props keeps
+# EnableSourceControlManagerQueries off for the #104 source-path privacy
+# reason, and the value travels in as /p:SourceRevisionId on the publish below.
+#
+# The stamp is best effort by design. A build from the release source snapshot
+# (release/Publish-Release.ps1 ships a `git archive`, which has no .git) has
+# nothing to resolve, and must still succeed. It builds without a stamp and the
+# gate after the publish is skipped rather than failed.
+#
+# A dirty tree stamps "<sha>.dirty" so a developer build never claims to be a
+# clean commit. Releases can never carry it: Publish-Release.ps1 refuses to run
+# on a dirty tree.
+function Resolve-CommitSha {
+    param(
+        [string]$Override,
+        [switch]$OverrideProvided
+    )
+
+    # An explicitly passed -CommitSha always wins, including an empty one. The
+    # caller has to tell us it was passed, because the parameter's own default
+    # is "" and PowerShell cannot tell "" apart from omitted on its own. That
+    # is what makes -CommitSha "" a real "no stamp" switch rather than a
+    # silent fall through to git.
+    if ($OverrideProvided) {
+        if ([string]::IsNullOrWhiteSpace($Override)) {
+            return $null
+        }
+        return [pscustomobject]@{ Sha = $Override.Trim(); Source = "-CommitSha parameter" }
+    }
+
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        # A source-only tree has no .git, so this fails rather than throws us
+        # off the rails. -ErrorAction Stop is deliberately not used.
+        $sha = & git -C $RepoRoot rev-parse HEAD 2>$null
+        if ($LASTEXITCODE -eq 0 -and $sha) {
+            $sha = $sha.Trim()
+            $dirty = & git -C $RepoRoot status --porcelain 2>$null
+            if ($LASTEXITCODE -eq 0 -and $dirty) {
+                return [pscustomobject]@{ Sha = "$sha.dirty"; Source = "git HEAD (working tree is dirty)" }
+            }
+            return [pscustomobject]@{ Sha = $sha; Source = "git HEAD" }
+        }
+    }
+
+    if ($env:CERTUS_COMMIT_SHA) {
+        return [pscustomobject]@{ Sha = $env:CERTUS_COMMIT_SHA; Source = "CERTUS_COMMIT_SHA" }
+    }
+
+    if ($env:GITHUB_SHA) {
+        return [pscustomobject]@{ Sha = $env:GITHUB_SHA; Source = "GITHUB_SHA" }
+    }
+
+    return $null
+}
+
+$commitStamp = Resolve-CommitSha -Override $CommitSha -OverrideProvided:$PSBoundParameters.ContainsKey('CommitSha')
 
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  Certus Build Script" -ForegroundColor Cyan
 Write-Host "  Configuration: $Configuration" -ForegroundColor Cyan
 Write-Host "  Runtime: $Runtime" -ForegroundColor Cyan
 Write-Host "  Started: $($BuildStartUtc.ToString('o'))" -ForegroundColor Cyan
+if ($commitStamp) {
+    Write-Host "  Commit: $($commitStamp.Sha) (from $($commitStamp.Source))" -ForegroundColor Cyan
+} else {
+    Write-Host "  Commit: none resolved (binaries will carry no commit stamp)" -ForegroundColor Yellow
+}
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -90,14 +162,29 @@ $cleanRoots = @(
     (Join-Path $RepoRoot "tests")
 )
 foreach ($root in $cleanRoots) {
-    if (Test-Path $root) {
-        # NOTE: deliberately no -ErrorAction SilentlyContinue here. A locked
-        # file or permission denial in the QA pipeline was previously swallowed,
-        # leaving stale DLLs in bin/ that the next publish then re-packaged
-        # into a fresh MSI. Surface the failure instead.
-        Get-ChildItem -Path $root -Recurse -Directory -Force |
-            Where-Object { $_.Name -in 'bin','obj' } |
-            ForEach-Object { Remove-Item $_.FullName -Recurse -Force }
+    if (-not (Test-Path $root)) { continue }
+
+    # Clean only the .NET project directories. A blanket recursive sweep for any
+    # directory named bin or obj also reaches into src/frontend/node_modules and
+    # deletes package bin folders, typescript/bin/tsc among them, which breaks
+    # 'npm run build' with a confusing "Cannot find module" until 'npm ci' is run
+    # again. Step 1 normally reinstalls and masks the damage, but -SkipFrontend
+    # leaves the developer's node_modules broken.
+    $projectDirs = Get-ChildItem -Path $root -Recurse -File -Filter '*.csproj' -Force |
+        Where-Object { $_.FullName -notlike '*\node_modules\*' } |
+        Select-Object -ExpandProperty DirectoryName -Unique
+
+    foreach ($projectDir in $projectDirs) {
+        foreach ($name in 'bin','obj') {
+            $target = Join-Path $projectDir $name
+            if (Test-Path $target) {
+                # NOTE: deliberately no -ErrorAction SilentlyContinue here. A locked
+                # file or permission denial in the QA pipeline was previously swallowed,
+                # leaving stale DLLs in bin/ that the next publish then re-packaged
+                # into a fresh MSI. Surface the failure instead.
+                Remove-Item $target -Recurse -Force
+            }
+        }
     }
 }
 Write-Host "  bin/obj cleaned" -ForegroundColor Green
@@ -157,12 +244,22 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "  Restore complete (log: $restoreLog)" -ForegroundColor Green
 
-dotnet publish $ServiceProject `
-    -c $Configuration `
-    -r $Runtime `
-    --self-contained false `
-    -o $PublishDir `
-    /p:PublishReadyToRun=true
+# /p:SourceRevisionId is what puts "+<sha>" on AssemblyInformationalVersion and
+# from there into the Win32 ProductVersion resource of every published assembly
+# (issue #112). Omitted entirely when nothing resolved, so a source-only build
+# behaves exactly as it did before.
+$publishArgs = @(
+    "-c", $Configuration,
+    "-r", $Runtime,
+    "--self-contained", "false",
+    "-o", $PublishDir,
+    "/p:PublishReadyToRun=true"
+)
+if ($commitStamp) {
+    $publishArgs += "/p:SourceRevisionId=$($commitStamp.Sha)"
+}
+
+dotnet publish $ServiceProject @publishArgs
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "  Publish failed!" -ForegroundColor Red
@@ -172,7 +269,7 @@ if ($LASTEXITCODE -ne 0) {
 # Diagnostic: log the LastWriteTimeUtc of Certus.Adcs.dll inside the project's
 # bin/ directory. If this is older than the build start, the compiler itself
 # was a no-op and the cleanup in step 0 did not reach this folder.
-$adcsBinDll = Join-Path $RepoRoot "src/Certus.Adcs/bin/$Configuration/net8.0-windows/Certus.Adcs.dll"
+$adcsBinDll = Join-Path $RepoRoot "src/Certus.Adcs/bin/$Configuration/net10.0-windows/Certus.Adcs.dll"
 if (Test-Path $adcsBinDll) {
     $adcsBin = Get-Item $adcsBinDll
     Write-Host "  src/Certus.Adcs/bin Certus.Adcs.dll LastWriteUtc: $($adcsBin.LastWriteTimeUtc.ToString('o'))" -ForegroundColor Gray
@@ -198,6 +295,55 @@ if ($svc.LastWriteTimeUtc -lt $cutoff) {
     Write-Host "         Build started: $($BuildStartUtc.ToString('o'))" -ForegroundColor Red
     Write-Host "         The clean step did not take effect or the compile was a no-op." -ForegroundColor Red
     exit 1
+}
+
+# Commit stamp assertion (issue #112). This is the check #108 did not have: its
+# verification was "Release test suite green, 0 failing", and no test asserts on
+# version metadata, so losing the stamp went unnoticed for two QA cycles. The
+# stamp is only assertable where the sha is known, which is here and not in the
+# test suite, because `dotnet test` also has to pass on a source-only tree.
+#
+# ProductVersion is read off the Win32 resource, which is written from
+# AssemblyInformationalVersion. Verified to survive the ReadyToRun crossgen this
+# publish runs with. Both the entry assembly and Certus.Web are checked:
+# Certus.Web is the one SettingsController reads to answer /api/settings/info,
+# so it is the assembly a regression would actually reach a user through.
+#
+# Deliberately placed before the MSI step, not inside it, so CI exercises it:
+# .github/workflows/pr-build.yml runs ./build.ps1 -SkipMsi.
+if ($commitStamp) {
+    Write-Host "  Verifying the commit stamp in ProductVersion..." -ForegroundColor Gray
+    foreach ($name in @("DucksInARow.Service.dll", "Certus.Web.dll")) {
+        $stampedDll = Join-Path $PublishDir $name
+        if (-not (Test-Path $stampedDll)) {
+            Write-Host "  ERROR: $stampedDll missing after publish." -ForegroundColor Red
+            exit 1
+        }
+        $productVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($stampedDll).ProductVersion
+        # Ordinal substring, deliberately not -like. The sha can arrive from
+        # CERTUS_COMMIT_SHA or GITHUB_SHA, which nothing here validates, and a
+        # wildcard character in it would turn -like into a pattern that matches
+        # far more than the literal stamp, so the gate would pass on a binary
+        # that never carried it. The null check keeps a missing version
+        # resource from reporting as a plain stamp mismatch.
+        if ([string]::IsNullOrEmpty($productVersion) -or
+            -not $productVersion.Contains($commitStamp.Sha, [StringComparison]::Ordinal)) {
+            Write-Host "  ERROR: $name carries no commit stamp (issue #112)." -ForegroundColor Red
+            Write-Host "         ProductVersion: '$productVersion'" -ForegroundColor Red
+            Write-Host "         Expected it to contain: $($commitStamp.Sha)" -ForegroundColor Red
+            Write-Host "         SourceRevisionId did not reach the compiler. Check that" -ForegroundColor Red
+            Write-Host "         IncludeSourceRevisionInInformationalVersion is still true in" -ForegroundColor Red
+            Write-Host "         Directory.Build.props and that the publish was not a no-op." -ForegroundColor Red
+            exit 1
+        }
+        Write-Host "    $name ProductVersion: $productVersion" -ForegroundColor Gray
+    }
+    Write-Host "  Commit stamp verified" -ForegroundColor Green
+} else {
+    Write-Host "  WARNING: no commit resolved, so the published binaries carry no" -ForegroundColor Yellow
+    Write-Host "           commit stamp and the #112 check is skipped. Expected when" -ForegroundColor Yellow
+    Write-Host "           building from a source snapshot with no .git; pass" -ForegroundColor Yellow
+    Write-Host "           -CommitSha or set CERTUS_COMMIT_SHA to stamp anyway." -ForegroundColor Yellow
 }
 
 # Copy wwwroot into publish output if it exists
@@ -378,7 +524,7 @@ if (-not $SkipMsi) {
 
             # Drift guard: the embedded runtime major must match the service
             # target framework major, or the bundle would install a runtime
-            # the app cannot run on. Parse the csproj itself (net8.0-windows),
+            # the app cannot run on. Parse the csproj itself (net10.0-windows),
             # not Directory.Build.props, which the service overrides. Runs
             # before the download so a drifted pin fails without pulling
             # 100 MB first.

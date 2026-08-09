@@ -4,19 +4,19 @@ export function WelcomeStep() {
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-xl font-bold text-slate-900">Welcome to Ducks in a Row</h2>
-        <p className="text-sm text-slate-500 mt-1">
+        <h2 className="text-xl font-bold text-ink">Welcome to Ducks in a Row</h2>
+        <p className="text-sm text-muted mt-1">
           This wizard will guide you through connecting Ducks in a Row to your Active Directory Certificate Services CA.
         </p>
       </div>
 
-      <div className="bg-certus-50 border border-certus-200 rounded-lg p-4">
-        <p className="text-sm text-certus-800">
+      <div className="bg-certus-50 dark:bg-certus-500/10 border border-certus-200 dark:border-certus-500/30 rounded-lg p-4">
+        <p className="text-sm text-certus-800 dark:text-certus-300">
           <strong>What you'll need:</strong>
         </p>
-        <ul className="text-sm text-certus-700 mt-2 space-y-1 list-disc list-inside">
+        <ul className="text-sm text-certus-700 dark:text-certus-300 mt-2 space-y-1 list-disc list-inside">
           <li>This server must be <strong>domain-joined</strong> (DCOM requires AD authentication)</li>
-          <li>The CA hostname and name (e.g., <code className="bg-certus-100 px-1 rounded">ca-server\Contoso-CA</code>)</li>
+          <li>The CA hostname and name (e.g., <code className="bg-certus-100 dark:bg-certus-500/15 px-1 rounded">ca-server\Contoso-CA</code>)</li>
           <li>Network access from this server to the CA (RPC/DCOM ports)</li>
           <li>The URL that ACME clients will use to reach this server</li>
         </ul>
@@ -45,7 +45,7 @@ export function WelcomeStep() {
         />
       </div>
 
-      <p className="text-xs text-slate-400 mt-4">
+      <p className="text-xs text-faint mt-4">
         Setup typically takes less than 5 minutes. Click <strong>Next</strong> to begin.
       </p>
     </div>
@@ -54,11 +54,11 @@ export function WelcomeStep() {
 
 function FeatureCard({ icon, title, description }: { icon: React.ReactNode; title: string; description: string }) {
   return (
-    <div className="flex items-start gap-3 p-3 rounded-lg border border-slate-100 bg-slate-50">
-      <div className="p-2 rounded-md bg-white text-certus-600 shadow-sm">{icon}</div>
+    <div className="flex items-start gap-3 p-3 rounded-lg border border-hairline-soft bg-sunken">
+      <div className="p-2 rounded-md bg-surface text-certus-600 shadow-sm">{icon}</div>
       <div>
-        <h3 className="text-sm font-semibold text-slate-900">{title}</h3>
-        <p className="text-xs text-slate-500 mt-0.5">{description}</p>
+        <h3 className="text-sm font-semibold text-ink">{title}</h3>
+        <p className="text-xs text-muted mt-0.5">{description}</p>
       </div>
     </div>
   );

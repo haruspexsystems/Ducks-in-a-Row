@@ -72,7 +72,7 @@ public sealed class RevokeCertController : AcmeControllerBase
         try
         {
             var der = JwsService.Base64UrlDecode(request.Certificate);
-            submitted = new X509Certificate2(der);
+            submitted = X509CertificateLoader.LoadCertificate(der);
         }
         catch (Exception)
         {

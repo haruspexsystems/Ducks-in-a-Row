@@ -95,7 +95,14 @@ public class KeyChangeIntegrationTests : IDisposable
         var jws = await BuildKeyChangeJws(oldKeyA, keyB, accountA.Kid, accountA.Kid);
         var response = await PostJws(KeyChangePath, jws);
 
-        response.StatusCode.Should().Be(HttpStatusCode.Conflict);
+        // Read the body before asserting. This test failed twice under the full Release suite
+        // (issue #127) and the status code alone did not say why; the ACME problem document
+        // names the refusal, so carry it into the failure message.
+        var body = await response.Content.ReadAsStringAsync();
+
+        response.StatusCode.Should().Be(HttpStatusCode.Conflict, "the response body was {0}", body);
+        response.Headers.Location.Should().NotBeNull(
+            "a 409 must name the account that already holds the key; the response body was {0}", body);
         response.Headers.Location!.ToString().Should().Be(accountB.Kid,
             "the 409 points at the account that already holds the key (RFC 8555 §7.3.5)");
     }
@@ -127,7 +134,14 @@ public class KeyChangeIntegrationTests : IDisposable
         var jws = SignJws(rsa, headerJson, payloadJson);
 
         var response = await PostJws("/acme/WebServer/new-account", jws);
-        response.EnsureSuccessStatusCode();
+
+        // Assert rather than EnsureSuccessStatusCode: every test here builds its accounts through
+        // this helper, and a bare HttpRequestException names neither the status nor the problem
+        // document, which is what made the issue #127 failure unreadable after the fact.
+        var body = await response.Content.ReadAsStringAsync();
+        response.IsSuccessStatusCode.Should().BeTrue(
+            "new-account must succeed before the key-change assertions mean anything; " +
+            "the status was {0} and the body was {1}", response.StatusCode, body);
 
         var kid = response.Headers.GetValues("Location").First();
         return (new AccountInfo(kid, kid.Split('/').Last()), rsa);

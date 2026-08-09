@@ -1,6 +1,10 @@
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using Certus.Core.Alerts;
+using Certus.Core.Configuration;
 using Certus.Core.Data;
 using Certus.Core.Data.Entities;
+using Certus.Core.Setup;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -48,12 +52,64 @@ public class ExpiryMonitorServiceTests : IDisposable
         db.Database.EnsureCreated();
     }
 
-    private ExpiryMonitorService CreateService()
+    private ExpiryMonitorService CreateService(ServerCertificateIdentity? serverCertificate = null)
     {
         return new ExpiryMonitorService(
             _serviceProvider.GetRequiredService<IServiceScopeFactory>(),
             Options.Create(_alertOptions),
-            NullLogger<ExpiryMonitorService>.Instance);
+            NullLogger<ExpiryMonitorService>.Instance,
+            serverCertificate ?? NoServerCertificate());
+    }
+
+    /// <summary>
+    /// An identity that owns nothing, for the tests that are not about
+    /// suppression: no thumbprint is configured, so it resolves to an empty
+    /// list and every certificate alerts as it always did.
+    /// </summary>
+    private static ServerCertificateIdentity NoServerCertificate() =>
+        new(Substitute.For<IHttpsCertificateStore>(),
+            Options.Create(new CertusOptions
+            {
+                // Point at a path that does not exist rather than letting the
+                // default resolve to the real data directory: a unit test must
+                // never read the operator's ProgramData overlay.
+                SettingsOverlayPath = Path.Combine(
+                    Path.GetTempPath(), "certus-no-such-overlay-" + Guid.NewGuid().ToString("N") + ".json"),
+            }),
+            NullLogger<ServerCertificateIdentity>.Instance);
+
+    /// <summary>
+    /// A <see cref="ServerCertificateIdentity"/> whose store holds one
+    /// certificate carrying <paramref name="serialHex"/>, which is what the
+    /// server's own HTTPS certificate looks like to the suppression path.
+    /// </summary>
+    private static (ServerCertificateIdentity Identity, X509Certificate2 Certificate)
+        ServerCertificateWithSerial(byte[] serialHex)
+    {
+        using var key = RSA.Create(2048);
+        var request = new CertificateRequest(
+            "CN=certus.home.local", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        var certificate = request.Create(
+            request.SubjectName,
+            X509SignatureGenerator.CreateForRSA(key, RSASignaturePadding.Pkcs1),
+            DateTimeOffset.UtcNow.AddDays(-30),
+            DateTimeOffset.UtcNow.AddDays(20),
+            serialHex);
+
+        var store = Substitute.For<IHttpsCertificateStore>();
+        store.Find("AA11BB22").Returns(_ => X509CertificateLoader.LoadCertificate(certificate.RawData));
+
+        var options = Options.Create(new CertusOptions
+        {
+            HttpsCertificateThumbprint = "AA11BB22",
+            // A path that does not exist reads as an empty overlay, so the
+            // in process thumbprint above is the whole answer.
+            SettingsOverlayPath = Path.Combine(
+                Path.GetTempPath(), "certus-no-such-overlay-" + Guid.NewGuid().ToString("N") + ".json"),
+        });
+
+        return (new ServerCertificateIdentity(
+            store, options, NullLogger<ServerCertificateIdentity>.Instance), certificate);
     }
 
     private CertusDbContext GetDb()
@@ -63,13 +119,15 @@ public class ExpiryMonitorServiceTests : IDisposable
         return scope.ServiceProvider.GetRequiredService<CertusDbContext>();
     }
 
-    private void SeedCertificate(int requestId, string subject, int daysUntilExpiry, string status = "Issued")
+    private void SeedCertificate(
+        int requestId, string subject, int daysUntilExpiry, string status = "Issued",
+        string? serialNumber = null)
     {
         var db = GetDb();
         db.SyncedCertificates.Add(new SyncedCertificate
         {
             RequestId = requestId,
-            SerialNumber = $"SERIAL{requestId:D4}",
+            SerialNumber = serialNumber ?? $"SERIAL{requestId:D4}",
             Subject = subject,
             TemplateName = "WebServer",
             NotBefore = DateTime.UtcNow.AddDays(-30),
@@ -231,6 +289,50 @@ public class ExpiryMonitorServiceTests : IDisposable
         var alert = await db.AlertsSent.FirstAsync();
         alert.Success.Should().BeFalse();
         alert.ErrorMessage.Should().Be("SMTP connection refused");
+    }
+
+    /// <summary>
+    /// The server's own HTTPS certificate is issued by the monitored CA, so it
+    /// syncs into the inventory like any other. Automatic renewal owns it
+    /// (issue #105), so the threshold ladder must stay quiet about it, and no
+    /// AlertsSent row may be written either: if it ever stops being ours, the
+    /// normal alerts have to start firing again.
+    /// </summary>
+    [Fact]
+    public async Task Check_ServerOwnCertificate_IsSuppressed()
+    {
+        // The CA database stores the serial lowercase with no pad; the X509
+        // form is uppercase and carries the leading zero of a DER integer
+        // whose top bit is set. Both sides must normalize before comparing.
+        var (identity, certificate) = ServerCertificateWithSerial([0x00, 0xAB, 0xCD]);
+        using var _ = certificate;
+        SeedCertificate(1, "CN=certus.home.local", 20, serialNumber: "abcd");
+
+        var sut = CreateService(identity);
+        await sut.CheckForExpiringCertificatesAsync(CancellationToken.None);
+
+        await _mockNotifier.DidNotReceive().SendExpiryAlertAsync(
+            Arg.Any<ExpiryAlertBatch>(), Arg.Any<CancellationToken>());
+        (await GetDb().AlertsSent.CountAsync()).Should().Be(0);
+    }
+
+    [Fact]
+    public async Task Check_ServerOwnCertificate_DoesNotSilenceItsNeighbours()
+    {
+        var (identity, certificate) = ServerCertificateWithSerial([0x00, 0xAB, 0xCD]);
+        using var _ = certificate;
+        SeedCertificate(1, "CN=certus.home.local", 20, serialNumber: "abcd");
+        SeedCertificate(2, "CN=other.example.com", 20);
+
+        var sut = CreateService(identity);
+        await sut.CheckForExpiringCertificatesAsync(CancellationToken.None);
+
+        await _mockNotifier.Received(1).SendExpiryAlertAsync(
+            Arg.Is<ExpiryAlertBatch>(b =>
+                b.ThresholdDays == 30 &&
+                b.Certificates.Count == 1 &&
+                b.Certificates[0].Subject == "CN=other.example.com"),
+            Arg.Any<CancellationToken>());
     }
 
     public void Dispose()

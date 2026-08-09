@@ -14,7 +14,8 @@ namespace Certus.Adcs.ComInterop;
 
 /// <summary>
 /// COM coclass for CCertAdmin. Instantiates the DCOM client for CA
-/// administration. Currently unused; reserved for future use.
+/// administration. Used by AdcsClient.RevokeCertificateAsync (PR #202),
+/// dispatched through IDispatch as dynamic like every other coclass here.
 /// </summary>
 [ComImport]
 [Guid("37eabaf0-7fb6-11d0-8817-00a0c903b83c")]

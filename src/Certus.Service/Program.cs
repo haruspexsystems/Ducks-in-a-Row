@@ -2,7 +2,9 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading.RateLimiting;
 using Certus.Adcs;
+using Certus.Core.Acme.Attestation;
 using Certus.Core.Acme.Crypto;
+using Certus.Core.ActiveDirectory;
 using Certus.Core.Adcs;
 using Certus.Core.Acme.Services;
 using Certus.Core.Alerts;
@@ -13,7 +15,9 @@ using Certus.Core.Security;
 using Certus.Core.Services;
 using Certus.Core.Setup;
 using Certus.Service;
+using Certus.Web;
 using Certus.Web.Authentication;
+using Certus.Web.Routing;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.EntityFrameworkCore;
@@ -130,7 +134,7 @@ try
         {
             try
             {
-                using var existing = new X509Certificate2(
+                using var existing = X509CertificateLoader.LoadPkcs12FromFile(
                     selfSignedPath, selfSignedPassword, X509KeyStorageFlags.EphemeralKeySet);
                 regenerate = existing.NotAfter.ToUniversalTime()
                     <= DateTime.UtcNow.AddDays(selfSignedRenewalWindowDays);
@@ -219,13 +223,15 @@ try
     // whose operations surface as 503 ca-unavailable until the setup wizard
     // connects a CA. An empty CA string used to fall back to the mock
     // silently, which let a production install complete setup against a fake
-    // CA without noticing. The wizard's probe factory and CA discovery are
-    // registered in the same branch so all three concerns switch together.
+    // CA without noticing. The wizard's probe factory, CA discovery, and the
+    // EAB owner principal lookup are registered in the same branch so every
+    // directory facing concern switches together.
     if (certusOptions.UseMockCa)
     {
         builder.Services.AddMockAdcsClient();
         builder.Services.AddSingleton<IAdcsClientFactory, MockAdcsClientFactory>();
         builder.Services.AddSingleton<ICaDiscoveryService, MockCaDiscoveryService>();
+        builder.Services.AddSingleton<IAdPrincipalLookup, MockAdPrincipalLookup>();
         Log.Warning(
             "Certus:UseMockCa=true — using the mock ADCS client. Certificates are fake; " +
             "never use this in production");
@@ -234,6 +240,7 @@ try
     {
         builder.Services.AddSingleton<IAdcsClientFactory, AdcsClientFactory>();
         builder.Services.AddSingleton<ICaDiscoveryService, AdcsCaDiscoveryService>();
+        builder.Services.AddSingleton<IAdPrincipalLookup, AdPrincipalLookup>();
 
         if (!string.IsNullOrEmpty(certusOptions.CaConnectionString))
         {
@@ -250,12 +257,27 @@ try
     }
 
     // ACME services
+    builder.Services.Configure<AcmeOptions>(
+        builder.Configuration.GetSection(AcmeOptions.SectionName));
     builder.Services.AddSingleton<NonceService>();
     builder.Services.AddSingleton<JwsService>();
     builder.Services.AddScoped<AccountService>();
     builder.Services.AddScoped<OrderService>();
     builder.Services.AddSingleton<EnabledTemplatesPolicy>();
+    builder.Services.AddSingleton<AllowedDomainsPolicy>();
+    builder.Services.AddScoped<DomainPolicyAuditService>();
     builder.Services.AddSingleton<TemplateService>();
+
+    // External account binding (RFC 8555 §7.3.4). The enforcement policy hot
+    // reads the wizard status file; credentials live in the database with
+    // their MAC secrets encrypted at rest through the shared Data Protection
+    // wiring (see CertusDataProtectionExtensions for the keyring and DPAPI
+    // details).
+    builder.Services.AddSingleton<EabEnforcementPolicy>();
+    // The dashboard revocation scope, hot read from the same status file.
+    builder.Services.AddSingleton<RevocationScopePolicy>();
+    builder.Services.AddScoped<EabCredentialService>();
+    builder.Services.AddCertusSecretProtection(certusOptions);
 
     // Setup wizard. The probe factory and CA discovery are registered with
     // the ADCS client tri state above. The restarter applies completed setup
@@ -265,6 +287,18 @@ try
     builder.Services.AddSingleton<IHttpsCertificateStore, MachineHttpsCertificateStore>();
     builder.Services.AddScoped<TlsCertificateEnroller>();
     builder.Services.AddScoped<SetupService>();
+
+    // Automatic renewal of the server's own HTTPS certificate (issue #105).
+    // The renewal core is shared with the settings page button. The hosted
+    // service is registered as a singleton as well, the CertificateSyncService
+    // pattern, so the settings API reads its last attempt off the instance the
+    // loop writes. ServerCertificateIdentity keeps this certificate out of the
+    // product's own expiry alerting.
+    builder.Services.AddScoped<HttpsCertificateRenewalService>();
+    builder.Services.AddSingleton<ServerCertificateIdentity>();
+    builder.Services.AddSingleton<HttpsCertificateAutoRenewalService>();
+    builder.Services.AddHostedService(sp =>
+        sp.GetRequiredService<HttpsCertificateAutoRenewalService>());
 
     // External URL reachability probe (issue #89). Its handler accepts self
     // signed certificates and is deliberately not the challenge egress
@@ -279,6 +313,13 @@ try
     // Dashboard services
     builder.Services.AddScoped<CertificateQueryService>();
     builder.Services.AddScoped<DashboardMetricsService>();
+    builder.Services.AddScoped<CertificateRevocationService>();
+    // The TLS capability gate under both the revoke endpoint and the detail
+    // response's disabled button reason.
+    builder.Services.AddScoped<RevocationEligibilityService>();
+    // Singleton so concurrent scoped requests share the per serial locks
+    // (issue #203); the scoped service above acquires it per revocation.
+    builder.Services.AddSingleton<CertificateRevocationGate>();
 
     // Certificate sync background service. Registered as a singleton the API
     // controllers can reach (manual sync endpoint) and as the hosted service
@@ -292,9 +333,44 @@ try
     // Expiry alert services. ThresholdDays binds onto an empty default, so
     // PostConfigure supplies the standard thresholds when the section is
     // absent and normalizes whatever was configured (see AlertOptions).
+    //
+    // What an administrator saved from the dashboard is laid over the bound
+    // values here rather than left to the configuration binder (issue #162).
+    // The overlay is a JSON source like appsettings.json, and .NET merges array
+    // keys index by index, so a saved ThresholdDays shorter than the shipped
+    // one would silently keep the old tail; ApplyOverlay replaces arrays
+    // wholesale. The outranked set is computed once, before DI, because it is
+    // a property of the configuration layering and cannot change at runtime.
+    var outrankedAlertKeys = SettingsOverlay.FindOutrankedKeys(
+        builder.Configuration, AlertOptions.OutrankableKeys);
     builder.Services.Configure<AlertOptions>(
         builder.Configuration.GetSection(AlertOptions.SectionName));
-    builder.Services.PostConfigure<AlertOptions>(o => o.NormalizeThresholdDays());
+    builder.Services.AddOptions<AlertOptions>()
+        // IOptions<CertusOptions> rather than the manually bound copy above:
+        // this resolves after every PostConfigure<CertusOptions> has run, which
+        // is how the web test factory redirects the overlay away from
+        // ProgramData.
+        .PostConfigure<IOptions<CertusOptions>>((alerts, certusOptions) =>
+        {
+            var saved = SettingsOverlay.TryLoadAlerts(
+                SettingsOverlay.ResolvePath(certusOptions.Value), out var failure);
+
+            if (failure != null)
+            {
+                Log.Error(
+                    failure,
+                    "The settings overlay could not be read, so alert configuration saved " +
+                    "from the dashboard is not in force; the values in appsettings.json are " +
+                    "being used instead");
+            }
+
+            alerts.ApplyOverlay(saved, outrankedAlertKeys);
+            alerts.NormalizeThresholdDays();
+        });
+    // The read and write path for the dashboard-owned slice of the alert
+    // configuration. Singleton: it holds no state beyond the outranked key set,
+    // which is fixed once the process has started.
+    builder.Services.AddSingleton<AlertConfigStore>();
     builder.Services.AddScoped<AlertQueryService>();
     builder.Services.AddScoped<IAlertNotifier, EmailAlertNotifier>();
     builder.Services.AddHttpClient<WebhookAlertNotifier>(client =>
@@ -304,6 +380,11 @@ try
     builder.Services.AddScoped<IAlertNotifier>(sp =>
         sp.GetRequiredService<WebhookAlertNotifier>());
     builder.Services.AddHostedService<ExpiryMonitorService>();
+    // The test send (issue #161). The throttle is a singleton because its whole
+    // job is to hold the last send time across requests; the service that
+    // consumes it is scoped like every other notifier consumer.
+    builder.Services.AddSingleton<AlertTestThrottle>();
+    builder.Services.AddScoped<AlertTestService>();
 
     // Challenge validators — HTTP-01, DNS-01, TLS-ALPN-01.
     // Egress is screened by AddressGuard so a validator cannot be pointed at loopback,
@@ -337,6 +418,24 @@ try
     builder.Services.AddTransient<IChallengeValidator>(sp =>
         sp.GetRequiredService<TlsAlpn01ChallengeValidator>());
 
+    // device-attest-01 (draft-ietf-acme-device-attest-08). The verifier registry
+    // is keyed on the CBOR fmt string; apple is the only format in v1 and its
+    // verifier pins the embedded Apple root. The validator and its dependencies
+    // are scoped, unlike the network validators above, because the trust anchor
+    // store and the device gate read the database. Dark until an administrator
+    // creates a device attestation profile: without one, no device order is
+    // accepted, so no device-attest-01 challenge ever exists to validate.
+    builder.Services.AddSingleton<IAttestationFormatVerifier, AppleAttestationVerifier>();
+    builder.Services.AddScoped<AttestationTrustAnchorStore>();
+    builder.Services.AddScoped<DeviceAttestationPolicyService>();
+    builder.Services.AddScoped<DeviceAttest01ChallengeValidator>();
+    builder.Services.AddScoped<IChallengeValidator>(sp =>
+        sp.GetRequiredService<DeviceAttest01ChallengeValidator>());
+    // Registered in both hosts to mirror EabCredentialService: the admin
+    // controllers live in the Certus.Web assembly, which the service host also
+    // loads, so the service must resolve wherever the controller can be routed.
+    builder.Services.AddScoped<DeviceAttestationAdminService>();
+
     // Background challenge validation worker
     builder.Services.AddHostedService<ChallengeValidationService>();
 
@@ -366,6 +465,10 @@ try
         builder.Services.AddRateLimiter(rlOptions =>
         {
             rlOptions.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+            // A bare 429 tells an ACME client nothing; RFC 8555 §6.6 has an
+            // error code for exactly this, and §6.6 asks for Retry-After.
+            rlOptions.OnRejected = AcmeProblemResults.OnRateLimitRejected;
 
             rlOptions.AddPolicy("acme-new-account", httpContext =>
                 RateLimitPartition.GetFixedWindowLimiter(
@@ -418,6 +521,23 @@ try
         // Force construction so a misconfigured challenge egress denylist fails at startup
         // rather than on the first challenge validation.
         _ = scope.ServiceProvider.GetRequiredService<AddressGuard>();
+
+        // Construct the attestation verifier registry now: this runs the embedded
+        // Apple root's SHA-256 pin check, so a tampered or mispackaged root fails
+        // at startup rather than on the first device attestation.
+        var attestationFormats = string.Join(", ",
+            scope.ServiceProvider.GetServices<IAttestationFormatVerifier>().Select(v => v.Format));
+        Log.Information("Device attestation formats registered: {Formats}", attestationFormats);
+
+        // The revocation scope, named on every boot the same way the template
+        // exposure is: the mode decides what the dashboard may revoke, and an
+        // admin reading the log should not have to open Settings to know it.
+        var revocationScope = scope.ServiceProvider
+            .GetRequiredService<RevocationScopePolicy>().GetSnapshot();
+        Log.Information(
+            "Revocation scope: {Mode} ({CustomCount} custom templates)",
+            RevocationScopePolicy.ModeName(revocationScope.Mode),
+            revocationScope.CustomTemplates.Count);
     }
 
     // Ensure the database directory exists and the schema is current. The
@@ -444,6 +564,14 @@ try
 
     // Security headers middleware — X-Content-Type-Options, X-Frame-Options, etc.
     app.UseMiddleware<Certus.Web.Middleware.SecurityHeadersMiddleware>();
+
+    // Refuse control and formatting characters in the URL, before the request
+    // logger renders the path into the log file (a percent encoded line feed
+    // would otherwise forge log lines from an unauthenticated request) and
+    // before the redirect below builds a Location header out of that path.
+    // After the security headers, which are set on the way in, so the refusal
+    // carries them too.
+    app.UseMiddleware<Certus.Web.Middleware.UrlCharacterGuardMiddleware>();
 
     // HTTPS enforcement (HSTS + redirect) outside Development, gated by Auth:RequireHttps
     app.UseCertusTransportSecurity();
@@ -479,11 +607,12 @@ try
     app.MapControllers();
 
     // Unknown /api/ and /acme/ paths must never fall back to the SPA shell:
-    // index.html would mask the 401/404 (issue #27). The /api fallback carries
-    // no [AllowAnonymous], so the global fallback policy applies — anonymous
-    // callers get 401, authenticated callers get 404.
-    app.MapFallback("/api/{**path}", () => Results.NotFound());
-    app.MapFallback("/acme/{**path}", () => Results.NotFound()).AllowAnonymous();
+    // index.html would mask the 401/404 (issue #27). Both fallbacks also work
+    // out why the request missed, because they are unconstrained catch-alls
+    // and so suppress the 405/415 ASP.NET would otherwise answer (issue #147).
+    // See ProtocolFallbackExtensions for the whole story.
+    app.MapApiFallback();
+    app.MapAcmeProtocolFallback();
 
     // SPA fallback — serve index.html for any unmatched routes
     app.MapFallbackToFile("index.html").AllowAnonymous();

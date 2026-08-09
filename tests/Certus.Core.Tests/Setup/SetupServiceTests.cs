@@ -1,6 +1,8 @@
 using System.Text.Json;
+using Certus.Core.Acme.Services;
 using Certus.Core.Adcs;
 using Certus.Core.Configuration;
+using Certus.Core.Services;
 using Certus.Core.Setup;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -424,6 +426,112 @@ public class SetupServiceTests : IDisposable
     }
 
     [Fact]
+    public void UpdateEabEnforcement_PersistsTheMode()
+    {
+        _sut.CompleteSetup(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"));
+
+        _sut.UpdateEabEnforcement(EabEnforcementMode.Optional).Should().BeTrue();
+
+        _sut.GetStatus().EabEnforcement.Should().Be("optional");
+    }
+
+    [Fact]
+    public void UpdateEabEnforcement_BeforeSetupCompletes_IsRefused()
+    {
+        _sut.UpdateEabEnforcement(EabEnforcementMode.Required).Should().BeFalse();
+
+        _sut.GetStatus().EabEnforcement.Should().BeNull();
+    }
+
+    [Fact]
+    public void SaveWizardDraft_CarriesTheEabEnforcementModeForward()
+    {
+        // A stranded install recovery reopens the wizard and saves drafts.
+        // The draft rewrites the whole status file, and the mode is not
+        // wizard state, so the draft writer must carry it forward or the
+        // subsequent completion carry-forward reads an already wiped value.
+        _sut.CompleteSetup(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"));
+        _sut.UpdateEabEnforcement(EabEnforcementMode.Required).Should().BeTrue();
+
+        _sut.SaveWizardDraft(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"));
+
+        _sut.GetStatus().EabEnforcement.Should().Be("required");
+    }
+
+    [Fact]
+    public void CompleteSetup_CarriesTheEabEnforcementModeForward()
+    {
+        // The EAB mode is not part of the wizard's configuration, so a re-run
+        // of setup (the stranded install recovery path) writes a fresh status
+        // record that must carry the mode forward, not reset it to off.
+        _sut.CompleteSetup(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"));
+        _sut.UpdateEabEnforcement(EabEnforcementMode.Required).Should().BeTrue();
+
+        var status = _sut.CompleteSetup(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"));
+
+        status.EabEnforcement.Should().Be("required");
+        _sut.GetStatus().EabEnforcement.Should().Be("required");
+    }
+
+    [Fact]
+    public void UpdateRevocationScope_PersistsModeAndList()
+    {
+        _sut.CompleteSetup(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"));
+
+        _sut.UpdateRevocationScope(
+            RevocationScopeMode.Custom, ["WebServer", "AcmeClient"]).Should().BeTrue();
+
+        var status = _sut.GetStatus();
+        status.RevocationScope.Should().Be("custom");
+        status.RevocableTemplates.Should().Equal("WebServer", "AcmeClient");
+    }
+
+    [Fact]
+    public void UpdateRevocationScope_BeforeSetupCompletes_IsRefused()
+    {
+        _sut.UpdateRevocationScope(RevocationScopeMode.All, []).Should().BeFalse();
+
+        _sut.GetStatus().RevocationScope.Should().BeNull();
+    }
+
+    [Fact]
+    public void SaveWizardDraft_CarriesTheRevocationScopeForward()
+    {
+        // The same trap as the EAB mode above: the scope is not wizard
+        // state, and a draft that rewrites the file must not reset it.
+        _sut.CompleteSetup(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"));
+        _sut.UpdateRevocationScope(RevocationScopeMode.Custom, ["WebServer"]).Should().BeTrue();
+
+        _sut.SaveWizardDraft(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"));
+
+        var status = _sut.GetStatus();
+        status.RevocationScope.Should().Be("custom");
+        status.RevocableTemplates.Should().Equal("WebServer");
+    }
+
+    [Fact]
+    public void CompleteSetup_CarriesTheRevocationScopeForward()
+    {
+        _sut.CompleteSetup(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"));
+        _sut.UpdateRevocationScope(RevocationScopeMode.All, []).Should().BeTrue();
+
+        var status = _sut.CompleteSetup(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"));
+
+        status.RevocationScope.Should().Be("all");
+        _sut.GetStatus().RevocationScope.Should().Be("all");
+    }
+
+    [Fact]
     public void CompleteSetup_WritesTheSettingsOverlay()
     {
         var config = new SetupConfiguration(
@@ -735,6 +843,70 @@ public class SetupServiceTests : IDisposable
 
         sut.IsSetupEffectivelyComplete().Should().BeTrue();
         sut.CaMode.Should().Be("mock");
+    }
+
+    /// <summary>
+    /// Template name resolution for the wizard's TLS enrollment (issue #175).
+    /// The enrolled name is interpolated into the ADCS request attribute string,
+    /// so the wizard's request body value must only ever select a template; the
+    /// CA's own published name is what gets submitted.
+    /// </summary>
+    [Fact]
+    public async Task ResolvePublishedTemplateName_ProgrammaticName_ReturnsIt()
+    {
+        var resolved = await _sut.ResolvePublishedTemplateNameAsync(TestCa, "WebServer");
+
+        resolved.Should().Be("WebServer");
+    }
+
+    [Fact]
+    public async Task ResolvePublishedTemplateName_DisplayName_ReturnsTheProgrammaticName()
+    {
+        // ADCS matches the CertificateTemplate attribute against the
+        // programmatic name, so the display form must be translated, never
+        // forwarded.
+        var resolved = await _sut.ResolvePublishedTemplateNameAsync(TestCa, "Web Server");
+
+        resolved.Should().Be("WebServer");
+    }
+
+    [Fact]
+    public async Task ResolvePublishedTemplateName_DiffersOnlyByCase_ReturnsTheCanonicalCasing()
+    {
+        var resolved = await _sut.ResolvePublishedTemplateNameAsync(TestCa, "wEbSeRvEr");
+
+        resolved.Should().Be("WebServer");
+    }
+
+    [Fact]
+    public async Task ResolvePublishedTemplateName_UnpublishedName_ReturnsNull()
+    {
+        var resolved = await _sut.ResolvePublishedTemplateNameAsync(TestCa, "NotOnThisCa");
+
+        resolved.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task ResolvePublishedTemplateName_CertiGhostPayload_ReturnsNull()
+    {
+        // The attribute smuggling payload never matches a published template, so
+        // it is refused here, one step before the AdcsRequestAttributes guard
+        // that would also catch it.
+        var resolved = await _sut.ResolvePublishedTemplateNameAsync(
+            TestCa, "WebServer\ncdc:evil.attacker.example\nrmd:DC01.contoso.com");
+
+        resolved.Should().BeNull();
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task ResolvePublishedTemplateName_MissingName_ReturnsNull(string? templateName)
+    {
+        var resolved = await _sut.ResolvePublishedTemplateNameAsync(TestCa, templateName!);
+
+        resolved.Should().BeNull();
     }
 
     public void Dispose()

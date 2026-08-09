@@ -65,6 +65,23 @@ public class HttpsCertificateIntegrationTests : IDisposable
         body.GetProperty("configured").GetBoolean().Should().BeFalse();
     }
 
+    /// <summary>
+    /// On a completed install that never enrolled a certificate the service is
+    /// on its self signed fallback and the wizard is locked (SEC-G1). The report
+    /// still names the template a first provision would use, so the settings
+    /// page can offer enrollment in place instead of pointing at the wizard.
+    /// </summary>
+    [Fact]
+    public async Task GetHttpsCertificate_NotConfiguredButSetupComplete_SurfacesTheProvisionTemplate()
+    {
+        SeedCompletedSetup();
+
+        var body = await ParseJsonAsync(await _client.GetAsync("/api/settings/https-certificate"));
+
+        body.GetProperty("configured").GetBoolean().Should().BeFalse();
+        body.GetProperty("renewTemplate").GetString().Should().Be("WebServer");
+    }
+
     [Fact]
     public async Task GetHttpsCertificate_OverlayThumbprint_ReportsDetailsAndRenewTemplate()
     {
@@ -124,5 +141,81 @@ public class HttpsCertificateIntegrationTests : IDisposable
         response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
         var body = await ParseJsonAsync(response);
         body.GetProperty("error").GetString().Should().Contain("mock");
+    }
+
+    /// <summary>
+    /// The automatic renewal state the dashboard banner reads (issue #105).
+    /// On this host the hosted service has not run a pass yet (its first check
+    /// is a minute out), so the last attempt fields are null while the
+    /// configuration is still reported.
+    /// </summary>
+    [Fact]
+    public async Task GetHttpsCertificate_ReportsTheAutomaticRenewalState()
+    {
+        SeedCompletedSetup();
+        SettingsOverlay.Save(
+            new SettingsOverlay.OverlaySettings(
+                null, "https://certus.example.com:5001",
+                HttpsCertificateThumbprint: "AA11BB22CC33",
+                HttpsCertificateTemplate: "WebServerV2"),
+            OverlayPath);
+
+        var body = await ParseJsonAsync(await _client.GetAsync("/api/settings/https-certificate"));
+
+        var autoRenewal = body.GetProperty("autoRenewal");
+        autoRenewal.GetProperty("enabled").GetBoolean().Should().BeTrue();
+        autoRenewal.GetProperty("windowDays").GetInt32().Should().Be(30);
+        autoRenewal.GetProperty("failed").GetBoolean().Should().BeFalse();
+        autoRenewal.GetProperty("lastOutcome").ValueKind.Should().Be(JsonValueKind.Null);
+
+        // Nothing is configured on this process, so the recorded thumbprint is
+        // not the served one and a restart is genuinely pending.
+        body.GetProperty("restartPending").GetBoolean().Should().BeTrue();
+        body.GetProperty("servedThumbprint").ValueKind.Should().Be(JsonValueKind.Null);
+    }
+
+    [Fact]
+    public async Task ApplyHttpsCertificate_NothingPending_Returns409()
+    {
+        SeedCompletedSetup();
+
+        var response = await _client.PostAsync(
+            "/api/settings/https-certificate/apply",
+            new StringContent("{}", Encoding.UTF8, "application/json"));
+
+        response.StatusCode.Should().Be(HttpStatusCode.Conflict);
+        var body = await ParseJsonAsync(response);
+        body.GetProperty("error").GetString().Should().Contain("waiting to be applied");
+    }
+
+    /// <summary>
+    /// The dev host cannot restart itself (NoOpServiceRestarter), so applying
+    /// reports the manual step rather than failing. That is the same answer a
+    /// console run of the real service gives.
+    /// </summary>
+    [Fact]
+    public async Task ApplyHttpsCertificate_RenewalPending_ReportsTheManualRestart()
+    {
+        SeedCompletedSetup();
+        SettingsOverlay.Save(
+            new SettingsOverlay.OverlaySettings(
+                null, "https://certus.example.com:5001",
+                HttpsCertificateThumbprint: "CC33DD44EE55"),
+            OverlayPath);
+
+        var response = await _client.PostAsync(
+            "/api/settings/https-certificate/apply",
+            new StringContent("{}", Encoding.UTF8, "application/json"));
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body = await ParseJsonAsync(response);
+        body.GetProperty("thumbprint").GetString().Should().Be("CC33DD44EE55");
+        body.GetProperty("restartScheduled").GetBoolean().Should().BeFalse();
+        body.GetProperty("message").GetString().Should().Contain("Restart the service");
+
+        // Applying must not touch the overlay: it only starts serving what is
+        // already recorded there.
+        SettingsOverlay.Load(OverlayPath).HttpsCertificateThumbprint
+            .Should().Be("CC33DD44EE55");
     }
 }

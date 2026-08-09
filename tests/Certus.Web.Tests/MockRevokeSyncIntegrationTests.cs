@@ -41,7 +41,7 @@ public class MockRevokeSyncIntegrationTests
         // Revoke it by the X509 serial form (uppercase, possibly 00 padded),
         // the way the ACME revoke endpoint supplies it.
         var issued = await adcs.GetCertificateAsync(submit.RequestId);
-        using var x509 = new X509Certificate2(issued.CertificateDer!);
+        using var x509 = X509CertificateLoader.LoadCertificate(issued.CertificateDer!);
         await adcs.RevokeCertificateAsync(x509.SerialNumber, reason: 0);
 
         // Pull the inventory from the CA into the local database.

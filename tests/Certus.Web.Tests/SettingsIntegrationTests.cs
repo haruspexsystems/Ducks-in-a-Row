@@ -200,4 +200,44 @@ public class SettingsIntegrationTests : IDisposable
         var body = await ParseJsonAsync(response);
         body.GetProperty("overlayUrl").GetString().Should().Be(OldUrl);
     }
+
+    /// <summary>
+    /// Issue #112. The build stamps the commit onto AssemblyInformationalVersion
+    /// as SemVer build metadata, and this endpoint splits it back out so the
+    /// Settings page shows a clean version with the sha as its own field.
+    ///
+    /// Deliberately asserts the payload shape, not a sha: the stamp is absent
+    /// on a plain `dotnet build` and on a build from the release source
+    /// snapshot, both of which must keep this suite green. The assertion that a
+    /// shipped binary really carries a sha lives in build.ps1, which is the
+    /// only place the expected value is known.
+    ///
+    /// The load bearing assertion here is that "commit" is present at all: that
+    /// is what fails if the endpoint is ever reverted to returning the raw
+    /// informational version. The "no +" assertion only bites on a stamped
+    /// build, so it is a guard for a developer running this against build.ps1
+    /// output, not something CI can catch. The splitting itself is covered
+    /// exhaustively by BuildVersionInfoTests.
+    /// </summary>
+    [Fact]
+    public async Task GetInfo_ReportsACleanVersionAndACommitField()
+    {
+        var response = await _client.GetAsync("/api/settings/info");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body = await ParseJsonAsync(response);
+
+        var version = body.GetProperty("version").GetString();
+        version.Should().NotBeNullOrWhiteSpace();
+        version.Should().NotContain("+",
+            "the build metadata belongs in the commit field, not the version the page shows");
+
+        body.TryGetProperty("commit", out var commit).Should().BeTrue(
+            "the dashboard reads this field and must not have to guess whether it exists");
+        commit.ValueKind.Should().BeOneOf(JsonValueKind.String, JsonValueKind.Null);
+        if (commit.ValueKind == JsonValueKind.String)
+        {
+            commit.GetString().Should().NotBeNullOrWhiteSpace();
+        }
+    }
 }

@@ -1,3 +1,5 @@
+using Certus.Core.Security;
+using Org.BouncyCastle.Asn1;
 using Org.BouncyCastle.Asn1.X509;
 using Org.BouncyCastle.Crypto;
 using Org.BouncyCastle.Crypto.Generators;
@@ -33,6 +35,26 @@ public sealed class MockAdcsClient : IAdcsClient
     /// Simulated delay for certificate issuance (default: none).
     /// </summary>
     public TimeSpan IssuanceDelay { get; set; } = TimeSpan.Zero;
+
+    /// <summary>
+    /// EKU OIDs written into the leaves the mock issues. The default is
+    /// server authentication so every existing consumer passes the TLS
+    /// capability ceiling unchanged; null omits the extension entirely,
+    /// which the ceiling refuses (guard tests).
+    /// </summary>
+    public IReadOnlyList<string>? LeafEkuOids { get; set; } = new[] { TlsEkuOids.ServerAuth };
+
+    /// <summary>
+    /// BouncyCastle KeyUsage bits for issued leaves. Null omits the
+    /// extension. The default matches an ordinary RSA TLS leaf.
+    /// </summary>
+    public int? LeafKeyUsageBits { get; set; } = KeyUsage.DigitalSignature | KeyUsage.KeyEncipherment;
+
+    /// <summary>
+    /// When true, issued leaves carry BasicConstraints CA=true, for guard
+    /// tests. The default leaf carries no BasicConstraints at all.
+    /// </summary>
+    public bool LeafIsCa { get; set; }
 
     public MockAdcsClient(string caName = "MockCA", IEnumerable<TemplateInfo>? templates = null)
     {
@@ -90,14 +112,17 @@ public sealed class MockAdcsClient : IAdcsClient
 
             if (AutoApprove)
             {
-                // Parse CSR and issue a certificate
+                // Parse CSR and issue a certificate. The mock decides
+                // instantly, so the decision instant is the request instant.
                 var cert = IssueCertificateFromCsr(csrDer, templateName);
+                var now = DateTime.UtcNow;
                 _issuedCerts[requestId] = new MockIssuedCertificate(
                     RequestId: requestId,
                     TemplateName: templateName,
                     Certificate: cert,
                     Status: CertificateStatus.Issued,
-                    RequestDate: DateTime.UtcNow);
+                    RequestDate: now,
+                    ResolvedWhen: now);
 
                 return new SubmitResult(requestId, SubmitStatus.Issued);
             }
@@ -147,6 +172,12 @@ public sealed class MockAdcsClient : IAdcsClient
         CertificateQuery query,
         CancellationToken cancellationToken = default)
     {
+        // The lock guards only the shared inventory, so it is held just long
+        // enough to take a snapshot of the matching rows. Projecting them,
+        // which includes a DER parse per certificate, is pure work on that
+        // snapshot and happens after the lock is released: a sync sweeping the
+        // whole inventory must not block a concurrent revoke for the duration.
+        List<MockIssuedCertificate> matches;
         lock (_lock)
         {
             var results = _issuedCerts.Values.AsEnumerable();
@@ -171,26 +202,61 @@ public sealed class MockAdcsClient : IAdcsClient
                     c.Certificate != null &&
                     c.Certificate.NotAfter <= query.ExpiringBefore.Value);
 
-            var list = results
+            // Mirrors the SubmittedWhen restriction the real client applies, so
+            // the dev host's sync behaves the same way against the mock CA.
+            if (query.SubmittedAfter.HasValue)
+                results = results.Where(c => c.RequestDate >= query.SubmittedAfter.Value);
+
+            // Mirrors the ResolvedWhen restriction (issue #187). A row with no
+            // decision yet is excluded, which is what a GreaterOrEqual
+            // restriction on a null column does on the real CA.
+            if (query.ResolvedAfter.HasValue)
+                results = results.Where(c =>
+                    c.ResolvedWhen != null && c.ResolvedWhen >= query.ResolvedAfter.Value);
+
+            matches = results
                 .Skip(query.Skip)
                 .Take(query.Take)
-                .Select(c => new CertificateInfo(
-                    RequestId: c.RequestId,
-                    SerialNumber: c.Certificate?.SerialNumber?.ToString(16) ?? "",
-                    Subject: c.Certificate?.SubjectDN?.ToString() ?? "Unknown",
-                    SubjectAlternativeNames: null,
-                    TemplateName: c.TemplateName,
-                    NotBefore: c.Certificate?.NotBefore ?? DateTime.MinValue,
-                    NotAfter: c.Certificate?.NotAfter ?? DateTime.MinValue,
-                    Status: c.Status,
-                    Requestor: "MOCK\\TestUser",
-                    RequestDate: c.RequestDate,
-                    RevokedWhen: c.RevokedWhen,
-                    RevokedReason: c.RevokedReason))
                 .ToList();
-
-            return Task.FromResult<IReadOnlyList<CertificateInfo>>(list);
         }
+
+        var list = matches.Select(ToCertificateInfo).ToList();
+
+        return Task.FromResult<IReadOnlyList<CertificateInfo>>(list);
+    }
+
+    /// <summary>
+    /// Projects one mock issued certificate to the shape the sync consumes,
+    /// running its DER through the shared parser exactly once. One parse rather
+    /// than one per field because this runs while the mock's lock is held.
+    /// </summary>
+    private static CertificateInfo ToCertificateInfo(MockIssuedCertificate c)
+    {
+        // The mock issues real certificates, so its own DER goes through the
+        // same parser the real client uses rather than inventing values. The
+        // dev host then shows the detail a live CA would, and mock backed tests
+        // can assert on it. A parse that fails yields neither the detail nor the
+        // bytes, which is the invariant the real client holds too: nothing
+        // undecodable is ever carried forward to be stored and later handed to
+        // an admin as a download.
+        var der = c.Certificate?.GetEncoded();
+        var parsed = der == null ? null : CertificateDerParser.Parse(der);
+
+        return new CertificateInfo(
+            RequestId: c.RequestId,
+            SerialNumber: c.Certificate?.SerialNumber?.ToString(16) ?? "",
+            Subject: c.Certificate?.SubjectDN?.ToString() ?? "Unknown",
+            SubjectAlternativeNames: null,
+            TemplateName: c.TemplateName,
+            NotBefore: c.Certificate?.NotBefore ?? DateTime.MinValue,
+            NotAfter: c.Certificate?.NotAfter ?? DateTime.MinValue,
+            Status: c.Status,
+            Requestor: "MOCK\\TestUser",
+            RequestDate: c.RequestDate,
+            RevokedWhen: c.RevokedWhen,
+            RevokedReason: c.RevokedReason,
+            CryptoDetail: parsed?.Crypto,
+            RawCertificate: parsed == null ? null : der);
     }
 
     public Task RevokeCertificateAsync(
@@ -249,7 +315,8 @@ public sealed class MockAdcsClient : IAdcsClient
                 _issuedCerts[requestId] = issued with
                 {
                     Certificate = cert,
-                    Status = CertificateStatus.Issued
+                    Status = CertificateStatus.Issued,
+                    ResolvedWhen = DateTime.UtcNow
                 };
             }
         }
@@ -304,6 +371,7 @@ public sealed class MockAdcsClient : IAdcsClient
             generator.SetNotBefore(DateTime.UtcNow);
             generator.SetNotAfter(DateTime.UtcNow.AddYears(1));
             generator.SetPublicKey(csr.GetPublicKey());
+            AddLeafExtensions(generator);
 
             var signatureFactory = new Asn1SignatureFactory("SHA256WithRSA", _caKeyPair.Private);
             return generator.Generate(signatureFactory);
@@ -327,9 +395,45 @@ public sealed class MockAdcsClient : IAdcsClient
         generator.SetNotBefore(DateTime.UtcNow);
         generator.SetNotAfter(DateTime.UtcNow.AddYears(1));
         generator.SetPublicKey(subjectKeyPair.Public);
+        AddLeafExtensions(generator);
 
         var signatureFactory = new Asn1SignatureFactory("SHA256WithRSA", _caKeyPair.Private);
         return generator.Generate(signatureFactory);
+    }
+
+    /// <summary>
+    /// Applies the configurable leaf extensions to a certificate under
+    /// construction. Shared by the CSR path and the self signed path so a
+    /// pending request approved later carries the same shape as an instant
+    /// issuance. The real CA writes the template's extensions into every
+    /// leaf; before this the mock issued bare certificates, which the TLS
+    /// capability ceiling would refuse as valid for every purpose.
+    /// </summary>
+    private void AddLeafExtensions(X509V3CertificateGenerator generator)
+    {
+        if (LeafEkuOids is { Count: > 0 } ekus)
+        {
+            generator.AddExtension(
+                X509Extensions.ExtendedKeyUsage,
+                false,
+                new ExtendedKeyUsage(ekus.Select(o => new DerObjectIdentifier(o)).ToArray()));
+        }
+
+        if (LeafKeyUsageBits is { } keyUsageBits)
+        {
+            generator.AddExtension(
+                X509Extensions.KeyUsage,
+                true,
+                new KeyUsage(keyUsageBits));
+        }
+
+        if (LeafIsCa)
+        {
+            generator.AddExtension(
+                X509Extensions.BasicConstraints,
+                true,
+                new BasicConstraints(true));
+        }
     }
 
     private static string ConvertToPem(X509Certificate cert)
@@ -343,6 +447,12 @@ public sealed class MockAdcsClient : IAdcsClient
 
     #endregion
 
+    /// <summary>
+    /// <paramref name="ResolvedWhen"/> mirrors the CA database column of the
+    /// same name: the instant the CA decided the request, null while it is
+    /// still pending. Revocation does not touch it; that is what RevokedWhen
+    /// is for.
+    /// </summary>
     private sealed record MockIssuedCertificate(
         int RequestId,
         string TemplateName,
@@ -350,5 +460,6 @@ public sealed class MockAdcsClient : IAdcsClient
         CertificateStatus Status,
         DateTime RequestDate,
         DateTime? RevokedWhen = null,
-        int? RevokedReason = null);
+        int? RevokedReason = null,
+        DateTime? ResolvedWhen = null);
 }

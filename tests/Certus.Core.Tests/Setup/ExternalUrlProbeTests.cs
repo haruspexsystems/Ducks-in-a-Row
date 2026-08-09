@@ -9,11 +9,18 @@ namespace Certus.Core.Tests.Setup;
 
 public class ExternalUrlProbeTests
 {
+    /// <summary>
+    /// The default timeout is generous on purpose. Only the test that asserts a
+    /// timeout passes its own short value; everywhere else the timeout is
+    /// headroom, not a fact under test, and a tight budget just turns thread
+    /// pool pressure under the full Release suite into a false failure
+    /// (issue #127).
+    /// </summary>
     private static ExternalUrlProbe CreateProbe(TimeSpan? timeout = null)
     {
         var client = new HttpClient(ExternalUrlProbe.CreateHandler())
         {
-            Timeout = timeout ?? TimeSpan.FromSeconds(5),
+            Timeout = timeout ?? TimeSpan.FromSeconds(30),
         };
         return new ExternalUrlProbe(client, NullLogger<ExternalUrlProbe>.Instance);
     }
@@ -166,11 +173,22 @@ public class ExternalUrlProbeTests
     /// The smallest thing that answers HTTP on a loopback port: accepts a
     /// connection, reads the request head, writes a fixed status response.
     /// Raw TCP rather than HttpListener so no URL reservation is needed.
+    ///
+    /// The accept loop runs on its own background thread with blocking socket
+    /// calls rather than as a thread pool task. This assembly runs its tests
+    /// in parallel and the full Release suite runs it alongside a second test
+    /// process, so the pool is saturated. A queued accept loop can then sit
+    /// unscheduled for longer than the probe client's timeout, and the client
+    /// reports a timeout against a listener that never got to accept. That is
+    /// how this test failed intermittently under the full suite (issue #127).
+    /// A dedicated thread is not subject to pool queueing, so the accept
+    /// happens no matter how loaded the machine is.
     /// </summary>
     private sealed class MinimalHttpListener : IDisposable
     {
         private readonly TcpListener _listener;
-        private readonly CancellationTokenSource _cts = new();
+        private readonly Thread _acceptThread;
+        private volatile bool _stopped;
 
         public int Port { get; }
 
@@ -179,35 +197,63 @@ public class ExternalUrlProbeTests
             _listener = new TcpListener(IPAddress.Loopback, 0);
             _listener.Start();
             Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
-            _ = AcceptLoopAsync(statusCode, _cts.Token);
+            _acceptThread = new Thread(() => AcceptLoop(statusCode))
+            {
+                IsBackground = true,
+                Name = "external-url-probe-test-listener"
+            };
+            _acceptThread.Start();
         }
 
-        private async Task AcceptLoopAsync(int statusCode, CancellationToken ct)
+        private void AcceptLoop(int statusCode)
         {
-            try
+            var response = Encoding.ASCII.GetBytes(
+                $"HTTP/1.1 {statusCode} Probe\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            while (!_stopped)
             {
-                while (!ct.IsCancellationRequested)
+                TcpClient client;
+                try
                 {
-                    using var client = await _listener.AcceptTcpClientAsync(ct);
-                    var stream = client.GetStream();
-                    var buffer = new byte[4096];
-                    await stream.ReadAsync(buffer, ct);
-                    var response = Encoding.ASCII.GetBytes(
-                        $"HTTP/1.1 {statusCode} Probe\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-                    await stream.WriteAsync(response, ct);
+                    client = _listener.AcceptTcpClient();
                 }
-            }
-            catch
-            {
-                // Disposal stops the listener; the loop just ends.
+                catch
+                {
+                    // Disposal stops the listener, which makes the blocking
+                    // accept throw. That is the only way out of this loop.
+                    return;
+                }
+
+                using (client)
+                {
+                    try
+                    {
+                        // Serving one connection is bounded and its failure is
+                        // its own: a caller that connects and then says nothing
+                        // must not wedge the listener for everyone after it.
+                        client.ReceiveTimeout = 5000;
+                        client.SendTimeout = 5000;
+                        var stream = client.GetStream();
+                        // One inexact read is the intent: drain whatever
+                        // request bytes arrived, however many, before the
+                        // canned response goes out. The count is irrelevant.
+                        var requestBytesRead = stream.Read(new byte[4096], 0, 4096);
+                        _ = requestBytesRead;
+                        stream.Write(response, 0, response.Length);
+                        stream.Flush();
+                    }
+                    catch
+                    {
+                        // One bad connection does not end the listener.
+                    }
+                }
             }
         }
 
         public void Dispose()
         {
-            _cts.Cancel();
+            _stopped = true;
             _listener.Stop();
-            _cts.Dispose();
+            _acceptThread.Join(TimeSpan.FromSeconds(2));
         }
     }
 }

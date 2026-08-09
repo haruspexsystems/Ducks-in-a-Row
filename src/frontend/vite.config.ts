@@ -30,5 +30,14 @@ export default defineConfig({
   build: {
     outDir: '../Certus.Web/wwwroot',
     emptyOutDir: true,
+    // Never inline font files, whatever their size. Vite's default 4 kB threshold
+    // is below the small @fontsource subsets (cyrillic-ext, vietnamese), so those
+    // faces were emitted as `data:` URIs inside the CSS and then refused at runtime
+    // by the `font-src 'self'` directive in SecurityHeadersMiddleware. Emitting every
+    // font as a same origin file under /assets satisfies that directive as it stands,
+    // instead of widening it to accept `data:`. Returning undefined for everything
+    // else keeps the default limit for small images, which `img-src data:` allows.
+    assetsInlineLimit: (filePath) =>
+      /\.(woff2?|ttf|otf|eot)$/i.test(filePath) ? false : undefined,
   },
 })

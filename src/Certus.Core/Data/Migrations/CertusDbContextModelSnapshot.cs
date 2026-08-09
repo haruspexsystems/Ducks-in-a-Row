@@ -15,7 +15,7 @@ namespace Certus.Core.Data.Migrations
         protected override void BuildModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
-            modelBuilder.HasAnnotation("ProductVersion", "8.0.13");
+            modelBuilder.HasAnnotation("ProductVersion", "10.0.10");
 
             modelBuilder.Entity("Certus.Core.Data.Entities.AcmeAccount", b =>
                 {
@@ -33,6 +33,12 @@ namespace Certus.Core.Data.Migrations
 
                     b.Property<DateTime>("CreatedAt")
                         .HasColumnType("TEXT");
+
+                    b.Property<string>("EabJwsJson")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int?>("ExternalAccountCredentialId")
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("JwkJson")
                         .IsRequired()
@@ -61,8 +67,14 @@ namespace Certus.Core.Data.Migrations
                     b.HasIndex("AccountId")
                         .IsUnique();
 
+                    b.HasIndex("CreatedAt");
+
+                    b.HasIndex("ExternalAccountCredentialId");
+
                     b.HasIndex("JwkThumbprint")
                         .IsUnique();
+
+                    b.HasIndex("Status");
 
                     b.ToTable("AcmeAccounts");
                 });
@@ -72,6 +84,16 @@ namespace Certus.Core.Data.Migrations
                     b.Property<int>("Id")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("INTEGER");
+
+                    b.Property<string>("AttestationFormat")
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("AttestedPropertiesJson")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("AttestedSpki")
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("AuthorizationId")
                         .IsRequired()
@@ -86,7 +108,7 @@ namespace Certus.Core.Data.Migrations
 
                     b.Property<string>("IdentifierType")
                         .IsRequired()
-                        .HasMaxLength(10)
+                        .HasMaxLength(32)
                         .HasColumnType("TEXT");
 
                     b.Property<string>("IdentifierValue")
@@ -171,6 +193,9 @@ namespace Certus.Core.Data.Migrations
                     b.Property<int>("Id")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("INTEGER");
+
+                    b.Property<string>("AttestationObject")
+                        .HasColumnType("TEXT");
 
                     b.Property<int>("AuthorizationId")
                         .HasColumnType("INTEGER");
@@ -277,10 +302,10 @@ namespace Certus.Core.Data.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("AccountId");
-
                     b.HasIndex("OrderId")
                         .IsUnique();
+
+                    b.HasIndex("AccountId", "CreatedAt");
 
                     b.ToTable("AcmeOrders");
                 });
@@ -320,14 +345,257 @@ namespace Certus.Core.Data.Migrations
                     b.ToTable("AlertsSent");
                 });
 
+            modelBuilder.Entity("Certus.Core.Data.Entities.AttestationTrustAnchor", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("CertificatePem")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Format")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(200)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Sha256Fingerprint")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Format");
+
+                    b.HasIndex("Sha256Fingerprint")
+                        .IsUnique();
+
+                    b.ToTable("AttestationTrustAnchors");
+                });
+
+            modelBuilder.Entity("Certus.Core.Data.Entities.DeviceAllowlistEntry", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("IdentifierValue")
+                        .IsRequired()
+                        .HasMaxLength(253)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Note")
+                        .HasMaxLength(500)
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("ProfileId")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ProfileId", "IdentifierValue")
+                        .IsUnique();
+
+                    b.ToTable("DeviceAllowlistEntries");
+                });
+
+            modelBuilder.Entity("Certus.Core.Data.Entities.DeviceAttestationProfile", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("CsrIdentifierBinding")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(20)
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("cn-or-san");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("GateMode")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(20)
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("allowlist");
+
+                    b.Property<string>("TemplateId")
+                        .IsRequired()
+                        .HasMaxLength(200)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("UpdatedAt")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TemplateId")
+                        .IsUnique();
+
+                    b.ToTable("DeviceAttestationProfiles");
+                });
+
+            modelBuilder.Entity("Certus.Core.Data.Entities.DomainPolicyRejection", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("AccountId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ClientIp")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("OccurredAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("RejectedIdentifiers")
+                        .IsRequired()
+                        .HasMaxLength(2000)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("RequestedIdentifiers")
+                        .IsRequired()
+                        .HasMaxLength(2000)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Stage")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("TemplateId")
+                        .IsRequired()
+                        .HasMaxLength(200)
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("OccurredAt");
+
+                    b.ToTable("DomainPolicyRejections");
+                });
+
+            modelBuilder.Entity("Certus.Core.Data.Entities.EabCredential", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("AdPrincipalName")
+                        .HasMaxLength(256)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("AdPrincipalSid")
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("AdPrincipalType")
+                        .HasMaxLength(20)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("ExpiresAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("KeyId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(200)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("NamespacesJson")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("[]");
+
+                    b.Property<DateTime?>("RevokedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("SecretProtected")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("SecretRegeneratedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(20)
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("active");
+
+                    b.Property<DateTime?>("UpdatedAt")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("KeyId")
+                        .IsUnique();
+
+                    b.ToTable("EabCredentials");
+                });
+
             modelBuilder.Entity("Certus.Core.Data.Entities.SyncedCertificate", b =>
                 {
                     b.Property<int>("Id")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("INTEGER");
 
+                    b.Property<string>("DispositionMessage")
+                        .HasMaxLength(2000)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ExtendedKeyUsageOids")
+                        .HasMaxLength(1000)
+                        .HasColumnType("TEXT");
+
                     b.Property<DateTime>("FirstSyncedAt")
                         .HasColumnType("TEXT");
+
+                    b.Property<string>("KeyAlgorithm")
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT");
+
+                    b.Property<int?>("KeySizeBits")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int?>("KeyUsage")
+                        .HasColumnType("INTEGER");
 
                     b.Property<DateTime>("LastSyncedAt")
                         .HasColumnType("TEXT");
@@ -337,6 +605,9 @@ namespace Certus.Core.Data.Migrations
 
                     b.Property<DateTime>("NotBefore")
                         .HasColumnType("TEXT");
+
+                    b.Property<byte[]>("RawCertificate")
+                        .HasColumnType("BLOB");
 
                     b.Property<DateTime>("RequestDate")
                         .HasColumnType("TEXT");
@@ -359,10 +630,21 @@ namespace Certus.Core.Data.Migrations
                         .HasMaxLength(64)
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("Sha256Thumbprint")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("SignatureAlgorithmOid")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("Status")
                         .IsRequired()
                         .HasMaxLength(20)
                         .HasColumnType("TEXT");
+
+                    b.Property<int?>("StatusCode")
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("Subject")
                         .IsRequired()
@@ -373,6 +655,9 @@ namespace Certus.Core.Data.Migrations
                         .HasMaxLength(2000)
                         .HasColumnType("TEXT");
 
+                    b.Property<int?>("SupersededByCertificateId")
+                        .HasColumnType("INTEGER");
+
                     b.Property<string>("TemplateName")
                         .IsRequired()
                         .HasMaxLength(200)
@@ -382,8 +667,14 @@ namespace Certus.Core.Data.Migrations
 
                     b.HasIndex("NotAfter");
 
+                    b.HasIndex("NotBefore");
+
+                    b.HasIndex("RequestDate");
+
                     b.HasIndex("RequestId")
                         .IsUnique();
+
+                    b.HasIndex("Requestor");
 
                     b.HasIndex("SerialNumber");
 
@@ -391,9 +682,21 @@ namespace Certus.Core.Data.Migrations
 
                     b.HasIndex("Subject");
 
+                    b.HasIndex("SupersededByCertificateId");
+
                     b.HasIndex("TemplateName");
 
                     b.ToTable("SyncedCertificates");
+                });
+
+            modelBuilder.Entity("Certus.Core.Data.Entities.AcmeAccount", b =>
+                {
+                    b.HasOne("Certus.Core.Data.Entities.EabCredential", "ExternalAccountCredential")
+                        .WithMany()
+                        .HasForeignKey("ExternalAccountCredentialId")
+                        .OnDelete(DeleteBehavior.Restrict);
+
+                    b.Navigation("ExternalAccountCredential");
                 });
 
             modelBuilder.Entity("Certus.Core.Data.Entities.AcmeAuthorization", b =>
@@ -451,6 +754,17 @@ namespace Certus.Core.Data.Migrations
                     b.Navigation("Certificate");
                 });
 
+            modelBuilder.Entity("Certus.Core.Data.Entities.DeviceAllowlistEntry", b =>
+                {
+                    b.HasOne("Certus.Core.Data.Entities.DeviceAttestationProfile", "Profile")
+                        .WithMany("AllowlistEntries")
+                        .HasForeignKey("ProfileId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Profile");
+                });
+
             modelBuilder.Entity("Certus.Core.Data.Entities.AcmeAuthorization", b =>
                 {
                     b.Navigation("Challenges");
@@ -459,6 +773,11 @@ namespace Certus.Core.Data.Migrations
             modelBuilder.Entity("Certus.Core.Data.Entities.AcmeOrder", b =>
                 {
                     b.Navigation("Authorizations");
+                });
+
+            modelBuilder.Entity("Certus.Core.Data.Entities.DeviceAttestationProfile", b =>
+                {
+                    b.Navigation("AllowlistEntries");
                 });
 #pragma warning restore 612, 618
         }

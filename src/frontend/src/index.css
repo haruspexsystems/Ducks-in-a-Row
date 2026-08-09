@@ -2,9 +2,78 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Semantic theme tokens.
+   Values are raw RGB channel triplets, not hex, so Tailwind's opacity modifiers
+   keep working through the <alpha-value> placeholder in tailwind.config.js
+   (bg-surface/50 and friends). A hex value here would silently break them.
+
+   These values are kept in lockstep with getChartColors() in
+   features/dashboard/lib/colors.ts. SVG charts need real color values rather
+   than class names, so the two must agree or a chart drifts from its card.
+   Change one, change the other. */
 @layer base {
+  :root {
+    /* Light values are the exact Tailwind slate steps they replace, so
+       migrating a class onto a token is a pure rename with no visual change in
+       light mode. Dark mode is the only thing these introduce. */
+    --bg: 246 247 249; /*            #F6F7F9 page */
+    --surface: 255 255 255; /*       white, card */
+    --sunken: 248 250 252; /*        slate-50, table head / subtle panel */
+    --sunken-strong: 241 245 249; /* slate-100, chip */
+    --track: 226 232 240; /*         slate-200, progress track / step dot */
+
+    --ink: 15 23 42; /*              slate-900 */
+    --ink-strong: 30 41 59; /*       slate-800 */
+    --ink-soft: 51 65 85; /*         slate-700 */
+    --ink-mid: 71 85 105; /*         slate-600 */
+    --muted: 100 116 139; /*         slate-500 */
+    --faint: 148 163 184; /*         slate-400 */
+
+    --hairline-soft: 241 245 249; /*   slate-100, divider */
+    --hairline: 226 232 240; /*        slate-200, card / table border */
+    --hairline-strong: 203 213 225; /* slate-300, form input border */
+
+    /* Card border from ui.ts, alpha based rather than a solid step. */
+    --card-border: 15 23 42;
+    --card-border-alpha: 0.08;
+
+    /* Deep slate nav chrome, intentionally identical in both themes. */
+    --nav-bg: 12 19 34; /*           #0C1322 */
+    --nav-border: 148 163 184;
+    --nav-border-alpha: 0.14;
+
+    color-scheme: light;
+  }
+
+  .dark {
+    --bg: 11 18 32; /*               #0B1220 page */
+    --surface: 19 28 46; /*          #131C2E card */
+    --sunken: 15 23 38;
+    --sunken-strong: 26 37 58;
+    --track: 33 46 70;
+
+    --ink: 241 245 249; /*           slate-100 */
+    --ink-strong: 226 232 240; /*    slate-200 */
+    --ink-soft: 203 213 225; /*      slate-300 */
+    --ink-mid: 168 183 202;
+    --muted: 133 149 173; /*         #8595AD, matches getChartColors */
+    --faint: 91 107 134; /*          #5B6B86, matches getChartColors */
+
+    --hairline-soft: 28 39 60;
+    --hairline: 38 50 72;
+    --hairline-strong: 55 70 96;
+
+    --card-border: 148 163 184;
+    --card-border-alpha: 0.16;
+
+    /* color-scheme drives the native surfaces Tailwind cannot reach: scrollbar
+       gutters, form control chrome and the canvas behind the app. Without it a
+       white scrollbar flashes down the side of a dark page. */
+    color-scheme: dark;
+  }
+
   body {
-    @apply antialiased text-slate-900;
+    @apply antialiased bg-bg text-ink;
     /* Hanken Grotesk is self-hosted via @fontsource (see main.tsx) and is the
        dashboard's typeface; applying it here keeps every page in step. */
     font-family: 'Hanken Grotesk', system-ui, -apple-system, sans-serif;

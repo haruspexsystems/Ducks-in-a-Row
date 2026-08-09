@@ -20,6 +20,10 @@ public sealed class SecurityHeadersMiddleware
     //                            this concession does not undermine the script backstop.
     //   img-src data:          : Vite inlines small assets as data URIs; the favicon is same origin.
     //   font-src 'self'        : the @fontsource fonts ship bundled, served from this origin.
+    //                            This holds only while the build emits every font as a file.
+    //                            vite.config.ts sets build.assetsInlineLimit to refuse inlining
+    //                            for font extensions; without it the small subsets land in the
+    //                            CSS as `data:` URIs and every one of them is blocked here.
     //   connect-src 'self'     : /api, /acme, and /health are all same origin.
     //   frame-ancestors 'none' : the modern equivalent of the X-Frame-Options: DENY above.
     // No report-uri / report-to: a violation sink would phone home, which the no-telemetry

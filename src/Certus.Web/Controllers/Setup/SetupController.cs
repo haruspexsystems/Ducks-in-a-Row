@@ -1,3 +1,4 @@
+using Certus.Core.Acme.Services;
 using Certus.Core.Adcs;
 using Certus.Core.Configuration;
 using Certus.Core.Setup;
@@ -90,6 +91,9 @@ public sealed class SetupController : ControllerBase
             enabledTemplates = status.EnabledTemplates,
             externalUrl = status.ExternalUrl,
             suggestedExternalUrl = ServerUrlSuggestion.Build(_configuration),
+            allowedDomainsEnabled = status.AllowedDomainsEnabled,
+            allowedDomains = status.AllowedDomains,
+            suggestedAllowedDomain = AdDomainSuggestion.Get(),
             wizardStep = status.SetupCompleted ? null : status.WizardStep,
             tlsCertificate = DescribeConfiguredTlsCertificate(),
         });
@@ -131,8 +135,10 @@ public sealed class SetupController : ControllerBase
     /// POST /api/setup/draft — persist the wizard's current selections and
     /// step without completing setup, so a plain reload resumes where it was.
     /// Locked once setup is effectively complete (SEC-G1, mirrors the
-    /// completion lock): a completed install must never be reverted to a
-    /// draft, which would drop the enabled template restriction.
+    /// completion lock): a completed install must never have its recorded
+    /// state rewritten by an anonymous draft. Since issue #101 an emptied
+    /// template set fails closed, so the exposure risk became an availability
+    /// risk, but the lock stands either way.
     /// </summary>
     [HttpPost("draft")]
     public IActionResult SaveDraft([FromBody] SaveWizardDraftRequest request)
@@ -140,11 +146,31 @@ public sealed class SetupController : ControllerBase
         if (_setupService.IsSetupEffectivelyComplete())
             return Conflict(new { error = "Setup already completed" });
 
+        // A draft writes the same EnabledTemplates field completion does, and
+        // EnabledTemplatesPolicy does not consult SetupCompleted (issue #101), so
+        // a draft set is live for ACME matching and is logged the moment the
+        // policy loads it. Check every entry here too, or the draft is an
+        // unguarded second writer to a field the completion endpoint guards.
+        foreach (var draftTemplate in request.EnabledTemplates ?? [])
+        {
+            if (!AdcsRequestAttributes.TryValidateTemplateName(draftTemplate, out var draftError))
+                return BadRequest(new { error = draftError });
+        }
+
+        // A draft records the CA the wizard will later be completed against, and
+        // every CA call logs that string verbatim, so the draft is a second
+        // writer to it exactly as it is to the template set (issue #220). A
+        // missing value passes: the wizard saves whatever it has at each step.
+        if (!AdcsCaConnectionString.TryValidate(request.CaConnectionString, out var draftCaError))
+            return BadRequest(new { error = draftCaError });
+
         _setupService.SaveWizardDraft(
             new SetupConfiguration(
                 CaConnectionString: request.CaConnectionString ?? string.Empty,
                 EnabledTemplates: request.EnabledTemplates ?? new List<string>(),
-                ExternalUrl: request.ExternalUrl ?? string.Empty),
+                ExternalUrl: request.ExternalUrl ?? string.Empty,
+                AllowedDomainsEnabled: request.AllowedDomainsEnabled,
+                AllowedDomains: request.AllowedDomains),
             request.WizardStep);
 
         return Ok(new { saved = true });
@@ -171,6 +197,8 @@ public sealed class SetupController : ControllerBase
     {
         if (string.IsNullOrWhiteSpace(request.CaConnectionString))
             return BadRequest(new { error = "CA connection string is required" });
+        if (!AdcsCaConnectionString.TryValidate(request.CaConnectionString, out var caError))
+            return BadRequest(new { error = caError });
 
         var result = await _setupService.TestConnectivityAsync(request.CaConnectionString, ct);
         return Ok(result);
@@ -191,6 +219,8 @@ public sealed class SetupController : ControllerBase
     {
         if (string.IsNullOrWhiteSpace(request.CaConnectionString))
             return BadRequest(new { error = "CA connection string is required" });
+        if (!AdcsCaConnectionString.TryValidate(request.CaConnectionString, out var caError))
+            return BadRequest(new { error = caError });
 
         try
         {
@@ -262,8 +292,27 @@ public sealed class SetupController : ControllerBase
         if (request.EnabledTemplates == null || request.EnabledTemplates.Count == 0)
             return BadRequest(new { error = "At least one template must be enabled" });
 
+        // The recorded set is what the ACME template policy matches against and
+        // where the webserver certificate renewal reads its template from, so
+        // no entry may carry a character that could smuggle an extra ADCS
+        // request attribute once it is submitted (issue #175).
+        foreach (var enabledTemplate in request.EnabledTemplates)
+        {
+            if (!AdcsRequestAttributes.TryValidateTemplateName(enabledTemplate, out var templateError))
+                return BadRequest(new { error = templateError });
+        }
+
         if (_setupService.CaMode != "mock" && string.IsNullOrWhiteSpace(request.CaConnectionString))
             return BadRequest(new { error = "CA connection string is required" });
+
+        // The recorded connection string is written verbatim into the service
+        // log on every CA call, so no character may forge a log line or disguise
+        // which CA is being addressed (issue #220). Unconditional, including in
+        // mock mode: completion keeps the value out of the settings overlay
+        // there, but it still writes it to the wizard status file and logs it
+        // either way.
+        if (!AdcsCaConnectionString.TryValidate(request.CaConnectionString, out var caError))
+            return BadRequest(new { error = caError });
 
         var validation = await _setupService.ValidateExternalUrlAsync(
             request.ExternalUrl, request.EnabledTemplates[0], ct);
@@ -283,10 +332,32 @@ public sealed class SetupController : ControllerBase
             });
         }
 
+        // Same validation rules as PUT /api/settings/allowed-domains, through
+        // the same shared helper: the enabled flag never completes without at
+        // least one usable entry.
+        var allowedDomains = new List<string>();
+        if (request.AllowedDomainsEnabled)
+        {
+            var (normalized, invalid) =
+                AllowedDomainsPolicy.ValidateAndNormalize(request.AllowedDomains ?? []);
+            if (invalid.Count > 0)
+            {
+                var (entry, reason) = invalid[0];
+                return BadRequest(new { error = $"Allowed domain '{entry}': {reason}" });
+            }
+
+            if (normalized.Count == 0)
+                return BadRequest(new { error = "Add at least one allowed domain, or turn the restriction off." });
+
+            allowedDomains = normalized;
+        }
+
         var config = new SetupConfiguration(
             CaConnectionString: request.CaConnectionString ?? string.Empty,
             EnabledTemplates: request.EnabledTemplates,
-            ExternalUrl: request.ExternalUrl);
+            ExternalUrl: request.ExternalUrl,
+            AllowedDomainsEnabled: request.AllowedDomainsEnabled,
+            AllowedDomains: allowedDomains);
 
         var status = _setupService.CompleteSetup(config);
 
@@ -325,6 +396,8 @@ public sealed class SetupController : ControllerBase
 
         if (string.IsNullOrWhiteSpace(request.CaConnectionString))
             return BadRequest(new { error = "CA connection string is required" });
+        if (!AdcsCaConnectionString.TryValidate(request.CaConnectionString, out var caError))
+            return BadRequest(new { error = caError });
         if (string.IsNullOrWhiteSpace(request.TemplateName))
             return BadRequest(new { error = "Template name is required" });
 
@@ -334,9 +407,25 @@ public sealed class SetupController : ControllerBase
 
         try
         {
+            // Enrollment interpolates the template name into the ADCS request
+            // attribute string, so resolve the request body value to the CA's
+            // own published name and enroll with that. Without this step the
+            // wizard would be the one caller that hands ADCS a client supplied
+            // string verbatim (issue #175, the CVE-2026-54121 smuggling class).
+            var templateName = await _setupService.ResolvePublishedTemplateNameAsync(
+                request.CaConnectionString, request.TemplateName, ct);
+            if (templateName is null)
+            {
+                return BadRequest(new
+                {
+                    error = "That certificate template is not published by the CA. " +
+                            "Pick one from the template list.",
+                });
+            }
+
             var result = await _tlsEnroller.EnrollAsync(
                 request.CaConnectionString,
-                request.TemplateName,
+                templateName,
                 request.ExternalUrl,
                 Request.Host.Host,
                 ct);
@@ -372,7 +461,7 @@ public sealed class SetupController : ControllerBase
             }
 
             return Ok(ApplyEnrolledCertificate(
-                request.CaConnectionString, request.TemplateName, request.ExternalUrl,
+                request.CaConnectionString, templateName, request.ExternalUrl,
                 result.Thumbprint!, result.CurrentHostCovered));
         }
         catch (CaUnavailableException ex)
@@ -388,7 +477,8 @@ public sealed class SetupController : ControllerBase
     /// that is already installed in the store.
     /// </summary>
     [HttpPost("tls-certificate/apply")]
-    public IActionResult ApplyTlsCertificate([FromBody] ApplyTlsCertificateRequest request)
+    public async Task<IActionResult> ApplyTlsCertificate(
+        [FromBody] ApplyTlsCertificateRequest request, CancellationToken ct)
     {
         var guard = GuardTlsProvisioning();
         if (guard is not null)
@@ -397,15 +487,52 @@ public sealed class SetupController : ControllerBase
         if (string.IsNullOrWhiteSpace(request.Thumbprint))
             return BadRequest(new { error = "Thumbprint is required" });
 
+        // Apply had no connection string check of its own, which left it the
+        // second unguarded writer alongside the draft endpoint (issue #220): the
+        // value reaches the CA through the template resolution below and is then
+        // recorded into the wizard draft, from where completion carries it into
+        // the settings overlay.
+        if (!AdcsCaConnectionString.TryValidate(request.CaConnectionString, out var caError))
+            return BadRequest(new { error = caError });
+
         using var certificate = _certificateStore.Find(request.Thumbprint);
         if (certificate is null)
             return NotFound(new { error = "No certificate with that thumbprint is installed" });
+
+        // Resolve exactly as the enrollment endpoint does. Nothing is submitted
+        // here, but this name is recorded into the wizard draft and the settings
+        // overlay, and the renewal path submits it verbatim later with no
+        // resolution of its own. The wizard restores its template selection from
+        // the recorded set, which EnabledTemplatesPolicy documents may hold a
+        // display name, so recording an unresolved name is how a display name
+        // reaches ADCS and fails every future renewal (the issue #17 bug).
+        string templateName;
+        try
+        {
+            var resolved = await _setupService.ResolvePublishedTemplateNameAsync(
+                request.CaConnectionString, request.TemplateName, ct);
+            if (resolved is null)
+            {
+                return BadRequest(new
+                {
+                    error = "That certificate template is not published by the CA. " +
+                            "Pick one from the template list.",
+                });
+            }
+
+            templateName = resolved;
+        }
+        catch (CaUnavailableException ex)
+        {
+            _logger.LogWarning(ex, "TLS certificate apply: the CA is unavailable");
+            return StatusCode(503, new { error = true, message = "The certificate authority is unavailable. Try again shortly." });
+        }
 
         var currentHostCovered = TlsCertificateEnroller.CoversHost(
             TlsCertificateEnroller.GetSubjectNames(certificate), Request.Host.Host);
 
         return Ok(ApplyEnrolledCertificate(
-            request.CaConnectionString, request.TemplateName, request.ExternalUrl,
+            request.CaConnectionString, templateName, request.ExternalUrl,
             request.Thumbprint, currentHostCovered));
     }
 
@@ -461,11 +588,18 @@ public sealed class SetupController : ControllerBase
         string thumbprint,
         bool? currentHostCovered)
     {
+        // The TLS request carries only the CA, template, and URL, but this
+        // draft overwrites the whole status file. Read the current draft
+        // back and carry the allowed domain choice through, or the mid
+        // wizard restart wipes what the domains step already saved.
+        var current = _setupService.GetStatus();
         _setupService.SaveWizardDraft(
             new SetupConfiguration(
                 CaConnectionString: caConnectionString,
                 EnabledTemplates: new List<string> { templateName },
-                ExternalUrl: externalUrl),
+                ExternalUrl: externalUrl,
+                AllowedDomainsEnabled: current.AllowedDomainsEnabled,
+                AllowedDomains: current.AllowedDomains),
             wizardStep: "url");
         _setupService.SetHttpsCertificateThumbprint(thumbprint, templateName);
 
@@ -508,7 +642,9 @@ public sealed record CompleteSetupRequest(
     string? CaConnectionString,
     List<string> EnabledTemplates,
     string ExternalUrl,
-    bool ConfirmUnreachableExternalUrl = false);
+    bool ConfirmUnreachableExternalUrl = false,
+    bool AllowedDomainsEnabled = false,
+    List<string>? AllowedDomains = null);
 
 /// <summary>
 /// Request body for enrolling the server's own TLS certificate. Carries the
@@ -542,4 +678,6 @@ public sealed record SaveWizardDraftRequest(
     string? CaConnectionString,
     List<string>? EnabledTemplates,
     string? ExternalUrl,
-    string? WizardStep);
+    string? WizardStep,
+    bool AllowedDomainsEnabled = false,
+    List<string>? AllowedDomains = null);

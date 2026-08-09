@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
 
   <PropertyGroup>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
     <!-- The host exe name is user visible (Task Manager, services binPath,
          Event Viewer source), so it carries the product name. Namespaces and
          the other Certus.* assemblies are internal and keep their names. -->

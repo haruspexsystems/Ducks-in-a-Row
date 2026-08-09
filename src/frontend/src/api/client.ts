@@ -19,16 +19,17 @@ export const CSRF_HEADERS = { 'X-Certus-Csrf': '1' } as const;
 /**
  * Single fetch helper for the JSON API. Merges the CSRF guard header with any
  * caller headers, and turns an empty or non-JSON body into an ApiError rather
- * than a raw SyntaxError so call sites only ever catch ApiError.
+ * than a raw SyntaxError so call sites only ever catch ApiError. A non 2xx
+ * problem+json body (RFC 7807) is parsed into the ApiError's problem fields,
+ * so a caller can tell, for example, a CA that is unreachable from a CA that
+ * denied view access (issue #157).
  */
 export async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     ...options,
     headers: { ...CSRF_HEADERS, ...(options?.headers ?? {}) },
   });
-  if (!response.ok) {
-    throw new ApiError(response.status, response.statusText, url);
-  }
+  if (!response.ok) throw await problemFrom(response, url);
   try {
     return (await response.json()) as T;
   } catch {
@@ -36,11 +37,60 @@ export async function fetchJson<T>(url: string, options?: RequestInit): Promise<
   }
 }
 
+/**
+ * The same fetch for endpoints that answer with text rather than JSON, used by
+ * the copy PEM button on the certificate detail page. Shares fetchJson's CSRF
+ * header merge and its RFC 7807 error parsing, so a caller catches the one
+ * ApiError type either way.
+ *
+ * A separate function rather than a flag on fetchJson because the two differ in
+ * what they do with a successful body, and fetchJson treats a non JSON body as
+ * an error by design.
+ */
+export async function fetchText(url: string, options?: RequestInit): Promise<string> {
+  const response = await fetch(url, {
+    ...options,
+    headers: { ...CSRF_HEADERS, ...(options?.headers ?? {}) },
+  });
+  if (!response.ok) throw await problemFrom(response, url);
+  return response.text();
+}
+
+/**
+ * Turns a failed response into an ApiError, reading the RFC 7807 problem body
+ * when there is one. Shared so the JSON and text helpers report failures
+ * identically.
+ */
+async function problemFrom(response: Response, url: string): Promise<ApiError> {
+  let problemType: string | undefined;
+  let problemTitle: string | undefined;
+  let problemDetail: string | undefined;
+  try {
+    const body: unknown = await response.json();
+    if (body && typeof body === 'object') {
+      const problem = body as Record<string, unknown>;
+      if (typeof problem.type === 'string') problemType = problem.type;
+      if (typeof problem.title === 'string') problemTitle = problem.title;
+      if (typeof problem.detail === 'string') problemDetail = problem.detail;
+    }
+  } catch {
+    // Non JSON error body: the status line is all there is.
+  }
+  return new ApiError(
+    response.status, response.statusText, url, problemType, problemTitle, problemDetail);
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
     public statusText: string,
-    public url: string
+    public url: string,
+    /** RFC 7807 problem type URI, when the error body carried one. */
+    public problemType?: string,
+    /** RFC 7807 problem title, when the error body carried one. */
+    public problemTitle?: string,
+    /** RFC 7807 problem detail, when the error body carried one. */
+    public problemDetail?: string
   ) {
     super(`API error ${status}: ${statusText} (${url})`);
     this.name = 'ApiError';
@@ -54,6 +104,7 @@ function buildQueryString(query: CertificateQuery): string {
   if (query.search) params.set('search', query.search);
   if (query.template) params.set('template', query.template);
   if (query.status) params.set('status', query.status);
+  if (query.state) params.set('state', query.state);
   if (query.expiringBefore) params.set('expiringBefore', query.expiringBefore);
   if (query.expiringAfter) params.set('expiringAfter', query.expiringAfter);
   if (query.sortBy) params.set('sortBy', query.sortBy);
@@ -102,6 +153,62 @@ export interface SyncResult {
  */
 export async function triggerSync(): Promise<SyncResult> {
   return fetchJson('/api/certificates/sync', { method: 'POST' });
+}
+
+/** Outcome of a dashboard revocation (issue #159). */
+export interface RevokeCertificateResult {
+  outcome: 'revoked';
+  /**
+   * Whether the in request inventory resync succeeded. When false the CA has
+   * revoked but the returned certificate may still read Issued until the next
+   * background sync; the page says so instead of pretending.
+   */
+  resynced: boolean;
+  /** The row as the resync read it back from the CA. */
+  certificate: CertificateDetail;
+}
+
+/**
+ * Revoke one certificate at the CA. The serial is echoed back so the server
+ * refuses if the row underneath the dialog is not the certificate the admin
+ * confirmed. Waits for the CA call and the follow up resync; failures arrive
+ * as ApiError carrying the problem type (already revoked, target mismatch,
+ * CA unavailable, and so on) for the dialog to word precisely.
+ */
+export async function revokeCertificate(
+  id: number,
+  reason: number,
+  serialNumber: string
+): Promise<RevokeCertificateResult> {
+  return fetchJson(`/api/certificates/${id}/revoke`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reason, serialNumber }),
+  });
+}
+
+/** The connected CA and the outcome of the most recent inventory sync. */
+export interface SyncStatus {
+  /** CA display name from the connection string; null when unknown. */
+  caName: string | null;
+  caMode: 'real' | 'mock' | 'unconfigured';
+  /** When the most recent attempt ran, success or failure; null before the first one. */
+  lastAttemptAt: string | null;
+  lastOutcome: 'success' | 'caUnavailable' | 'caAccessDenied' | 'failed' | null;
+  /** The failure message of the last attempt, when it failed. */
+  lastMessage: string | null;
+  /** True when the most recent attempt failed. */
+  failed: boolean;
+  /** The most recent successful sync; null when none has succeeded yet. */
+  lastSuccess: SyncResult | null;
+}
+
+/**
+ * Fetch the sync status for the page headers (issue #157). A memory read on
+ * the server with no CA round trip, so it is cheap to poll.
+ */
+export async function fetchSyncStatus(): Promise<SyncStatus> {
+  return fetchJson('/api/certificates/sync-status');
 }
 
 // ── Dashboard metrics (charts) ──────────────────────────────────────

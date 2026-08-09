@@ -22,11 +22,13 @@ public sealed class Http01ChallengeValidator : IChallengeValidator
     public string ChallengeType => "http-01";
 
     public async Task<ChallengeValidationResult> ValidateAsync(
-        string domain,
-        string token,
-        string accountThumbprint,
+        ChallengeValidationContext context,
         CancellationToken cancellationToken = default)
     {
+        var domain = context.IdentifierValue;
+        var token = context.Token;
+        var accountThumbprint = context.AccountThumbprint;
+
         // The expected key authorization: token.thumbprint
         var expectedKeyAuth = $"{token}.{accountThumbprint}";
 

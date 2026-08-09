@@ -25,6 +25,14 @@ public sealed class AcmeError
     [JsonPropertyName("identifier")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public AcmeIdentifier? Identifier { get; set; }
+
+    /// <summary>
+    /// The algorithms the server accepts, included on badSignatureAlgorithm
+    /// problems as RFC 8555 §6.2 recommends.
+    /// </summary>
+    [JsonPropertyName("algorithms")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string[]? Algorithms { get; set; }
 }
 
 /// <summary>
@@ -48,6 +56,9 @@ public static class AcmeErrorType
 
     public const string AccountDoesNotExist = Prefix + "accountDoesNotExist";
     public const string AlreadyRevoked = Prefix + "alreadyRevoked";
+    // From draft-ietf-acme-device-attest-08, not RFC 8555: the attestation
+    // object of a device-attest-01 challenge did not verify.
+    public const string BadAttestationStatement = Prefix + "badAttestationStatement";
     public const string BadCsr = Prefix + "badCSR";
     public const string BadNonce = Prefix + "badNonce";
     public const string BadPublicKey = Prefix + "badPublicKey";

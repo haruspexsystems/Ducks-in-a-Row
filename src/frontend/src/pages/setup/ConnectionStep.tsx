@@ -93,8 +93,8 @@ export function ConnectionStep({ state, onUpdate }: ConnectionStepProps) {
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-xl font-bold text-slate-900">Connect to Certificate Authority</h2>
-        <p className="text-sm text-slate-500 mt-1">
+        <h2 className="text-xl font-bold text-ink">Connect to Certificate Authority</h2>
+        <p className="text-sm text-muted mt-1">
           Pick the ADCS CA to issue certificates from, then test the connection. Ducks in a
           Row connects over DCOM/RPC, which requires this server to be domain joined with
           appropriate permissions on the CA.
@@ -102,7 +102,7 @@ export function ConnectionStep({ state, onUpdate }: ConnectionStepProps) {
       </div>
 
       {discovering && (
-        <div className="flex items-center gap-2 text-sm text-slate-500 py-4">
+        <div className="flex items-center gap-2 text-sm text-muted py-4">
           <Loader2 className="h-4 w-4 animate-spin" />
           Looking for certificate authorities in Active Directory...
         </div>
@@ -117,8 +117,8 @@ export function ConnectionStep({ state, onUpdate }: ConnectionStepProps) {
                 key={ca.connectionString}
                 className={`flex items-center gap-3 p-3 rounded-xl border cursor-pointer transition-colors ${
                   isSelected
-                    ? 'border-certus-300 bg-certus-50'
-                    : 'border-slate-200 bg-white hover:border-slate-300'
+                    ? 'border-certus-300 bg-certus-50 dark:bg-certus-500/10'
+                    : 'border-hairline bg-surface hover:border-hairline-strong'
                 }`}
               >
                 <input
@@ -126,12 +126,12 @@ export function ConnectionStep({ state, onUpdate }: ConnectionStepProps) {
                   name="ca"
                   checked={isSelected}
                   onChange={() => pickDiscovered(ca.connectionString)}
-                  className="h-4 w-4 text-certus-600 border-slate-300 focus:ring-certus-500"
+                  className="h-4 w-4 text-certus-600 border-hairline-strong focus:ring-certus-500"
                 />
-                <Server className={`h-4 w-4 ${isSelected ? 'text-certus-600' : 'text-slate-400'}`} />
+                <Server className={`h-4 w-4 ${isSelected ? 'text-certus-600' : 'text-faint'}`} />
                 <div className="flex-1 min-w-0">
-                  <div className="text-sm font-medium text-slate-900">{ca.displayName}</div>
-                  <div className="text-xs text-slate-500 font-mono">{ca.connectionString}</div>
+                  <div className="text-sm font-medium text-ink">{ca.displayName}</div>
+                  <div className="text-xs text-muted font-mono">{ca.connectionString}</div>
                 </div>
               </label>
             );
@@ -140,8 +140,8 @@ export function ConnectionStep({ state, onUpdate }: ConnectionStepProps) {
           <label
             className={`flex items-center gap-3 p-3 rounded-xl border cursor-pointer transition-colors ${
               useManual
-                ? 'border-certus-300 bg-certus-50'
-                : 'border-slate-200 bg-white hover:border-slate-300'
+                ? 'border-certus-300 bg-certus-50 dark:bg-certus-500/10'
+                : 'border-hairline bg-surface hover:border-hairline-strong'
             }`}
           >
             <input
@@ -149,15 +149,15 @@ export function ConnectionStep({ state, onUpdate }: ConnectionStepProps) {
               name="ca"
               checked={useManual}
               onChange={pickManual}
-              className="h-4 w-4 text-certus-600 border-slate-300 focus:ring-certus-500"
+              className="h-4 w-4 text-certus-600 border-hairline-strong focus:ring-certus-500"
             />
-            <PencilLine className={`h-4 w-4 ${useManual ? 'text-certus-600' : 'text-slate-400'}`} />
+            <PencilLine className={`h-4 w-4 ${useManual ? 'text-certus-600' : 'text-faint'}`} />
             <div className="flex-1 min-w-0">
-              <div className="text-sm font-medium text-slate-900">Enter manually</div>
+              <div className="text-sm font-medium text-ink">Enter manually</div>
               {discovered.length === 0 && (
-                <div className="text-xs text-slate-500">
+                <div className="text-xs text-muted">
                   No CA was discovered in Active Directory. Find the connection string with{' '}
-                  <code className="bg-slate-100 px-1 rounded">certutil -config - -ping</code>
+                  <code className="bg-sunken-strong px-1 rounded">certutil -config - -ping</code>
                 </div>
               )}
             </div>
@@ -174,17 +174,17 @@ export function ConnectionStep({ state, onUpdate }: ConnectionStepProps) {
               }}
               placeholder="CAHOST.corp.example.com\Corp Issuing CA"
               spellCheck={false}
-              className="w-full px-3 py-2 text-sm font-mono border border-slate-300 rounded-lg
+              className="w-full px-3 py-2 text-sm font-mono border border-hairline-strong rounded-lg
                          focus:outline-none focus:ring-2 focus:ring-certus-500 focus:border-certus-500"
             />
           )}
         </div>
       )}
 
-      <div className="bg-slate-50 border border-slate-200 rounded-lg p-4">
+      <div className="bg-sunken border border-hairline rounded-lg p-4">
         <div className="flex items-start gap-3">
-          <Server className="h-5 w-5 text-slate-400 mt-0.5" />
-          <p className="text-xs text-slate-500">
+          <Server className="h-5 w-5 text-faint mt-0.5" />
+          <p className="text-xs text-muted">
             The service account running Ducks in a Row needs <strong>Request Certificates</strong>{' '}
             permission on the CA and the relevant templates.
           </p>
@@ -214,12 +214,12 @@ export function ConnectionStep({ state, onUpdate }: ConnectionStepProps) {
 
       {/* Success */}
       {state.connectionTested && (
-        <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-4">
+        <div className="bg-emerald-50 dark:bg-emerald-500/10 border border-emerald-200 dark:border-emerald-500/30 rounded-lg p-4">
           <div className="flex items-start gap-3">
             <CheckCircle2 className="h-5 w-5 text-emerald-600 mt-0.5" />
             <div>
-              <h3 className="text-sm font-semibold text-emerald-900">Connected successfully</h3>
-              <dl className="mt-2 text-sm text-emerald-800 space-y-1">
+              <h3 className="text-sm font-semibold text-emerald-900 dark:text-emerald-200">Connected successfully</h3>
+              <dl className="mt-2 text-sm text-emerald-800 dark:text-emerald-300 space-y-1">
                 <div className="flex gap-2">
                   <dt className="font-medium">CA Name:</dt>
                   <dd>{state.caName}</dd>
@@ -240,12 +240,12 @@ export function ConnectionStep({ state, onUpdate }: ConnectionStepProps) {
 
       {/* Error */}
       {error && (
-        <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+        <div className="bg-red-50 dark:bg-red-500/10 border border-red-200 dark:border-red-500/30 rounded-lg p-4">
           <div className="flex items-start gap-3">
             <XCircle className="h-5 w-5 text-red-600 mt-0.5" />
             <div>
-              <h3 className="text-sm font-semibold text-red-900">Connection failed</h3>
-              <p className="text-sm text-red-700 mt-1">{error}</p>
+              <h3 className="text-sm font-semibold text-red-900 dark:text-red-200">Connection failed</h3>
+              <p className="text-sm text-red-700 dark:text-red-300 mt-1">{error}</p>
               <p className="text-xs text-red-500 mt-2">
                 Verify that this server is domain joined and the CA is reachable via RPC.
               </p>

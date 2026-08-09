@@ -1,4 +1,5 @@
 using Certus.Core.Acme.Services;
+using Certus.Web.Routing;
 
 namespace Certus.Web.Middleware;
 
@@ -17,8 +18,12 @@ public sealed class AcmeNonceMiddleware
 
     public async Task InvokeAsync(HttpContext context, NonceService nonceService)
     {
-        // Only add nonces to ACME paths
-        if (context.Request.Path.StartsWithSegments("/acme"))
+        // Only add nonces to ACME protocol paths, which always carry a
+        // template segment (/acme/{template}/...). Bare /acme is the
+        // dashboard's ACME tab (issue #129): stamping it would burn a stored
+        // nonce per page load that no client ever consumes, and force
+        // no-store on the SPA shell.
+        if (ProtocolPaths.IsAcmeProtocolPath(context.Request.Path))
         {
             context.Response.OnStarting(() =>
             {

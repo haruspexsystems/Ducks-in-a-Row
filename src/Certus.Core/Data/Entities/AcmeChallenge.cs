@@ -52,4 +52,13 @@ public class AcmeChallenge
 
     /// <summary>ACME error JSON if the challenge failed.</summary>
     public string? ErrorJson { get; set; }
+
+    /// <summary>
+    /// The attestation object the client POSTed to a device-attest-01
+    /// challenge (the base64url "attObj" member, stored as received). The
+    /// validation worker consumes it, and it stays for post issuance
+    /// forensics. Null for the network based challenge types, which carry
+    /// no payload.
+    /// </summary>
+    public string? AttestationObject { get; set; }
 }

@@ -94,8 +94,8 @@ public class TlsAlpn01ChallengeValidatorTests
             TimeSpan.FromMilliseconds(500));
 
         // 192.0.2.1 is TEST-NET-1 — guaranteed non-routable
-        var result = await sut.ValidateAsync(
-            "192.0.2.1", "test-token", "test-thumbprint");
+        var result = await sut.ValidateAsync(new ChallengeValidationContext(
+            "dns", "192.0.2.1", "test-token", "test-thumbprint", "test-template"));
 
         result.IsValid.Should().BeFalse();
         result.ErrorDetail.Should().NotBeNullOrEmpty();

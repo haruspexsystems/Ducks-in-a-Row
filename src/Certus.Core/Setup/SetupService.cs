@@ -1,6 +1,9 @@
 using System.Runtime.InteropServices;
+using Certus.Core.Acme.Services;
 using Certus.Core.Adcs;
 using Certus.Core.Configuration;
+using Certus.Core.Security;
+using Certus.Core.Services;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -59,8 +62,7 @@ public sealed class SetupService
     /// overlay read and write, so a reader can never watch a different file
     /// than the writer wrote.
     /// </summary>
-    public string SettingsOverlayPath =>
-        _certusOptions.SettingsOverlayPath ?? CertusPaths.SettingsOverlayPath;
+    public string SettingsOverlayPath => SettingsOverlay.ResolvePath(_certusOptions);
 
     /// <summary>
     /// The raw wizard status file. Says whether the wizard was walked through,
@@ -207,12 +209,63 @@ public sealed class SetupService
             if (!views.Any(v => v.EkuVerified))
                 return new SetupTemplatesResult(views, ExcludedCount: 0);
 
+            // The ceiling term catches what HasServerAuthEku alone misses: a
+            // template carrying server authentication next to a dangerous
+            // usage (code signing, enrollment agent) would mint certificates
+            // the finalize leaf guard refuses and revokes, so offering it in
+            // the wizard would only set the admin up for failed orders.
             var usable = views
-                .Where(v => v.HasServerAuthEku
-                    && v.Viability?.SubjectSuppliedInRequest != false)
+                .Zip(all, (view, template) => (view, template))
+                .Where(pair => pair.view.HasServerAuthEku
+                    && pair.view.Viability?.SubjectSuppliedInRequest != false
+                    && TlsCapabilityCeiling.Evaluate(new CertificateCapability(
+                        pair.template.ExtendedKeyUsages, null, null)).Allowed)
+                .Select(pair => pair.view)
                 .ToList();
 
             return new SetupTemplatesResult(usable, ExcludedCount: views.Count - usable.Count);
+        }
+        finally
+        {
+            (client as IDisposable)?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Resolve a wizard supplied template name against the candidate CA's own
+    /// published list, returning the CA's canonical name, or null when nothing
+    /// matches.
+    ///
+    /// Enrollment interpolates this name into the ADCS request attribute string
+    /// (see <see cref="AdcsRequestAttributes"/>), so resolving here is what
+    /// keeps that string built from CA supplied text rather than request body
+    /// text. It mirrors what the ACME path already does through
+    /// <see cref="Acme.Services.TemplateService.ResolveAsync"/>: the caller's
+    /// value selects a template, it never becomes the value sent to the CA.
+    ///
+    /// Matches the programmatic name or the display name, case insensitive, the
+    /// same dual form the ACME resolver accepts. Deliberately checked against
+    /// the full published list rather than the ACME usable subset
+    /// <see cref="GetSetupTemplatesAsync"/> returns: the question here is
+    /// whether ADCS knows the template, not whether it suits ACME.
+    /// </summary>
+    public async Task<string?> ResolvePublishedTemplateNameAsync(
+        string caConnectionString,
+        string templateName,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(templateName))
+            return null;
+
+        var client = _clientFactory.Create(caConnectionString);
+        try
+        {
+            var published = await client.GetTemplatesAsync(cancellationToken);
+            return published
+                .FirstOrDefault(t =>
+                    t.Name.Equals(templateName, StringComparison.OrdinalIgnoreCase)
+                    || t.DisplayName.Equals(templateName, StringComparison.OrdinalIgnoreCase))
+                ?.Name;
         }
         finally
         {
@@ -309,30 +362,59 @@ public sealed class SetupService
         // wizard's TLS provisioning wrote minutes earlier, and the completion
         // restart would silently fall back to the self signed certificate.
         var overlayPath = SettingsOverlayPath;
-        var overlay = SettingsOverlay.Load(overlayPath) with
+        SettingsOverlay.Mutate(overlayPath, current => current with
         {
             CaConnectionString = _certusOptions.UseMockCa ? null : config.CaConnectionString,
             ExternalUrl = config.ExternalUrl,
-        };
-        SettingsOverlay.Save(overlay, overlayPath);
+        });
 
-        var status = new SetupStatus
+        // Completion writes a fresh status record, and the EAB enforcement
+        // mode is not part of the wizard's configuration, so carry it forward
+        // from the prior file: without this, re-running setup on a stranded
+        // install would silently reset enforcement to off. Under the shared
+        // write lock so the read, modify, save cannot interleave with a
+        // settings page update.
+        SetupStatus status;
+        lock (StatusFileWriteLock)
         {
-            SetupCompleted = true,
-            CompletedAt = DateTime.UtcNow,
-            CaConnectionString = config.CaConnectionString,
-            EnabledTemplates = config.EnabledTemplates.ToList(),
-            ExternalUrl = config.ExternalUrl,
-        };
+            if (!SetupStatus.TryLoad(GetSetupStatusPath(), out var prior))
+            {
+                // Completion cannot be refused for a transient read failure,
+                // but resetting these must never be silent. Both reset to
+                // their safe defaults: enforcement to off, the revocation
+                // scope to ducks-managed.
+                _logger.LogWarning(
+                    "The wizard status file could not be read while completing setup; " +
+                    "the EAB enforcement mode and the revocation scope could not be " +
+                    "carried forward and read as their defaults until an administrator " +
+                    "sets them again");
+            }
+            status = new SetupStatus
+            {
+                SetupCompleted = true,
+                CompletedAt = DateTime.UtcNow,
+                CaConnectionString = config.CaConnectionString,
+                EnabledTemplates = config.EnabledTemplates.ToList(),
+                ExternalUrl = config.ExternalUrl,
+                AllowedDomainsEnabled = config.AllowedDomainsEnabled,
+                AllowedDomains = config.AllowedDomains?.ToList() ?? [],
+                EabEnforcement = prior.EabEnforcement,
+                RevocationScope = prior.RevocationScope,
+                RevocableTemplates = prior.RevocableTemplates.ToList(),
+            };
 
-        status.Save(GetSetupStatusPath());
+            status.Save(GetSetupStatusPath());
+        }
 
         _logger.LogInformation(
-            "Setup completed. CA: {Ca}, Templates: {Templates}, External URL: {Url}; " +
-            "configuration written to {Overlay}",
+            "Setup completed. CA: {Ca}, Templates: {Templates}, External URL: {Url}, " +
+            "Domain restriction: {DomainRestriction}; configuration written to {Overlay}",
             config.CaConnectionString,
             string.Join(", ", config.EnabledTemplates),
             config.ExternalUrl,
+            config.AllowedDomainsEnabled
+                ? $"on ({string.Join(", ", config.AllowedDomains ?? [])})"
+                : "off",
             overlayPath);
 
         return status;
@@ -350,8 +432,7 @@ public sealed class SetupService
     public void UpdateExternalUrl(string externalUrl)
     {
         var overlayPath = SettingsOverlayPath;
-        var overlay = SettingsOverlay.Load(overlayPath) with { ExternalUrl = externalUrl };
-        SettingsOverlay.Save(overlay, overlayPath);
+        SettingsOverlay.Mutate(overlayPath, current => current with { ExternalUrl = externalUrl });
 
         // Keep the wizard state copy in step so GET /api/setup/config prefills
         // the current URL, not the one setup originally saved. Only rewrite a
@@ -359,25 +440,143 @@ public sealed class SetupService
         // file (a transient lock, or a torn write) it returns a fresh record,
         // and saving that would wipe the wizard state, drop the enabled
         // template restriction, and reopen the wizard. A stale prefill is the
-        // far smaller harm.
-        var status = GetStatus();
-        if (status.SetupCompleted)
+        // far smaller harm. Under the shared write lock so this read, modify,
+        // save cannot interleave with an allowed domains update and resurrect
+        // a list the admin just changed.
+        lock (StatusFileWriteLock)
         {
-            status.ExternalUrl = externalUrl;
-            status.Save(GetSetupStatusPath());
-        }
-        else
-        {
-            _logger.LogWarning(
-                "External URL changed, but the wizard status file at {Path} did not read " +
-                "back as completed; leaving it untouched so its state is not overwritten",
-                GetSetupStatusPath());
+            var status = GetStatus();
+            if (status.SetupCompleted)
+            {
+                status.ExternalUrl = externalUrl;
+                status.Save(GetSetupStatusPath());
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "External URL changed, but the wizard status file at {Path} did not read " +
+                    "back as completed; leaving it untouched so its state is not overwritten",
+                    GetSetupStatusPath());
+            }
         }
 
         _logger.LogInformation(
             "External URL changed to {Url}; configuration written to {Overlay}",
             externalUrl,
             overlayPath);
+    }
+
+    /// <summary>
+    /// Serializes every read, modify, save of the wizard status file within
+    /// this process (the external URL and allowed domains writers).
+    /// SetupService is scoped, so an instance lock would not stop two
+    /// concurrent settings requests from interleaving and losing one update.
+    /// SetupStatus.Save's temp file and move already prevents torn files;
+    /// this lock prevents lost updates.
+    /// </summary>
+    private static readonly object StatusFileWriteLock = new();
+
+    /// <summary>
+    /// Change the allowed domain policy after setup. Unlike the external URL
+    /// this lives only in the wizard status file (the overlay is not
+    /// involved) and AllowedDomainsPolicy hot reads it, so no restart
+    /// follows. The same completed status guard as UpdateExternalUrl
+    /// applies, but here a failed read back must fail the request: this file
+    /// is the store itself, not a prefill mirror, and saving over an
+    /// unreadable status would wipe the wizard state and drop the enabled
+    /// template restriction. The caller validates and normalizes the
+    /// entries; this method only persists them.
+    /// </summary>
+    public bool UpdateAllowedDomains(bool enabled, IReadOnlyList<string> normalizedDomains)
+    {
+        lock (StatusFileWriteLock)
+        {
+            var status = GetStatus();
+            if (!status.SetupCompleted)
+            {
+                _logger.LogWarning(
+                    "Allowed domains change refused: the wizard status file at {Path} did not " +
+                    "read back as completed, so writing it would wipe the wizard state",
+                    GetSetupStatusPath());
+                return false;
+            }
+
+            status.AllowedDomainsEnabled = enabled;
+            status.AllowedDomains = normalizedDomains.ToList();
+            status.Save(GetSetupStatusPath());
+
+            _logger.LogInformation(
+                "Allowed domains updated: restriction {State}, {Count} entries ({Domains})",
+                enabled ? "on" : "off",
+                normalizedDomains.Count,
+                string.Join(", ", normalizedDomains));
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Change the external account binding enforcement mode after setup
+    /// (RFC 8555 §7.3.4). Lives only in the wizard status file, which
+    /// EabEnforcementPolicy hot reads, so no restart follows. The same
+    /// completed status guard as UpdateAllowedDomains applies: this file is
+    /// the store itself, and saving over an unreadable status would wipe the
+    /// wizard state.
+    /// </summary>
+    public bool UpdateEabEnforcement(EabEnforcementMode mode)
+    {
+        lock (StatusFileWriteLock)
+        {
+            var status = GetStatus();
+            if (!status.SetupCompleted)
+            {
+                _logger.LogWarning(
+                    "EAB enforcement change refused: the wizard status file at {Path} did not " +
+                    "read back as completed, so writing it would wipe the wizard state",
+                    GetSetupStatusPath());
+                return false;
+            }
+
+            status.EabEnforcement = EabEnforcementPolicy.ModeName(mode);
+            status.Save(GetSetupStatusPath());
+
+            _logger.LogInformation(
+                "EAB enforcement mode updated: {Mode}",
+                EabEnforcementPolicy.ModeName(mode));
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Change the dashboard revocation scope after setup. Lives only in the
+    /// wizard status file, which RevocationScopePolicy hot reads, so no
+    /// restart follows. The same completed status guard as
+    /// UpdateAllowedDomains applies: this file is the store itself, and
+    /// saving over an unreadable status would wipe the wizard state. The
+    /// caller validates the template names; this method only persists them.
+    /// </summary>
+    public bool UpdateRevocationScope(RevocationScopeMode mode, IReadOnlyList<string> customTemplates)
+    {
+        lock (StatusFileWriteLock)
+        {
+            var status = GetStatus();
+            if (!status.SetupCompleted)
+            {
+                _logger.LogWarning(
+                    "Revocation scope change refused: the wizard status file at {Path} did not " +
+                    "read back as completed, so writing it would wipe the wizard state",
+                    GetSetupStatusPath());
+                return false;
+            }
+
+            status.RevocationScope = RevocationScopePolicy.ModeName(mode);
+            status.RevocableTemplates = customTemplates.ToList();
+            status.Save(GetSetupStatusPath());
+
+            _logger.LogInformation(
+                "Revocation scope updated: {Mode}, {Count} custom templates",
+                RevocationScopePolicy.ModeName(mode), customTemplates.Count);
+            return true;
+        }
     }
 
     /// <summary>
@@ -392,15 +591,31 @@ public sealed class SetupService
     /// </summary>
     public void SaveWizardDraft(SetupConfiguration config, string? wizardStep = null)
     {
-        var status = new SetupStatus
+        lock (StatusFileWriteLock)
         {
-            SetupCompleted = false,
-            CaConnectionString = config.CaConnectionString,
-            EnabledTemplates = config.EnabledTemplates.ToList(),
-            ExternalUrl = config.ExternalUrl,
-            WizardStep = wizardStep,
-        };
-        status.Save(GetSetupStatusPath());
+            // The draft rewrites the whole status file, and neither the EAB
+            // enforcement mode nor the revocation scope is wizard state
+            // (they cannot ride through SetupConfiguration the way the
+            // allowed domain choice does), so carry both forward from the
+            // prior file exactly like CompleteSetup. Without this, a draft
+            // saved while recovering a stranded install would silently reset
+            // them to their defaults.
+            var prior = GetStatus();
+            var status = new SetupStatus
+            {
+                SetupCompleted = false,
+                CaConnectionString = config.CaConnectionString,
+                EnabledTemplates = config.EnabledTemplates.ToList(),
+                ExternalUrl = config.ExternalUrl,
+                AllowedDomainsEnabled = config.AllowedDomainsEnabled,
+                AllowedDomains = config.AllowedDomains?.ToList() ?? [],
+                EabEnforcement = prior.EabEnforcement,
+                RevocationScope = prior.RevocationScope,
+                RevocableTemplates = prior.RevocableTemplates.ToList(),
+                WizardStep = wizardStep,
+            };
+            status.Save(GetSetupStatusPath());
+        }
 
         _logger.LogInformation(
             "Wizard draft saved. CA: {Ca}, Templates: {Templates}, External URL: {Url}, Step: {Step}",
@@ -422,13 +637,11 @@ public sealed class SetupService
     public void SetHttpsCertificateThumbprint(string thumbprint, string? templateName = null)
     {
         var overlayPath = SettingsOverlayPath;
-        var current = SettingsOverlay.Load(overlayPath);
-        var overlay = current with
+        SettingsOverlay.Mutate(overlayPath, current => current with
         {
             HttpsCertificateThumbprint = thumbprint,
             HttpsCertificateTemplate = templateName ?? current.HttpsCertificateTemplate,
-        };
-        SettingsOverlay.Save(overlay, overlayPath);
+        });
 
         _logger.LogInformation(
             "HTTPS certificate thumbprint {Thumbprint} written to {Overlay}",
@@ -460,7 +673,9 @@ public sealed record ExternalUrlValidation(
 public sealed record SetupConfiguration(
     string CaConnectionString,
     IReadOnlyList<string> EnabledTemplates,
-    string ExternalUrl);
+    string ExternalUrl,
+    bool AllowedDomainsEnabled = false,
+    IReadOnlyList<string>? AllowedDomains = null);
 
 /// <summary>
 /// A certificate template as presented by the setup wizard, with the server

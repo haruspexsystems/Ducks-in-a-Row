@@ -8,10 +8,12 @@ using Microsoft.Extensions.Options;
 namespace Certus.Core.Tests.Acme;
 
 /// <summary>
-/// Tests for EnabledTemplatesPolicy (issue #85). A missing wizard status file
-/// or an empty enabled list means no restriction (pre wizard compatibility);
-/// a non empty list restricts ACME to the listed templates, matched by
-/// programmatic name or display name, case insensitive.
+/// Tests for EnabledTemplatesPolicy (issues #85 and #101). The policy fails
+/// closed: a missing wizard status file, an empty enabled list, and an
+/// unreadable file all expose nothing. A non empty list restricts ACME to the
+/// listed templates, matched by programmatic name or display name, case
+/// insensitive. Certus:Acme:ExposeAllTemplates is the explicit break-glass
+/// override and wins over a recorded set.
 /// </summary>
 public class EnabledTemplatesPolicyTests : IDisposable
 {
@@ -42,10 +44,12 @@ public class EnabledTemplatesPolicyTests : IDisposable
         }
     }
 
-    private EnabledTemplatesPolicy BuildPolicy()
+    private EnabledTemplatesPolicy BuildPolicy(bool exposeAll = false)
     {
         return new EnabledTemplatesPolicy(
-            Options.Create(_options), NullLogger<EnabledTemplatesPolicy>.Instance);
+            Options.Create(_options),
+            Options.Create(new AcmeOptions { ExposeAllTemplates = exposeAll }),
+            NullLogger<EnabledTemplatesPolicy>.Instance);
     }
 
     private void WriteStatus(params string[] enabledTemplates)
@@ -58,25 +62,49 @@ public class EnabledTemplatesPolicyTests : IDisposable
         status.Save(SetupStatus.GetStatusPath(_options));
     }
 
-    [Fact]
-    public void IsEnabled_NoStatusFile_AllowsEverything()
+    /// <summary>
+    /// Advances the status file's write time so the policy's write time cache
+    /// sees a change without the test depending on file system timestamp
+    /// resolution.
+    /// </summary>
+    private void BumpWriteTime()
     {
-        var sut = BuildPolicy();
-
-        sut.IsEnabled(WebServer).Should().BeTrue();
-        sut.IsEnabled(Machine).Should().BeTrue();
+        var path = SetupStatus.GetStatusPath(_options);
+        File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddSeconds(1));
     }
 
     [Fact]
-    public void IsEnabled_EmptyList_AllowsEverything()
+    public void IsEnabled_NoStatusFile_ExposesNothing()
     {
-        // The wizard requires at least one template, so an empty list only
-        // occurs on pre wizard state and must not restrict.
+        var sut = BuildPolicy();
+
+        sut.IsEnabled(WebServer).Should().BeFalse();
+        sut.IsEnabled(Machine).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsEnabled_EmptyList_ExposesNothing()
+    {
+        // The wizard requires at least one template at completion, so an empty
+        // list is a pre completion draft or a hand edited file. Either way it
+        // must expose nothing (issue #101).
         WriteStatus();
         var sut = BuildPolicy();
 
-        sut.IsEnabled(WebServer).Should().BeTrue();
-        sut.IsEnabled(Machine).Should().BeTrue();
+        sut.IsEnabled(WebServer).Should().BeFalse();
+        sut.IsEnabled(Machine).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsEnabled_UnparseableFile_ExposesNothing()
+    {
+        // A corrupt status file must fail closed, not fall through to the old
+        // allow all (issue #101).
+        File.WriteAllText(SetupStatus.GetStatusPath(_options), "{this is not json");
+        var sut = BuildPolicy();
+
+        sut.IsEnabled(WebServer).Should().BeFalse();
+        sut.IsEnabled(Machine).Should().BeFalse();
     }
 
     [Fact]
@@ -116,11 +144,9 @@ public class EnabledTemplatesPolicyTests : IDisposable
         sut.IsEnabled(WebServer).Should().BeFalse();
 
         // A wizard re run rewrites the file; the policy must pick up the new
-        // set without a restart. Bump the write time explicitly so the test
-        // does not depend on file system timestamp resolution.
+        // set without a restart.
         WriteStatus("WebServerACME");
-        var path = SetupStatus.GetStatusPath(_options);
-        File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddSeconds(1));
+        BumpWriteTime();
 
         sut.IsEnabled(WebServer).Should().BeTrue();
         sut.IsEnabled(Machine).Should().BeFalse();
@@ -130,11 +156,82 @@ public class EnabledTemplatesPolicyTests : IDisposable
     public void IsEnabled_FileAppearsAfterFirstCheck_Restricts()
     {
         var sut = BuildPolicy();
-        sut.IsEnabled(Machine).Should().BeTrue("no file means no restriction");
+        sut.IsEnabled(Machine).Should().BeFalse("no file means nothing is exposed");
 
         WriteStatus("WebServerACME");
 
         sut.IsEnabled(Machine).Should().BeFalse();
         sut.IsEnabled(WebServer).Should().BeTrue();
+    }
+
+    [Fact]
+    public void IsEnabled_UnparseableFileAfterGoodLoad_KeepsLastKnownSetWithoutCaching()
+    {
+        WriteStatus("WebServerACME");
+        var sut = BuildPolicy();
+        sut.IsEnabled(WebServer).Should().BeTrue();
+
+        var path = SetupStatus.GetStatusPath(_options);
+        File.WriteAllText(path, "{this is not json");
+        BumpWriteTime();
+        var unreadableTime = File.GetLastWriteTimeUtc(path);
+
+        sut.IsEnabled(WebServer).Should().BeTrue(
+            "the last known set answers while the file is unreadable");
+        sut.IsEnabled(Machine).Should().BeFalse(
+            "a read failure must never widen exposure");
+
+        // Fix the file but pin its write time to the unreadable file's time.
+        // A policy that had cached the failed read against that time would
+        // skip the reload and keep serving the stale set.
+        WriteStatus("Machine");
+        File.SetLastWriteTimeUtc(path, unreadableTime);
+
+        sut.IsEnabled(Machine).Should().BeTrue(
+            "a failed read must not be cached, so the fixed file is reloaded");
+        sut.IsEnabled(WebServer).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsEnabled_TransientReadFailureAfterGoodLoad_KeepsLastKnownSet()
+    {
+        WriteStatus("WebServerACME");
+        var sut = BuildPolicy();
+        sut.IsEnabled(WebServer).Should().BeTrue();
+
+        BumpWriteTime();
+        var path = SetupStatus.GetStatusPath(_options);
+        using (File.Open(path, FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            sut.IsEnabled(WebServer).Should().BeTrue(
+                "the last known set answers during a transient read failure");
+            sut.IsEnabled(Machine).Should().BeFalse();
+        }
+
+        // After the lock is released the next request reloads and enforcement
+        // continues.
+        sut.IsEnabled(WebServer).Should().BeTrue();
+        sut.IsEnabled(Machine).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsEnabled_ExposeAllTemplatesFlag_NoStatusFile_AllowsEverything()
+    {
+        var sut = BuildPolicy(exposeAll: true);
+
+        sut.IsEnabled(WebServer).Should().BeTrue();
+        sut.IsEnabled(Machine).Should().BeTrue();
+    }
+
+    [Fact]
+    public void IsEnabled_ExposeAllTemplatesFlag_OverridesWizardSet()
+    {
+        // The break-glass override wins over a recorded set: config alone
+        // tells you the posture.
+        WriteStatus("Machine");
+        var sut = BuildPolicy(exposeAll: true);
+
+        sut.IsEnabled(WebServer).Should().BeTrue();
+        sut.IsEnabled(Machine).Should().BeTrue();
     }
 }

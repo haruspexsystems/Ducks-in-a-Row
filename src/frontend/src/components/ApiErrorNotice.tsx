@@ -16,7 +16,7 @@ export function ApiErrorNotice({
 }) {
   if (error instanceof ApiError && error.status === 401) {
     return (
-      <div className="bg-amber-50 border border-amber-200 rounded-lg p-6 text-amber-800">
+      <div className="bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/30 rounded-lg p-6 text-amber-800 dark:text-amber-300">
         <div className="flex items-center gap-2 mb-1">
           <Lock className="h-5 w-5" />
           <h2 className="text-lg font-semibold">Authentication required</h2>
@@ -32,7 +32,7 @@ export function ApiErrorNotice({
 
   if (error instanceof ApiError && error.status === 403) {
     return (
-      <div className="bg-amber-50 border border-amber-200 rounded-lg p-6 text-amber-800">
+      <div className="bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/30 rounded-lg p-6 text-amber-800 dark:text-amber-300">
         <div className="flex items-center gap-2 mb-1">
           <ShieldAlert className="h-5 w-5" />
           <h2 className="text-lg font-semibold">Not authorized</h2>
@@ -46,7 +46,7 @@ export function ApiErrorNotice({
   }
 
   return (
-    <div className="bg-red-50 border border-red-200 rounded-lg p-6 text-red-700">
+    <div className="bg-red-50 dark:bg-red-500/10 border border-red-200 dark:border-red-500/30 rounded-lg p-6 text-red-700 dark:text-red-300">
       <h2 className="text-lg font-semibold mb-1">{title}</h2>
       <p className="text-sm">
         {error instanceof Error ? error.message : String(error)}

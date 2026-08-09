@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <AssemblyName>DeviceAttestProbe</AssemblyName>
+    <RootNamespace>DeviceAttestProbe</RootNamespace>
+    <Description>Diagnostic for the ACME device-attest-01 feature (draft-ietf-acme-device-attest-08). Submits PKCS#10 requests whose SubjectAltName carries an RFC 4043 PermanentIdentifier otherName (id-on-permanentIdentifier, 1.3.6.1.5.5.7.8.3) to a live ADCS CA and reports whether the otherName survives into the issued certificate. Answers, before any server code is written, whether the issued-certificate identity story can rely on CSR passthrough with enrollee-supplies-subject templates.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- A source link, not a ProjectReference: the probe keeps the tools/
+         convention of standing alone with no assembly dependency on the
+         product, and Certus.Core would drag EF Core, BouncyCastle, MailKit and
+         Serilog behind it for a self contained publish that only needs one
+         static class. This is the same csproj source link the device
+         attestation test builders are shared with.
+
+         Linked rather than duplicated inline, unlike the Submit flag constants
+         in Program.cs. Those are five fixed integers from the ADCS headers. This
+         is a security invariant: the guard that keeps a template name from
+         smuggling a second ADCS request attribute (issue #175, CVE-2026-54121).
+         A copy of it would be free to drift out of step with the product's. -->
+    <Compile Include="../../src/Certus.Core/Adcs/AdcsRequestAttributes.cs"
+             Link="AdcsRequestAttributes.cs" />
+  </ItemGroup>
+
+</Project>

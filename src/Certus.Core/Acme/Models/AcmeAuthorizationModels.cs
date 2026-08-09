@@ -27,6 +27,18 @@ public sealed class AuthorizationResponse
 }
 
 /// <summary>
+/// The payload a client POSTs to a device-attest-01 challenge URL:
+/// {"attObj": base64url(CBOR attestation object)}
+/// (draft-ietf-acme-device-attest-08 section 5.1). Deserialization ignores
+/// unknown members, which is exactly what the draft requires of the server.
+/// </summary>
+public sealed class DeviceAttestChallengePayload
+{
+    [JsonPropertyName("attObj")]
+    public string? AttObj { get; set; }
+}
+
+/// <summary>
 /// ACME challenge response object.
 /// RFC 8555 §7.1.5
 /// </summary>

@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0) (8.0.4xx or later)
+- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) (10.0.3xx or later)
 - Windows 10/11 or Windows Server 2019+ (required for COM interop)
 - VS Code with recommended extensions, or Visual Studio 2022
 
@@ -96,10 +96,10 @@ For the Certus server to communicate with a remote CA via DCOM:
 ## Project Architecture
 
 ```
-Certus.Core    (net8.0)         → Domain models, interfaces, EF Core
-Certus.Adcs    (net8.0-windows) → COM interop (ICertRequest2, ICertAdmin2, ICertView2)
-Certus.Web     (net8.0)         → ASP.NET Core host (ACME + Dashboard)
-Certus.Service (net8.0-windows) → Windows Service wrapper + DI composition root
+Certus.Core    (net10.0)         → Domain models, interfaces, EF Core
+Certus.Adcs    (net10.0-windows) → COM interop (CertRequest, CertView, CertAdmin coclasses, dispatched through IDispatch)
+Certus.Web     (net10.0)         → ASP.NET Core host (ACME + Dashboard)
+Certus.Service (net10.0-windows) → Windows Service wrapper + DI composition root
 ```
 
 `Certus.Web` does NOT reference `Certus.Adcs` directly (TFM incompatibility). Instead, it programs against `IAdcsClient` from `Certus.Core`. The `Certus.Service` project wires the concrete `AdcsClient` via dependency injection.

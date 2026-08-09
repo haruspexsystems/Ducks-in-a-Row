@@ -2,10 +2,18 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <!-- Dual target for the issue #169 net10 upgrade gate: the net8 and net10
+         probe builds must come from the same commit so the lab comparison has
+         one instrument and one variable (the runtime). The net8.0-windows
+         target is temporary and comes out in a follow up once the gate has
+         passed and the upgrade has merged. The empty TargetFramework clears
+         the singular default from Directory.Build.props, which would
+         otherwise override the plural and force a plain net10.0 build. -->
+    <TargetFramework></TargetFramework>
+    <TargetFrameworks>net8.0-windows;net10.0-windows</TargetFrameworks>
     <AssemblyName>AdcsQiProbe</AssemblyName>
     <RootNamespace>AdcsQiProbe</RootNamespace>
-    <Description>Diagnostic for Certus issues #14 and #15. Activates the CertRequest and CertView coclasses through the Activator and CoCreateInstance paths, queries the v1, v2, and v3 IIDs to see which interfaces the objects expose, and exercises four managed dispatch models (IUnknown, Dual, IDispatch, dynamic) against a live CA to find which one invokes a v1 method without crashing.</Description>
+    <Description>Diagnostic for Certus issues #14, #15, and #169. Activates the CertRequest, CertView, and CertAdmin coclasses through the Activator and CoCreateInstance paths, queries their IIDs to see which interfaces the objects expose (CertAdmin is QI only, no method calls), and exercises four managed dispatch models (IUnknown, Dual, IDispatch, dynamic) against a live CA to find which one invokes a v1 method without crashing.</Description>
   </PropertyGroup>
 
 </Project>

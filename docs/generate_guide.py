@@ -22,7 +22,7 @@ import os
 
 # Product version, stamped on the cover and footer. Kept in one place so the
 # guide never drifts from the release it documents.
-VERSION = "0.9.0-beta.1"
+VERSION = "0.10.0-beta.1"
 
 # Brand colors aligned with the web UI palette
 # (src/frontend/src/features/dashboard/lib/colors.ts and tailwind.config.js),
@@ -491,16 +491,16 @@ def build_document():
     story.append(Paragraph("Step 1: Install Prerequisites", styles["StepNumber"]))
     story.append(Paragraph(
         f"If you install with {bold('Ducks-in-a-Row-Setup.exe')} (recommended), the "
-        f"ASP.NET Core 8.0 runtime is installed for you, offline, from the installer "
+        f"ASP.NET Core 10.0 runtime is installed for you, offline, from the installer "
         f"itself. If you install the bare MSI instead, first download and install the "
-        f"{bold('ASP.NET Core 8.0 Hosting Bundle')} from the official .NET download "
+        f"{bold('ASP.NET Core 10.0 Hosting Bundle')} from the official .NET download "
         f"page. Either way, install the ADCS management tools and reboot the server "
         f"if prompted.",
         styles["BodyText2"]
     ))
     story.append(code_block(
-        "# Bare MSI only: download and install the .NET 8 Hosting Bundle from:\n"
-        "# https://dotnet.microsoft.com/download/dotnet/8.0\n\n"
+        "# Bare MSI only: download and install the .NET 10 Hosting Bundle from:\n"
+        "# https://dotnet.microsoft.com/download/dotnet/10.0\n\n"
         "# Then install ADCS Remote Administration Tools (elevated PowerShell):\n"
         "Install-WindowsFeature RSAT-ADCS-Mgmt", styles))
     story.append(Paragraph(
@@ -573,8 +573,15 @@ def build_document():
     req_table = make_table(
         ["Requirement", "Details"],
         [
-            ["Operating System", "Windows Server 2016 or later (2019, 2022, 2025)"],
-            ["Runtime", "ASP.NET Core 8.0 (installed automatically by Ducks-in-a-Row-Setup.exe; "
+            ["Operating System", "Windows Server. Verified on Server 2019 and Server 2025. "
+                                 "On Server 2022, install current Windows updates first: the .NET 10 "
+                                 "runtime requires Control-flow Enforcement Technology there, and an "
+                                 "installation not serviced since early 2022 does not provide it "
+                                 "(build 20348.587 is confirmed too old; check with winver). The service then "
+                                 "crashes before it can log, and the installer reports the misleading "
+                                 "Error 1920. Server 2019 predates the requirement; Server 2025 ships "
+                                 "with it"],
+            ["Runtime", "ASP.NET Core 10.0 (installed automatically by Ducks-in-a-Row-Setup.exe; "
                         "install the Hosting Bundle manually only for the bare MSI)"],
             ["Windows Feature", "RSAT-ADCS-Mgmt (ADCS Remote Administration Tools)"],
             ["Processor", "2 x64 cores minimum. The work is mostly I/O bound (COM and RPC "
@@ -603,7 +610,7 @@ def build_document():
         "Install-WindowsFeature RSAT-ADCS-Mgmt\n\n"
         "# Verify the feature is installed\n"
         "Get-WindowsFeature RSAT-ADCS-Mgmt\n\n"
-        "# Verify the .NET 8 runtime is installed (after the setup bundle or\n"
+        "# Verify the .NET 10 runtime is installed (after the setup bundle or\n"
         "# a manual Hosting Bundle install)\n"
         "dotnet --list-runtimes", styles))
     story.append(Paragraph(
@@ -743,12 +750,44 @@ def build_document():
              "null", "Public URL that ACME clients use to reach the server; the setup wizard sets it"],
             [Paragraph(code("SyncIntervalMinutes"), styles["TableCell"]),
              "5", "How often to sync certificates from the ADCS CA database"],
+            [Paragraph(code("RequestHistoryDays"), styles["TableCell"]),
+             "30", "How far back to sync pending, denied, and failed requests so their "
+                   "detail pages can show the CA's own explanation. Issued and revoked "
+                   "certificates are always synced in full. Set to 0 to skip those passes"],
             [Paragraph(code("EnableWalMode"), styles["TableCell"]),
              "true", "Enable SQLite WAL mode for better concurrent performance"],
         ],
         col_widths=[1.8 * inch, 0.8 * inch, 3.9 * inch]
     )
     story.append(core_table)
+    story.append(Spacer(1, 8))
+
+    story.append(Paragraph("Allowed Domains", styles["SubSection"]))
+    story.append(Paragraph(
+        "The allowed domain list restricts which DNS names ACME clients can order "
+        "certificates for. Each entry covers the domain itself and all of its subdomains: "
+        f'an entry of {code("home.local")} also allows {code("web.home.local")}, so wildcard '
+        "entries are not needed and are not accepted. Orders for names outside the list are "
+        f'refused with a {code("rejectedIdentifier")} error naming each refused domain, and '
+        "every refusal is recorded on the dashboard activity feed.",
+        styles["BodyText2"]
+    ))
+    story.append(Paragraph(
+        "The setup wizard turns the restriction on for new installs on a domain joined "
+        "server, prefilled with the AD domain. Manage it later on the Settings page under "
+        f'Allowed Domains. The list is stored in {code("ducks-setup.json")} in the data '
+        f'folder, not in {code("appsettings.json")}, and unlike the settings above it applies '
+        "immediately: no service restart is needed.",
+        styles["BodyText2"]
+    ))
+    story.append(Paragraph(
+        f'{bold("Scope:")} this is an ACME layer policy inside Ducks in a Row. The CA itself '
+        "can still issue certificates for any name through its own tools (the Certification "
+        "Authority console, certreq, or autoenrollment). To constrain the CA itself, use CA "
+        "side controls such as name constraints or template ACLs; the allowed domain list "
+        "complements them, it does not replace them.",
+        styles["Note"]
+    ))
     story.append(Spacer(1, 8))
 
     story.append(Paragraph("Authentication Settings", styles["SubSection"]))
@@ -1144,6 +1183,17 @@ def build_document():
         "needs outbound reachability to the domain or DNS being validated.",
         styles["BodyText2"]
     ))
+    story.append(Paragraph(
+        "Outbound validation is screened. The server always refuses to validate targets on "
+        "loopback, link local (including the cloud metadata address), and IPv6 unique local "
+        "addresses. The RFC 1918 private ranges are allowed by default, because an internal "
+        f"CA usually issues for exactly those addresses. Set "
+        f"{code('Certus:Acme:ChallengeValidation:BlockPrivateRanges')} to {code('true')} when "
+        f"every validation target is public, or list extra ranges in "
+        f"{code('AdditionalBlockedCidrs')}. The hardening guide in the docs folder covers "
+        "the tradeoff.",
+        styles["BodyText2"]
+    ))
 
     story.append(PageBreak())
 
@@ -1165,6 +1215,18 @@ def build_document():
     ))
 
     story.append(Paragraph("SMTP Email Alerts", styles["SubSection"]))
+    story.append(Paragraph(
+        "The whole SMTP transport can be set from the Alerts card on the Settings page: "
+        "relay host, port, transport security, username and password, sender address and "
+        "sender name, and the recipients. That is the recommended route, it needs no file "
+        "editing, and the password is stored encrypted in the data directory rather than "
+        "in a configuration file. The block below is what a fresh install starts from and "
+        "remains available for scripted or unattended configuration; the file remains the "
+        f'only way to configure the webhook. {code("TlsMode")} accepts {code("none")}, '
+        f'{code("starttls")} or {code("implicit")}; without it, {code("UseSsl")} plus the '
+        "port decide (465 means implicit TLS, anything else negotiates mandatory STARTTLS).",
+        styles["BodyText2"]
+    ))
     story.append(code_block(
         '"Certus:Alerts": {\n'
         '  "Enabled": true,\n'
@@ -1173,13 +1235,34 @@ def build_document():
         '  "Smtp": {\n'
         '    "Host": "smtp.yourdomain.local",\n'
         '    "Port": 587,\n'
-        '    "UseSsl": true,\n'
+        '    "TlsMode": "starttls",\n'
         '    "Username": "ducks@yourdomain.local",\n'
         '    "Password": "your-smtp-password",\n'
         '    "FromAddress": "ducks@yourdomain.local",\n'
+        '    "FromName": "Ducks in a Row",\n'
         '    "Recipients": ["admin@yourdomain.local"]\n'
         '  }\n'
         '}', styles))
+    story.append(Paragraph(
+        f'<b>Once a setting has been saved from the dashboard, the file no longer decides it.</b> '
+        f'Saving on the Alerts card writes the whole writable set, {code("Enabled")}, '
+        f'{code("CheckIntervalMinutes")}, {code("ThresholdDays")}, and every SMTP transport '
+        "field, into a settings file in the data directory, which outranks appsettings.json. "
+        "Editing those keys in the file after that has no effect, and the Alerts card lists "
+        "which ones it now owns so the situation is visible rather than puzzling. A password "
+        "saved from the dashboard is protected with the machine's Data Protection keyring: "
+        "it never appears in any file in readable form, it is never returned by the API, and "
+        "after restoring the data directory onto a different machine it cannot be decrypted "
+        "by design, so save it again from the Settings page there. The webhook block is "
+        "never written by the dashboard and is always read from the file.",
+        styles["BodyText2"]
+    ))
+    story.append(Paragraph(
+        "An environment variable or command line argument still outranks both. Where one is "
+        "in use, the Alerts card disables that field and says why, rather than accepting an "
+        "edit that could never come into force.",
+        styles["BodyText2"]
+    ))
 
     story.append(Paragraph("Webhook Alerts", styles["SubSection"]))
     story.append(Paragraph(
@@ -1199,8 +1282,59 @@ def build_document():
     story.append(Paragraph("Alert History", styles["SubSection"]))
     story.append(Paragraph(
         f'Sent alerts are recorded and available through the API at '
-        f'{code("GET /api/alerts/history")} and {code("GET /api/alerts/summary")}. '
-        f'This beta does not yet include a dedicated Alerts page in the dashboard.',
+        f'{code("GET /api/alerts/history")} and {code("GET /api/alerts/summary")}, '
+        f'and in the dashboard on the Settings page.',
+        styles["BodyText2"]
+    ))
+
+    story.append(Paragraph("Alerts in the Dashboard", styles["SubSection"]))
+    story.append(Paragraph(
+        "The Alerts card on the Settings page shows whether expiry monitoring is on, how "
+        "often it checks, the warning thresholds in force, who is on the email recipient "
+        "list, whether a webhook is configured, and the most recent alerts including any "
+        "that failed.",
+        styles["BodyText2"]
+    ))
+    story.append(Paragraph(
+        "Expiry monitoring, the check interval, the warning thresholds, the SMTP relay host, "
+        "the sender address and the recipient list can all be changed here and saved. "
+        "<b>A saved change is not in force until the service restarts.</b> Alerting reads its "
+        "settings once when the service starts, so the card keeps showing what the service is "
+        "actually running on and offers a <b>Restart now</b> button beside the notice. Until "
+        "that restart, the figures on the card and the expiry counts elsewhere in the "
+        "dashboard reflect the old settings, which is deliberate: appearing to have changed "
+        "monitoring when it has not is worse than asking for a restart.",
+        styles["BodyText2"]
+    ))
+    story.append(Paragraph(
+        "The card never shows the SMTP username or password, the webhook secret, or the "
+        "webhook address, and none of them can be set from it. Sending one is refused rather "
+        "than ignored. The webhook address is withheld because it commonly carries an access "
+        "token in the URL, which is how most webhook services authenticate. The relay host and "
+        "sender address are shown, because neither is a credential and a field that can be "
+        "edited but not seen cannot be edited safely.",
+        styles["BodyText2"]
+    ))
+    story.append(Paragraph(
+        "The card also has a <b>Send a test</b> button, which delivers over every configured "
+        "channel and reports what each one did. Use it after changing SMTP settings: mail "
+        "configuration fails quietly, and this is the fastest way to find out that it has. "
+        "The test is clearly marked as a test in both channels, so a recipient cannot mistake "
+        "it for a real expiry warning: the email subject leads with "
+        f'{code("[Ducks in a Row TEST]")}, and the webhook payload carries the event '
+        f'{code("test.alert")} with {code("test: true")} and no certificate list. It is signed '
+        "with the same HMAC secret as a real alert, so it proves the real delivery path.",
+        styles["BodyText2"]
+    ))
+    story.append(Paragraph(
+        "A test writes nothing to the alert history, so it cannot be mistaken later for a real "
+        "warning and cannot suppress one. There is a cooldown of about a minute between tests, "
+        "shared by everyone signed in.",
+        styles["BodyText2"]
+    ))
+    story.append(Paragraph(
+        "A delivered test proves delivery only. It does not mean expiry monitoring is switched "
+        f'on: that is the separate {code("Enabled")} setting, and the card says so when it is off.',
         styles["BodyText2"]
     ))
 
@@ -1213,7 +1347,7 @@ def build_document():
         (
             "Service fails to start",
             f'Check the Windows Event Log (Application) and the log files at '
-            f'{code("logs\\")} in the data folder. Common causes: missing .NET 8 runtime, '
+            f'{code("logs\\")} in the data folder. Common causes: missing .NET 10 runtime, '
             f'invalid {code("appsettings.json")} or {code("settings.json")} syntax (trailing '
             f'commas, missing quotes), or ports 5000 or 5001 already in use by another process. '
             f'To see the actual error, run the executable directly from an elevated PowerShell: '
@@ -1299,6 +1433,15 @@ def build_document():
             f'inventory sync cannot read the CA database and the log reports "CA view access '
             f'denied". The sync also runs only every {code("SyncIntervalMinutes")} (default '
             f'5), so wait for the first cycle or restart the service to force one.'
+        ),
+        (
+            "ACME order rejected: domain is not in the allowed domain list",
+            f'The allowed domain restriction is on and the requested name falls outside every '
+            f'allowed domain. The client sees a {code("rejectedIdentifier")} error naming the '
+            f'refused domains. On the Settings page under Allowed Domains, add the domain '
+            f'(subdomains of an entry are covered automatically) or turn the restriction off. '
+            f'Changes apply immediately with no restart, and each rejected order also appears '
+            f'on the dashboard activity feed as Rejected.'
         ),
     ]
 

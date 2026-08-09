@@ -20,6 +20,9 @@ export function ValidationMethods({ data }: { data: ValidationMethod[] }) {
       <div className="flex flex-col gap-4">
         {data.map((m, i) => {
           const pct = total === 0 ? 0 : Math.round((m.count / total) * 100);
+          // The 500 step is legible on white but drops under WCAG AA on the dark
+          // card, so the label and bar take the lightened step there.
+          const color = dark ? m.colorDark : m.color;
           return (
             <div key={m.id}>
               <div className="mb-[7px] flex items-baseline justify-between gap-2">
@@ -28,19 +31,19 @@ export function ValidationMethods({ data }: { data: ValidationMethod[] }) {
                   {i === 0 && (
                     <span
                       className="whitespace-nowrap rounded-full px-[7px] py-0.5 text-[10px] font-bold tracking-[0.2px]"
-                      style={{ color: m.color, background: alpha(m.color, dark ? 0.2 : 0.12) }}
+                      style={{ color, background: alpha(color, dark ? 0.2 : 0.12) }}
                     >
                       MOST USED
                     </span>
                   )}
                 </span>
                 <span className="flex shrink-0 items-baseline gap-[7px]">
-                  <span className={cn(mono, 'text-[13.5px] font-bold')} style={{ color: m.color }}>{pct}%</span>
+                  <span className={cn(mono, 'text-[13.5px] font-bold')} style={{ color }}>{pct}%</span>
                   <span className={cn(mono, 'text-[11.5px]', textFaint)}>{m.count.toLocaleString()}</span>
                 </span>
               </div>
               <div className="h-[9px] overflow-hidden rounded-full bg-[#EEF1F5] dark:bg-slate-400/[0.12]">
-                <div className="h-full rounded-full" style={{ width: `${(m.count / max) * 100}%`, background: m.color }} />
+                <div className="h-full rounded-full" style={{ width: `${(m.count / max) * 100}%`, background: color }} />
               </div>
             </div>
           );

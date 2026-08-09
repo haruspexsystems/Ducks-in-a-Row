@@ -3,7 +3,7 @@
 <!--
   Ducks in a Row: Burn bootstrapper bundle (issue #87)
 
-  Chains the ASP.NET Core 8 Hosting Bundle (x64) ahead of the Ducks in a Row
+  Chains the ASP.NET Core 10 Hosting Bundle (x64) ahead of the Ducks in a Row
   MSI so a clean server, online or offline, needs exactly one file. The
   Hosting Bundle payload is embedded (Compressed) and Permanent: this product
   never uninstalls the shared runtime, and Windows Update keeps servicing it.
@@ -17,10 +17,10 @@
   Build (normally via build.ps1, which supplies every define and downloads
   the pinned Hosting Bundle exe into installer/redist first):
     wix build installer/Bundle.wxs
-      -d ProductVersion=0.1.0.0
-      -d HostingBundleVersion=8.0.28
-      -d HostingBundleMajor=8
-      -d HostingBundleExe=installer/redist/dotnet-hosting-8.0.28-win.exe
+      -d ProductVersion=0.10.0.0
+      -d HostingBundleVersion=10.0.10
+      -d HostingBundleMajor=10
+      -d HostingBundleExe=installer/redist/dotnet-hosting-10.0.10-win.exe
       -d MsiPath=artifacts/Ducks-in-a-Row.msi
       -o artifacts/Ducks-in-a-Row-Setup.exe
       -ext WixToolset.Bal.wixext -ext WixToolset.Netfx.wixext -arch x64
@@ -32,7 +32,7 @@
 
   <!-- Fallback for direct wix invocations; build.ps1 always defines it. -->
   <?ifndef ProductVersion ?>
-  <?define ProductVersion = "0.1.0.0" ?>
+  <?define ProductVersion = "0.10.0.0" ?>
   <?endif ?>
 
   <!--
@@ -87,7 +87,7 @@
         The shared runtime. Permanent: uninstalling Ducks in a Row must never
         rip the runtime out from under other applications, and Windows Update
         services it from here on (so no UninstallArguments either).
-        DetectCondition skips the install when any 8.0.x runtime at or above
+        DetectCondition skips the install when any 10.0.x runtime at or above
         the floor is already present; an undefined search variable makes the
         condition false, so a clean box installs. Exit codes: 3010 means
         success but a reboot is wanted (offer it at the end of the chain);

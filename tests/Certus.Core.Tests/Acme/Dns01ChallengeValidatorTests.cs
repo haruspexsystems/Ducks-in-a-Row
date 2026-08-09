@@ -21,6 +21,9 @@ public class Dns01ChallengeValidatorTests
     // Precompute the expected TXT record value
     private static readonly string ExpectedTxtValue = ComputeExpectedDns01Value(TestToken, TestThumbprint);
 
+    private static ChallengeValidationContext Context(string domain = TestDomain) =>
+        new("dns", domain, TestToken, TestThumbprint, "test-template");
+
     public Dns01ChallengeValidatorTests()
     {
         _sut = new Dns01ChallengeValidator(_mockDns, NullLogger<Dns01ChallengeValidator>.Instance);
@@ -31,7 +34,7 @@ public class Dns01ChallengeValidatorTests
     {
         SetupDnsResponse($"_acme-challenge.{TestDomain}", ExpectedTxtValue);
 
-        var result = await _sut.ValidateAsync(TestDomain, TestToken, TestThumbprint);
+        var result = await _sut.ValidateAsync(Context());
 
         result.IsValid.Should().BeTrue();
     }
@@ -41,7 +44,7 @@ public class Dns01ChallengeValidatorTests
     {
         SetupDnsResponse($"_acme-challenge.{TestDomain}", "wrong-value");
 
-        var result = await _sut.ValidateAsync(TestDomain, TestToken, TestThumbprint);
+        var result = await _sut.ValidateAsync(Context());
 
         result.IsValid.Should().BeFalse();
         result.Transient.Should().BeFalse(); // a wrong answer is genuine, not retryable
@@ -53,7 +56,7 @@ public class Dns01ChallengeValidatorTests
     {
         SetupEmptyDnsResponse($"_acme-challenge.{TestDomain}");
 
-        var result = await _sut.ValidateAsync(TestDomain, TestToken, TestThumbprint);
+        var result = await _sut.ValidateAsync(Context());
 
         result.IsValid.Should().BeFalse();
         result.Transient.Should().BeFalse(); // record genuinely absent, not a transport error
@@ -65,7 +68,7 @@ public class Dns01ChallengeValidatorTests
     {
         SetupDnsError($"_acme-challenge.{TestDomain}", "NXDOMAIN");
 
-        var result = await _sut.ValidateAsync(TestDomain, TestToken, TestThumbprint);
+        var result = await _sut.ValidateAsync(Context());
 
         result.IsValid.Should().BeFalse();
         result.Transient.Should().BeTrue(); // a resolver error is transport level — retry it
@@ -78,7 +81,7 @@ public class Dns01ChallengeValidatorTests
         // For *.example.com, the TXT record should be at _acme-challenge.example.com
         SetupDnsResponse($"_acme-challenge.{TestDomain}", ExpectedTxtValue);
 
-        var result = await _sut.ValidateAsync($"*.{TestDomain}", TestToken, TestThumbprint);
+        var result = await _sut.ValidateAsync(Context($"*.{TestDomain}"));
 
         result.IsValid.Should().BeTrue();
         // Verify it queried _acme-challenge.example.com, not _acme-challenge.*.example.com
@@ -96,7 +99,7 @@ public class Dns01ChallengeValidatorTests
         SetupDnsResponse($"_acme-challenge.{TestDomain}",
             "wrong-value-1", ExpectedTxtValue, "wrong-value-2");
 
-        var result = await _sut.ValidateAsync(TestDomain, TestToken, TestThumbprint);
+        var result = await _sut.ValidateAsync(Context());
 
         result.IsValid.Should().BeTrue();
     }

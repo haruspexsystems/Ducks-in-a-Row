@@ -1,5 +1,6 @@
 using Certus.Core.Data;
 using Certus.Core.Data.Entities;
+using Certus.Core.Setup;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -12,19 +13,34 @@ namespace Certus.Core.Alerts;
 /// Background service that periodically scans for expiring certificates
 /// and sends alert notifications via configured channels (email, webhook).
 /// Uses the AlertsSent table to prevent duplicate notifications.
+///
+/// The server's own HTTPS certificate is excluded (issue #105). It is issued
+/// by the monitored CA like every other certificate, so it would otherwise
+/// fire the whole threshold ladder for a certificate the product renews for
+/// itself. <see cref="HttpsCertificateAutoRenewalService"/> owns it, and
+/// speaks up on these same channels only when its renewal actually fails.
 /// </summary>
 public sealed class ExpiryMonitorService : BackgroundService
 {
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly ServerCertificateIdentity _serverCertificate;
     private readonly ILogger<ExpiryMonitorService> _logger;
     private readonly AlertOptions _options;
 
+    /// <param name="serverCertificate">
+    /// Required rather than optional on purpose. An optional parameter would
+    /// fall back to null the day a host stops registering it, and suppression
+    /// would quietly stop working while every test still passed. Missing, this
+    /// fails at startup instead.
+    /// </param>
     public ExpiryMonitorService(
         IServiceScopeFactory scopeFactory,
         IOptions<AlertOptions> options,
-        ILogger<ExpiryMonitorService> logger)
+        ILogger<ExpiryMonitorService> logger,
+        ServerCertificateIdentity serverCertificate)
     {
         _scopeFactory = scopeFactory;
+        _serverCertificate = serverCertificate;
         _logger = logger;
         _options = options.Value;
     }
@@ -128,6 +144,21 @@ public sealed class ExpiryMonitorService : BackgroundService
                     && !db.AlertsSent.Any(a => a.CertificateId == c.Id && a.ThresholdDays == thresholdDays))
                 .OrderBy(c => c.NotAfter)
                 .ToListAsync(cancellationToken);
+
+            // Drop the server's own certificate. Filtered here rather than in
+            // the query because matching a CA database serial against an X509
+            // one needs SerialNumbers.Normalize, which SQLite cannot run. No
+            // AlertsSent row is written for a suppressed certificate, so if it
+            // ever stops being ours the normal ladder still fires.
+            var suppressed = expiringCerts
+                .RemoveAll(c => _serverCertificate.IsOwnCertificate(c.SerialNumber));
+            if (suppressed > 0)
+            {
+                _logger.LogDebug(
+                    "Suppressed the {Threshold} day expiry alert for {Count} server " +
+                    "certificate(s); automatic renewal owns them",
+                    thresholdDays, suppressed);
+            }
 
             if (expiringCerts.Count == 0)
                 continue;

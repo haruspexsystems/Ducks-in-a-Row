@@ -1,9 +1,12 @@
 using Certus.Core.Alerts;
+using Certus.Core.Configuration;
 using Certus.Core.Data;
 using Certus.Core.Data.Entities;
+using Certus.Core.Setup;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 
 namespace Certus.Core.Tests.Alerts;
 
@@ -24,9 +27,43 @@ public class AlertQueryServiceTests : IDisposable
         _db = new CertusDbContext(options);
         _db.Database.EnsureCreated();
 
-        _sut = new AlertQueryService(_db, NullLogger<AlertQueryService>.Instance);
+        var alertOptions = new AlertOptions();
+        alertOptions.NormalizeThresholdDays();
+
+        _sut = new AlertQueryService(
+            _db,
+            NullLogger<AlertQueryService>.Instance,
+            Options.Create(alertOptions),
+            // One enabled channel, so the ladder reports the certificate as
+            // monitored rather than as an install with nothing configured.
+            [EnabledNotifier("email")],
+            NoServerCertificate());
 
         SeedData();
+    }
+
+    /// <summary>
+    /// An identity that owns nothing, so no certificate here is mistaken for the
+    /// one Ducks serves its own web interface with. Same shape as the helper in
+    /// <see cref="ExpiryMonitorServiceTests"/>.
+    /// </summary>
+    private static ServerCertificateIdentity NoServerCertificate() =>
+        new(Substitute.For<IHttpsCertificateStore>(),
+            Options.Create(new CertusOptions
+            {
+                // A path that does not exist, so a unit test never reads the
+                // operator's real ProgramData overlay.
+                SettingsOverlayPath = Path.Combine(
+                    Path.GetTempPath(), "certus-no-such-overlay-" + Guid.NewGuid().ToString("N") + ".json"),
+            }),
+            NullLogger<ServerCertificateIdentity>.Instance);
+
+    private static IAlertNotifier EnabledNotifier(string channel)
+    {
+        var notifier = Substitute.For<IAlertNotifier>();
+        notifier.Channel.Returns(channel);
+        notifier.IsEnabled.Returns(true);
+        return notifier;
     }
 
     private void SeedData()
@@ -149,6 +186,136 @@ public class AlertQueryServiceTests : IDisposable
         var failed = result.Items.FirstOrDefault(a => !a.Success);
         failed.Should().NotBeNull();
         failed!.ErrorMessage.Should().Be("SMTP timeout");
+    }
+
+    // ---- Per certificate ladder (issue #160) ----------------------------
+    //
+    // The ladder's own decisions are covered in CertificateAlertLadderTests,
+    // which needs no database. What is tested here is the wiring: that the right
+    // rows reach it, and only the right rows.
+
+    [Fact]
+    public async Task GetForCertificate_UnknownCertificate_ReturnsNull()
+    {
+        // Null rather than an empty ladder, because an empty ladder is the
+        // answer for a real certificate nobody has been warned about.
+        var history = await _sut.GetForCertificateAsync(9999);
+
+        history.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task GetForCertificate_ReturnsOnlyThatCertificatesRows()
+    {
+        var cert2 = await _db.SyncedCertificates.FirstAsync(c => c.SerialNumber == "ALERT002");
+
+        var history = await _sut.GetForCertificateAsync(cert2.Id);
+
+        history.Should().NotBeNull();
+        history!.CertificateId.Should().Be(cert2.Id);
+
+        // cert2 has rows at 30 and 14; cert1's own 30 day row must not leak in.
+        var sent = history.Thresholds
+            .Where(t => t.SentAt != null)
+            .Select(t => t.ThresholdDays)
+            .ToList();
+        sent.Should().BeEquivalentTo(new[] { 30, 14 });
+    }
+
+    [Fact]
+    public async Task GetForCertificate_CarriesTheRecordedFailureAndItsError()
+    {
+        var cert2 = await _db.SyncedCertificates.FirstAsync(c => c.SerialNumber == "ALERT002");
+
+        var history = await _sut.GetForCertificateAsync(cert2.Id);
+
+        var failed = history!.Thresholds.Single(t => t.ThresholdDays == 14);
+        failed.State.Should().Be(AlertThresholdState.Failed);
+        failed.ErrorMessage.Should().Be("SMTP timeout");
+        failed.Channels.Should().Be("email");
+    }
+
+    [Fact]
+    public async Task GetForCertificate_ReportsTheChannelsThatWouldBeAttempted()
+    {
+        var cert1 = await _db.SyncedCertificates.FirstAsync(c => c.SerialNumber == "ALERT001");
+
+        var history = await _sut.GetForCertificateAsync(cert1.Id);
+
+        history!.Coverage.Should().Be(AlertCoverage.Monitored);
+        history.EnabledChannels.Should().Equal("email");
+    }
+
+    [Fact]
+    public void GetConfig_DelegatesToTheView()
+    {
+        // Wiring only. The projection rules are AlertConfigView's and are tested
+        // without a database in AlertConfigViewTests.
+        var config = _sut.GetConfig();
+
+        config.Enabled.Should().BeTrue();
+        config.ThresholdDays.Should().Equal(30, 14, 7, 1);
+        config.ExpiryWarningDays.Should().Be(30);
+    }
+
+    [Fact]
+    public async Task GetHistory_RedactsSecretsFromRecordedErrorMessages()
+    {
+        // The webhook notifier builds its errors from the receiver's response
+        // body or from a raw exception message, either of which can name the URL
+        // and the token in it. The row is written before anyone sanitizes it, so
+        // the read path has to.
+        var cert = await _db.SyncedCertificates.FirstAsync(c => c.SerialNumber == "ALERT001");
+        _db.AlertsSent.Add(new AlertSent
+        {
+            CertificateId = cert.Id,
+            ThresholdDays = 7,
+            SentAt = DateTime.UtcNow,
+            Channels = "webhook",
+            Success = false,
+            ErrorMessage = "No such host is known (https://hooks.example.com/xoxb-secret)",
+        });
+        await _db.SaveChangesAsync();
+
+        var result = await WithWebhook("https://hooks.example.com/xoxb-secret").GetHistoryAsync();
+
+        var item = result.Items.Single(i => i.ThresholdDays == 7);
+        item.ErrorMessage.Should().NotContain("hooks.example.com");
+        item.ErrorMessage.Should().NotContain("xoxb-secret");
+        item.ErrorMessage.Should().Contain("(redacted)");
+    }
+
+    [Fact]
+    public async Task GetForCertificate_RedactsSecretsFromRecordedErrorMessages()
+    {
+        // Same hole on the certificate detail page, which has rendered these
+        // strings verbatim since issue #160.
+        var cert = await _db.SyncedCertificates.FirstAsync(c => c.SerialNumber == "ALERT002");
+
+        var history = await WithWebhook("https://hooks.example.com/xoxb-secret")
+            .GetForCertificateAsync(cert.Id);
+
+        var failed = history!.Thresholds.Single(t => t.ThresholdDays == 14);
+        // The seeded message holds no secret, so it survives intact; what matters
+        // is that the redactor ran over this path at all.
+        failed.ErrorMessage.Should().Be("SMTP timeout");
+    }
+
+    /// <summary>
+    /// A second service over the same database with a webhook URL configured, so
+    /// the redactor has something to strip.
+    /// </summary>
+    private AlertQueryService WithWebhook(string url)
+    {
+        var options = new AlertOptions { Webhook = new WebhookOptions { Url = url } };
+        options.NormalizeThresholdDays();
+
+        return new AlertQueryService(
+            _db,
+            NullLogger<AlertQueryService>.Instance,
+            Options.Create(options),
+            [EnabledNotifier("email")],
+            NoServerCertificate());
     }
 
     public void Dispose()

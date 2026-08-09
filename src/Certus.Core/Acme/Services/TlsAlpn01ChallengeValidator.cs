@@ -50,11 +50,13 @@ public sealed class TlsAlpn01ChallengeValidator : IChallengeValidator
     public string ChallengeType => "tls-alpn-01";
 
     public async Task<ChallengeValidationResult> ValidateAsync(
-        string domain,
-        string token,
-        string accountThumbprint,
+        ChallengeValidationContext context,
         CancellationToken cancellationToken = default)
     {
+        var domain = context.IdentifierValue;
+        var token = context.Token;
+        var accountThumbprint = context.AccountThumbprint;
+
         // Expected: SHA-256(token.thumbprint), raw bytes (32 bytes)
         var keyAuth = $"{token}.{accountThumbprint}";
         var expectedDigest = SHA256.HashData(Encoding.UTF8.GetBytes(keyAuth));

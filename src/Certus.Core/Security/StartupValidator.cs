@@ -1,7 +1,10 @@
 using System.Net;
 using System.Runtime.Versioning;
 using System.Security.Principal;
+using Certus.Core.Acme.Services;
+using Certus.Core.Adcs;
 using Certus.Core.Configuration;
+using Certus.Core.Services;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -18,6 +21,8 @@ public sealed class StartupValidator
     private readonly CertusOptions _options;
     private readonly AuthOptions _authOptions;
     private readonly AcmeRateLimitOptions _rateLimitOptions;
+    private readonly AcmeOptions _acmeOptions;
+    private readonly RevocationScopePolicy _revocationScope;
     private readonly IConfiguration _configuration;
     private readonly ILogger<StartupValidator> _logger;
 
@@ -25,12 +30,16 @@ public sealed class StartupValidator
         IOptions<CertusOptions> options,
         IOptions<AuthOptions> authOptions,
         IOptions<AcmeRateLimitOptions> rateLimitOptions,
+        IOptions<AcmeOptions> acmeOptions,
+        RevocationScopePolicy revocationScope,
         IConfiguration configuration,
         ILogger<StartupValidator> logger)
     {
         _options = options.Value;
         _authOptions = authOptions.Value;
         _rateLimitOptions = rateLimitOptions.Value;
+        _acmeOptions = acmeOptions.Value;
+        _revocationScope = revocationScope;
         _configuration = configuration;
         _logger = logger;
     }
@@ -134,6 +143,58 @@ public sealed class StartupValidator
                 "CaConnectionString is not configured — the service is unconfigured; complete " +
                 "the setup wizard to connect a Certificate Authority");
             warnings++;
+        }
+
+        // The setup wizard refuses a connection string that could forge log
+        // lines, but a value recorded before that guard shipped, or hand edited
+        // into settings.json or appsettings.json, is still in effect and is
+        // written verbatim on every CA call (issue #220). Warn rather than
+        // throw: the two refusals above exist because a bypass must never front
+        // a real CA, while this is an audit integrity problem and turning it
+        // into a failed boot would be the larger harm. The warning reports the
+        // position and code point only, so it cannot forge the line it reports.
+        if (!AdcsCaConnectionString.TryValidate(_options.CaConnectionString, out var caError))
+        {
+            _logger.LogWarning(
+                "The configured CA connection string cannot be recorded safely and is written " +
+                "to this log on every CA call. {Reason} Correct it in the data directory's " +
+                "settings.json.",
+                caError);
+            warnings++;
+        }
+
+        // Check the ACME template exposure override (issue #101). The template
+        // policy fails closed without it, so the open posture must be visible
+        // on every boot, not only on the first ACME request.
+        if (_acmeOptions.ExposeAllTemplates)
+        {
+            _logger.LogWarning(
+                "Certus:Acme:ExposeAllTemplates is true — every CA published template is " +
+                "exposed via ACME regardless of the wizard's template selection");
+            warnings++;
+        }
+
+        // The revocation scope's wide posture must be as visible as the
+        // template override above: in all mode any certificate the TLS
+        // capability ceiling allows is revocable from the dashboard. Custom
+        // with an empty list is the opposite extreme (dashboard revocation
+        // disabled entirely); it fails safe, so an Information line rather
+        // than a warning.
+        var revocationScope = _revocationScope.GetSnapshot();
+        if (revocationScope.Mode == RevocationScopeMode.All)
+        {
+            _logger.LogWarning(
+                "The revocation scope is all: every certificate the TLS capability " +
+                "ceiling allows is revocable from the dashboard. Narrow it on the " +
+                "Settings page unless this is deliberate");
+            warnings++;
+        }
+        else if (revocationScope.Mode == RevocationScopeMode.Custom &&
+                 revocationScope.CustomTemplates.Count == 0)
+        {
+            _logger.LogInformation(
+                "The revocation scope is custom with an empty template list, so " +
+                "dashboard revocation is disabled entirely");
         }
 
         // Check sync interval

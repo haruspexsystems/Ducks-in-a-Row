@@ -12,8 +12,9 @@ namespace Certus.Web.Tests;
 /// surface (issue #85). The factory seeds a wizard status file that enables
 /// only the mock CA's WebServer template; the other CA published templates
 /// must answer 403 unauthorized, and unknown templates keep the 404. The
-/// shared factory (no status file) covers the allow all path in the existing
-/// ACME tests.
+/// shared base factory seeds the same WebServer set for the rest of the ACME
+/// tests; the fail closed default with no status file at all is pinned by
+/// EnabledTemplatesFailClosedIntegrationTests below (issue #101).
 /// </summary>
 [Trait("Category", "Integration")]
 public class EnabledTemplatesIntegrationTests
@@ -123,6 +124,53 @@ public class EnabledTemplatesIntegrationTests
                 EnabledTemplates = ["WebServer"],
             };
             status.Save(Path.Combine(TempDataDir, SetupStatus.FileName));
+        }
+    }
+}
+
+/// <summary>
+/// Verifies the fail closed default from issue #101 at the HTTP surface: a
+/// pre wizard install, with no status file at all, exposes no template over
+/// ACME even though the CA publishes them.
+/// </summary>
+[Trait("Category", "Integration")]
+public class EnabledTemplatesFailClosedIntegrationTests
+    : IClassFixture<EnabledTemplatesFailClosedIntegrationTests.NoStatusFileFactory>
+{
+    private readonly HttpClient _client;
+
+    public EnabledTemplatesFailClosedIntegrationTests(NoStatusFileFactory factory)
+    {
+        _client = factory.CreateClient();
+    }
+
+    [Fact]
+    public async Task Directory_NoStatusFile_Returns403Unauthorized()
+    {
+        // WebServer is published by the mock CA, but with no wizard status
+        // file nothing is enabled: the pre wizard posture is closed.
+        var response = await _client.GetAsync("/acme/WebServer/directory");
+
+        response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+        response.Content.Headers.ContentType?.MediaType.Should().Be("application/problem+json");
+
+        var error = JsonSerializer.Deserialize<AcmeError>(
+            await response.Content.ReadAsStringAsync());
+        error!.Type.Should().Be(AcmeErrorType.Unauthorized);
+        error.Status.Should().Be(403);
+        error.Detail.Should().Contain("not enabled");
+    }
+
+    /// <summary>
+    /// Test factory for the pre wizard install: removes the base factory's
+    /// seeded status file so the host starts with no wizard state at all.
+    /// </summary>
+    public sealed class NoStatusFileFactory : CertusWebApplicationFactory
+    {
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            base.ConfigureWebHost(builder);
+            File.Delete(Path.Combine(TempDataDir, SetupStatus.FileName));
         }
     }
 }

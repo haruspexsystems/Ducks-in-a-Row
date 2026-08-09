@@ -6,6 +6,7 @@ import { RequireSetup } from '@/components/RequireSetup';
 import { DashboardPage } from '@/pages/DashboardPage';
 import { CertificateListPage } from '@/pages/CertificateListPage';
 import { CertificateDetailPage } from '@/pages/CertificateDetailPage';
+import { AcmePage } from '@/pages/AcmePage';
 import { SettingsPage } from '@/pages/SettingsPage';
 import { SetupWizard } from '@/pages/setup/SetupWizard';
 
@@ -32,6 +33,10 @@ export default function App() {
               <Route path="/" element={<DashboardPage />} />
               <Route path="/certificates" element={<CertificateListPage />} />
               <Route path="/certificates/:id" element={<CertificateDetailPage />} />
+              {/* One route, not a nested set: everything below /acme belongs
+                  to the ACME protocol on this server, so the section's tabs
+                  ride in the query string. See the note on AcmePage. */}
+              <Route path="/acme" element={<AcmePage />} />
               <Route path="/settings" element={<SettingsPage />} />
             </Route>
 

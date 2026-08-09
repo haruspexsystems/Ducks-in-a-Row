@@ -1,6 +1,6 @@
 <Project>
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
@@ -13,7 +13,7 @@
          repo root to /_/ so PDBs never record the build host's absolute path or
          username.
 
-         The .NET 8 SDK bundles Source Link and turns it on by default: with
+         The .NET SDK (8 and later) bundles Source Link and turns it on by default: with
          ContinuousIntegrationBuild it would query git, derive its own path map,
          and embed a Source Link blob pointing at the remote. We deliberately opt
          out of that (issue #104 chose an explicit PathMap, no Source Link) so the
@@ -25,14 +25,38 @@
     <EnableSourceControlManagerQueries>false</EnableSourceControlManagerQueries>
     <DeterministicSourcePaths>false</DeterministicSourcePaths>
 
+    <!-- Issue #112. The commit stamp and the Source Link opt out above are two
+         independent things, and #108 conflated them by accident. Turning off
+         EnableSourceControlManagerQueries stops the SDK asking git for
+         SourceRevisionId, which silently took the "+<sha>" off
+         AssemblyInformationalVersion (and with it the Win32 ProductVersion
+         resource on every shipped DLL), leaving a running install with no way
+         to say which commit built it.
+
+         The target that appends the revision, AddSourceRevisionToInformationalVersion
+         in Microsoft.NET.GenerateAssemblyInfo.targets, is NOT gated on SCM
+         queries: it only needs SourceRevisionId to be non empty. So build.ps1
+         resolves the commit itself and passes /p:SourceRevisionId=<sha> to
+         dotnet publish. MSBuild still never runs git, the build still works
+         from a source-only tree with no .git (the stamp is simply absent), and
+         no Source Link blob or repository URL is embedded. The property below
+         is already the SDK default; it is stated explicitly, like Deterministic
+         above, so a future default flip cannot quietly undo the stamp again.
+
+         Do not add RepositoryUrl here. GenerateRepositoryUrlAttribute defaults
+         to true, so setting it would bake the private repo URL into every
+         binary, which is exactly the leak class #104 closed. A bare revision id
+         carries no path and no URL. -->
+    <IncludeSourceRevisionInInformationalVersion>true</IncludeSourceRevisionInInformationalVersion>
+
     <!-- Shared version properties. VersionPrefix alone is what release/Publish-Release.ps1
          and build.ps1 read for the WiX ProductVersion (a strict four part numeric,
          no prerelease suffix). VersionSuffix only feeds AssemblyInformationalVersion,
-         so the running app can report the real "0.9.0-beta.1" style version (see
+         so the running app can report the real "0.10.0-beta.1" style version (see
          SettingsController.GetInfo) without ever touching the MSI version. Update
          both together with the release tag; drop VersionSuffix entirely for a
          non prerelease version like 1.0.0. -->
-    <VersionPrefix>0.9.0</VersionPrefix>
+    <VersionPrefix>0.10.0</VersionPrefix>
     <VersionSuffix>beta.1</VersionSuffix>
     <Product>Ducks in a Row</Product>
     <Company>Haruspex Systems B.V.</Company>

@@ -153,3 +153,26 @@ internal static class ColumnName
     public const string SubjectKeyIdentifier = "SubjectKeyIdentifier";
     public const string PublicKeyLength = "PublicKeyLength";
 }
+
+/// <summary>
+/// Request table columns whose unqualified name collides with a certificate
+/// table column of the same name. The CA schema carries the subject twice: the
+/// bare names are the issued certificate's ("Issued Common Name", "Issued
+/// Distinguished Name") and the qualified ones are what the CSR asked for.
+///
+/// These live in their own type, and hold the qualified string, because here the
+/// qualifier IS the identity. GetColumnIndex accepts either form when the query
+/// is built, but IEnumCERTVIEWCOLUMN::GetName returns the canonical name on read
+/// back, and the probe confirmed on the lab CA (2026-08-03) that it hands back
+/// "Request.CommonName" qualified while the issued column comes back bare
+/// "CommonName". Folding these into <see cref="ColumnName"/> would make the
+/// constant "CommonName" mean two different columns depending on which one the
+/// caller had in mind, which is the confusion this whole class of bug is made
+/// of. <see cref="AdcsClient.NormalizeColumnName"/> keeps these two qualified so
+/// the two values land under distinct keys.
+/// </summary>
+internal static class RequestColumnName
+{
+    public const string CommonName = "Request.CommonName";
+    public const string DistinguishedName = "Request.DistinguishedName";
+}

@@ -17,6 +17,29 @@ public sealed class CertusOptions
     public string? CaConnectionString { get; set; }
 
     /// <summary>
+    /// The CA name half of <see cref="CaConnectionString"/>, for display in
+    /// the dashboard headers (issue #157). The whole string when it has no
+    /// backslash or an empty name half, null when nothing is configured
+    /// (appsettings ships the key as explicit JSON null). Pure string
+    /// parsing: it never contacts the CA, so the name renders exactly when
+    /// the CA is unreachable and the header needs it most.
+    /// </summary>
+    public string? CaDisplayName
+    {
+        get
+        {
+            var value = CaConnectionString?.Trim();
+            if (string.IsNullOrEmpty(value))
+                return null;
+            var separator = value.IndexOf('\\');
+            if (separator < 0)
+                return value;
+            var name = value[(separator + 1)..].Trim();
+            return name.Length > 0 ? name : value;
+        }
+    }
+
+    /// <summary>
     /// Explicitly select the mock ADCS client (development and demos only;
     /// certificates are fake). This is the only way to get the mock: an empty
     /// <see cref="CaConnectionString"/> no longer falls back to it, so a
@@ -76,6 +99,36 @@ public sealed class CertusOptions
     public string? HttpsCertificateThumbprint { get; set; }
 
     /// <summary>
+    /// Whether the server's own HTTPS certificate is re enrolled automatically
+    /// as it nears expiry (issue #105). The renewal never restarts the host by
+    /// itself: it swaps the overlay thumbprint and the dashboard offers the
+    /// restart that applies it.
+    ///
+    /// None of the three renewal keys below appear in appsettings.json on
+    /// purpose. Keys that ship there as an explicit JSON null have that null
+    /// applied over the C# initializer by the configuration binder (see
+    /// <see cref="NormalizeDatabasePath"/> for what that once cost), so
+    /// leaving them out is what makes these initializers the real defaults.
+    /// </summary>
+    public bool HttpsCertificateAutoRenewalEnabled { get; set; } = true;
+
+    /// <summary>
+    /// How close to expiry (in days) the server's own HTTPS certificate is
+    /// renewed. Defaults to 30, matching the self signed certificate's
+    /// renewal window in the service host. The effective window is capped at
+    /// a third of the certificate's own validity, so a short lived template
+    /// does not renew on every check.
+    /// </summary>
+    public int HttpsCertificateRenewalWindowDays { get; set; } = 30;
+
+    /// <summary>
+    /// How often (in hours) the renewal check runs. Daily by default: the
+    /// certificate lives for a year or two, and a failed attempt has the whole
+    /// renewal window to retry in.
+    /// </summary>
+    public int HttpsCertificateRenewalCheckIntervalHours { get; set; } = 24;
+
+    /// <summary>
     /// The smallest sync interval the certificate sync service will honor. A
     /// configured <see cref="SyncIntervalMinutes"/> below this is floored to it.
     /// </summary>
@@ -87,6 +140,17 @@ public sealed class CertusOptions
     /// reach the dashboard promptly.
     /// </summary>
     public int SyncIntervalMinutes { get; set; } = 5;
+
+    /// <summary>
+    /// How far back the certificate sync reaches for pending, denied, and
+    /// failed requests, in days. Issued and revoked certificates are always
+    /// synced in full; only these three request dispositions are bounded,
+    /// because they accumulate without limit on a busy CA while an admin only
+    /// ever chases a request that is stuck now.
+    /// Set to 0 to skip those three passes entirely and sync only issued and
+    /// revoked certificates, which is the behaviour before issue #151.
+    /// </summary>
+    public int RequestHistoryDays { get; set; } = 30;
 
     /// <summary>
     /// Whether to enable SQLite WAL (Write-Ahead Logging) mode for better

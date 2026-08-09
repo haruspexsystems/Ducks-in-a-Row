@@ -30,6 +30,17 @@ public interface IHttpsCertificateStore
     /// best effort basis. Returns false when no such certificate exists.
     /// </summary>
     bool Remove(string thumbprint);
+
+    /// <summary>
+    /// Remove every certificate this product installed except
+    /// <paramref name="keepThumbprint"/>, and report how many went. The
+    /// background renewal service calls this once a renewal has actually been
+    /// applied, because by then the thumbprint it superseded is only known to
+    /// the store: the process that recorded it restarted to apply the new one.
+    /// Only certificates carrying our friendly name are candidates, so a
+    /// certificate an administrator put in the store by hand is never touched.
+    /// </summary>
+    int RemoveSuperseded(string keepThumbprint);
 }
 
 /// <summary>
@@ -47,6 +58,8 @@ public sealed class NoOpHttpsCertificateStore : IHttpsCertificateStore
     public X509Certificate2? Find(string thumbprint) => null;
 
     public bool Remove(string thumbprint) => false;
+
+    public int RemoveSuperseded(string keepThumbprint) => 0;
 }
 
 /// <summary>
@@ -75,9 +88,9 @@ public sealed class MachineHttpsCertificateStore : IHttpsCertificateStore
         // the machine key store; without PersistKeySet the key would vanish
         // with this process and Kestrel could never serve the certificate.
         var pfx = certificateWithKey.Export(X509ContentType.Pfx);
-        var persisted = new X509Certificate2(
+        var persisted = X509CertificateLoader.LoadPkcs12(
             pfx,
-            (string?)null,
+            null,
             X509KeyStorageFlags.MachineKeySet | X509KeyStorageFlags.PersistKeySet);
         persisted.FriendlyName = FriendlyName;
 
@@ -118,6 +131,33 @@ public sealed class MachineHttpsCertificateStore : IHttpsCertificateStore
         _logger.LogInformation(
             "Removed HTTPS certificate {Thumbprint} from LocalMachine\\My", thumbprint);
         return true;
+    }
+
+    public int RemoveSuperseded(string keepThumbprint)
+    {
+        using var store = new X509Store(StoreName.My, StoreLocation.LocalMachine);
+        store.Open(OpenFlags.ReadWrite);
+
+        // Our friendly name is the only marker: a certificate an administrator
+        // installed by hand carries their own (or none), so it is never a
+        // candidate however much it looks like ours.
+        var superseded = store.Certificates
+            .Where(c => string.Equals(c.FriendlyName, FriendlyName, StringComparison.Ordinal)
+                        && !string.Equals(c.Thumbprint, keepThumbprint, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        foreach (var cert in superseded)
+        {
+            store.Remove(cert);
+            TryDeletePrivateKey(cert);
+            _logger.LogInformation(
+                "Removed superseded HTTPS certificate {Thumbprint} ({Subject}, valid until " +
+                "{NotAfter:u}) from LocalMachine\\My; {Keep} is the certificate in use",
+                cert.Thumbprint, cert.Subject, cert.NotAfter.ToUniversalTime(), keepThumbprint);
+            cert.Dispose();
+        }
+
+        return superseded.Count;
     }
 
     /// <summary>

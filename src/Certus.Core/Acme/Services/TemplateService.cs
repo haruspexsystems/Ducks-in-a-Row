@@ -1,4 +1,5 @@
 using Certus.Core.Adcs;
+using Certus.Core.Security;
 using Microsoft.Extensions.Logging;
 
 namespace Certus.Core.Acme.Services;
@@ -16,6 +17,14 @@ public enum TemplateAccess
 
     /// <summary>The template exists and is enabled for ACME.</summary>
     Enabled,
+
+    /// <summary>
+    /// The template is enabled but its verified AD metadata violates the TLS
+    /// capability ceiling, so its certificates could never be delivered.
+    /// Unverified metadata never lands here: the AD lookup is best effort,
+    /// and the finalize leaf check is the hard guarantee behind this state.
+    /// </summary>
+    BlockedByCeiling,
 }
 
 /// <summary>
@@ -75,9 +84,27 @@ public sealed class TemplateService
         if (match == null)
             return new TemplateResolution(TemplateAccess.Unknown, null);
 
-        return _enabledTemplates.IsEnabled(match)
-            ? new TemplateResolution(TemplateAccess.Enabled, match)
-            : new TemplateResolution(TemplateAccess.Disabled, match);
+        if (!_enabledTemplates.IsEnabled(match))
+            return new TemplateResolution(TemplateAccess.Disabled, match);
+
+        // The TLS capability ceiling over the template's verified AD
+        // metadata. Absent metadata passes deliberately (the AD lookup is
+        // best effort and must not take issuance down with it); the finalize
+        // leaf check is the hard guarantee behind this early refusal.
+        if (match.ExtendedKeyUsages != null)
+        {
+            var verdict = TlsCapabilityCeiling.Evaluate(
+                new CertificateCapability(match.ExtendedKeyUsages, null, null));
+            if (!verdict.Allowed)
+            {
+                _logger.LogWarning(
+                    "Template {Template} is enabled but refused by the TLS capability ceiling: {Reason}",
+                    match.Name, verdict.Message);
+                return new TemplateResolution(TemplateAccess.BlockedByCeiling, match);
+            }
+        }
+
+        return new TemplateResolution(TemplateAccess.Enabled, match);
     }
 
     /// <summary>

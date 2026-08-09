@@ -15,8 +15,11 @@ https://your-server:5001/acme/<template>/directory
   name. Display names with spaces are accepted; the client URL encodes them.
 - Use the HTTPS endpoint (5001) in production. Plain HTTP (5000) is for lab use
   only.
-- No external account binding is required. Clients register an account from
-  their own key the first time they connect.
+- Whether registration needs an external account binding credential depends on
+  the server's enforcement mode; see
+  [External account binding](#external-account-binding) below. Out of the box
+  the mode is Off and clients register an account from their own key the first
+  time they connect.
 
 > **Trusting the server's TLS.** ACME clients reject an untrusted TLS
 > certificate on the ACME server itself. Give Ducks in a Row a certificate your
@@ -28,6 +31,53 @@ https://your-server:5001/acme/<template>/directory
 > The example commands are representative. Exact flags vary by client version,
 > so check each client's own documentation for your release.
 
+## External account binding
+
+The ACME page of the dashboard sets one of three enforcement modes for
+external account binding (RFC 8555 section 7.3.4):
+
+| Mode | What a registering client needs |
+|---|---|
+| Off (default) | Nothing. A presented binding is ignored. |
+| Optional | Nothing, but a presented binding is verified and recorded. |
+| Required | A valid EAB credential; registration without one is refused with `externalAccountRequired`. |
+
+An administrator creates credentials on the ACME page. Each credential is a
+**key id** plus an **HMAC key** (base64url encoded, sized for HS256, which is
+what every client below signs with by default; HS384 and HS512 are also
+accepted). The HMAC key is shown exactly once, right after create or
+regenerate, so hand both values to the client operator then. The binding
+happens once, at account registration; later orders and renewals ride the
+existing account while the credential stays active (revoking a credential,
+or letting it expire, suspends orders from the accounts bound to it).
+Accounts that registered before the mode was raised to Required keep
+working; the ACME page lists them as Unbound.
+
+A credential can also carry a **domain namespace**: accounts bound to it may
+only order certificates inside those domains, across every template. Orders
+outside it are refused with `rejectedIdentifier` and a message naming the
+credential.
+
+The dashboard writes ready to paste setup for you: the panel shown right
+after create or regenerate inlines the real secret, and each credential row's
+**Client setup** action shows the same snippets with a placeholder for the
+saved secret. The dashboard covers the first six clients below; Traefik is
+listed here for its field names only. The flags per client:
+
+| Client | Directory URL | Key id | HMAC key |
+|---|---|---|---|
+| certbot | `--server` | `--eab-kid` | `--eab-hmac-key` |
+| win-acme | `--baseuri` | `--eab-key-identifier` | `--eab-key` |
+| acme.sh | `--server`, once with `--register-account` | `--eab-kid` | `--eab-hmac-key` |
+| Posh-ACME | `Set-PAServer -DirectoryUrl` | `New-PAAccount -ExtAcctKID` | `New-PAAccount -ExtAcctHMACKey` |
+| cert-manager | `spec.acme.server` | `externalAccountBinding.keyID` | `externalAccountBinding.keySecretRef`, a secret holding the base64url key |
+| Caddy | `acme_ca` | `acme_eab` block, `key_id` | `acme_eab` block, `mac_key` |
+| Traefik | `caServer` | `eab.kid` | `eab.hmacEncoded` |
+
+If a client with correct looking values is refused with `unauthorized`, the
+credential may be revoked, expired, or rotated; see
+[troubleshooting](troubleshooting.md) for the causes and fixes.
+
 ## Challenge types
 
 | Type | Good for | How Ducks in a Row validates it | Outbound port it uses |
@@ -38,6 +88,25 @@ https://your-server:5001/acme/<template>/directory
 
 The Ducks in a Row server is the party that performs validation, so the server
 needs outbound reachability to the domain or DNS being validated.
+
+## CSR requirements
+
+At finalize the server checks the CSR against the order before anything is
+submitted to the CA:
+
+- The subject alternative names must be DNS names matching the order's
+  domains exactly, wildcard marker included. Any other SAN type (an IP
+  address, an email, a UPN, a directoryName, a PermanentIdentifier) is
+  refused.
+- The subject common name is optional. When a CN is present, it must be one
+  of the domains on the order; a descriptive value such as `CN=My Web Server`
+  is refused. Public ACME CAs enforce the same rule, so a client that works
+  against Let's Encrypt needs no change.
+- A CSR with no SAN at all is identified by its subject CN, which then has to
+  match the order the same way.
+
+A CSR that breaks these rules is refused with `badCSR`, and the order stays
+in the ready state so the client can retry with a corrected CSR.
 
 ## certbot
 
@@ -122,8 +191,10 @@ New-PACertificate -Domain host.corp.example.com -Plugin WebRoot `
 
 ## Picking a template
 
-Any template your CA publishes and that the Ducks in a Row machine account can
-enrol is reachable at `/acme/<template>/directory`. Match the template to the
-certificate purpose, for example a Web Server template for TLS server
-certificates. If a directory URL returns `404 unknown certificate template`,
-check the name against the templates shown in the setup wizard.
+Any template that was enabled in the setup wizard is reachable at
+`/acme/<template>/directory`. Match the template to the certificate purpose,
+for example a Web Server template for TLS server certificates. A template the
+CA publishes but that was not enabled in the wizard answers
+`403 not enabled for ACME`; if a directory URL returns
+`404 unknown certificate template`, check the name against the templates shown
+in the setup wizard.

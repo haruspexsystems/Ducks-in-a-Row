@@ -35,8 +35,11 @@ public class AcmeAccount
     public string? ContactJson { get; set; }
 
     /// <summary>
-    /// Account status: "valid", "deactivated", or "revoked".
-    /// RFC 8555 §7.1.6
+    /// Account status. RFC 8555 §7.1.6 defines "valid", "deactivated", and
+    /// "revoked", but only the first two are ever written here: an account is
+    /// created valid, and dashboard deactivation is the single mutation.
+    /// Nothing revokes an account, so the dashboard offers no such filter.
+    /// Add "revoked" back to this list alongside the code that writes it.
     /// </summary>
     public string Status { get; set; } = "valid";
 
@@ -44,6 +47,25 @@ public class AcmeAccount
     /// Whether the client agreed to the terms of service.
     /// </summary>
     public bool TermsOfServiceAgreed { get; set; }
+
+    /// <summary>
+    /// The EAB credential this account is bound to (RFC 8555 §7.3.4), or null
+    /// for an account without a binding: registered before EAB existed, or
+    /// while enforcement was off or optional. Unbound accounts are
+    /// grandfathered; the dashboard flags them.
+    /// </summary>
+    public int? ExternalAccountCredentialId { get; set; }
+
+    /// <summary>Navigation to the bound EAB credential.</summary>
+    public EabCredential? ExternalAccountCredential { get; set; }
+
+    /// <summary>
+    /// The externalAccountBinding JWS exactly as received at binding time,
+    /// echoed back in the account object (RFC 8555 §7.1.2). After a key
+    /// rollover this still holds the registration time account key by design:
+    /// it is the historical registration proof, not the current key.
+    /// </summary>
+    public string? EabJwsJson { get; set; }
 
     /// <summary>When this account was created.</summary>
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;

@@ -32,8 +32,8 @@ checksums first.
 ## Before you cut a release
 
 1. **Bump `VersionPrefix` in `Directory.Build.props`** to match the release,
-   as its own normal reviewed commit. For `-Version 0.9.0-beta.1` that means
-   `VersionPrefix` must be `0.9.0` (the script checks this and refuses to
+   as its own normal reviewed commit. For `-Version 0.10.0-beta.1` that means
+   `VersionPrefix` must be `0.10.0` (the script checks this and refuses to
    build otherwise). WiX needs a plain four part numeric version, so the
    `-beta.1` part only ever appears in the git tag and the release title, not
    in the file version Windows shows.
@@ -55,11 +55,11 @@ repo first if you'd rather that account handle it end to end.
 
 ```powershell
 # Validate everything without publishing anything
-./release/Publish-Release.ps1 -Version 0.9.0-beta.1 -DryRun
+./release/Publish-Release.ps1 -Version 0.10.0-beta.1 -DryRun
 
 # Cut the beta to staging, then go test the installer
-./release/Publish-Release.ps1 -Version 0.9.0-beta.1
+./release/Publish-Release.ps1 -Version 0.10.0-beta.1
 
 # Once staging looks good, promote the same bits to the public repo
-./release/Publish-Release.ps1 -Version 0.9.0-beta.1 -Stage public
+./release/Publish-Release.ps1 -Version 0.10.0-beta.1 -Stage public
 ```

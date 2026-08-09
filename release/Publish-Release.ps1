@@ -32,7 +32,7 @@
     fails with a clear message rather than a confusing 404.
 
 .PARAMETER Version
-    The release version, e.g. "0.9.0-beta.1". Must satisfy semver
+    The release version, e.g. "0.10.0-beta.1". Must satisfy semver
     (major.minor.patch with an optional -prerelease suffix). The git tag is
     "v$Version".
 
@@ -50,9 +50,9 @@
     inspected. Nothing is published to any repo.
 
 .EXAMPLE
-    ./release/Publish-Release.ps1 -Version 0.9.0-beta.1 -DryRun
-    ./release/Publish-Release.ps1 -Version 0.9.0-beta.1
-    ./release/Publish-Release.ps1 -Version 0.9.0-beta.1 -Stage public
+    ./release/Publish-Release.ps1 -Version 0.10.0-beta.1 -DryRun
+    ./release/Publish-Release.ps1 -Version 0.10.0-beta.1
+    ./release/Publish-Release.ps1 -Version 0.10.0-beta.1 -Stage public
 #>
 
 param(
@@ -180,6 +180,12 @@ if ($Stage -eq "staging") {
 
     if (-not $SkipBuild) {
         Write-Host "[2/6] Building installers (./build.ps1)..." -ForegroundColor Yellow
+        # For the release record. build.ps1 resolves this itself from git HEAD
+        # (issue #112) and stamps it into the shipped assemblies' ProductVersion.
+        # The preflight above already guarantees a clean tree on main, so this is
+        # the exact commit the artifacts are built from.
+        $buildCommit = git -C $RepoRoot rev-parse HEAD
+        Write-Host "  Stamping commit: $buildCommit" -ForegroundColor Gray
         Push-Location $RepoRoot
         try {
             & "$RepoRoot/build.ps1" -Configuration Release

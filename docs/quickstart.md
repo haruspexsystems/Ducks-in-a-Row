@@ -106,7 +106,9 @@ steps.
    ![Setup wizard connection step showing a discovered CA and the test connection button](images/setup-02-connection.png)
 
 3. **Choose a template.** It lists the templates that CA publishes, checks each
-   one for ACME readiness, and lets you choose the template to expose.
+   one for ACME readiness, and lets you choose the template to expose. No
+   template is exposed over ACME until a selection is recorded on this step:
+   on a fresh install, every template's directory URL answers 403 until then.
 
    ![Setup wizard templates step showing the ACME readiness checklist](images/setup-03-templates.png)
 
@@ -195,10 +197,23 @@ Restart the service after editing either file.
 | `Certus:DatabasePath` | `ducks.db` in the data folder | SQLite database file |
 | `Certus:ExternalUrl` | `null` | The base URL you expect clients to use. Recorded and checked at startup; ACME URLs themselves follow the host the client connects to |
 | `Certus:SyncIntervalMinutes` | `5` | How often the dashboard syncs from the CA |
+| `Certus:RequestHistoryDays` | `30` | How far back the sync reaches for pending, denied, and failed requests, so their detail pages can show the CA's own explanation. Issued and revoked certificates are always synced in full. Set to `0` to skip those three passes entirely, which also empties the Pending, Denied, and Failed filters on the certificate list |
+| `Certus:Acme:ExposeAllTemplates` | `false` | Break glass override: expose every CA published template over ACME, ignoring the wizard's template selection. Leave it `false`; the open posture is logged as a warning at startup |
 | `Auth:Mode` | `Negotiate` | Windows Integrated Authentication for the dashboard |
 | `Auth:AdminGroup` | `null` (built in Administrators) | Group allowed into the dashboard and setup |
 | `Auth:RequireHttps` | `true` | HSTS and HTTP to HTTPS redirect outside development |
 | `Auth:TrustedProxies` | `[]` | Reverse proxy IPs whose `X-Forwarded-*` headers are trusted |
+
+### Challenge validation egress
+
+For HTTP-01 and TLS-ALPN-01, the server itself connects out to the host being
+validated. Loopback, link local (including the cloud metadata address), and
+IPv6 unique local targets are always refused; the RFC 1918 private ranges are
+allowed by default, because an internal CA usually issues for exactly those
+addresses. If everything you validate is public, set
+`Certus:Acme:ChallengeValidation:BlockPrivateRanges` to `true` in
+`settings.json`. The [hardening guide](hardening.md) explains the tradeoff and
+the rest of the egress settings.
 
 ### Giving clients a TLS certificate they trust
 

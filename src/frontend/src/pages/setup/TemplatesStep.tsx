@@ -58,37 +58,37 @@ export function TemplatesStep({ state, onUpdate }: TemplatesStepProps) {
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-xl font-bold text-slate-900">Select a Certificate Template</h2>
-        <p className="text-sm text-slate-500 mt-1">
+        <h2 className="text-xl font-bold text-ink">Select a Certificate Template</h2>
+        <p className="text-sm text-muted mt-1">
           Choose the ADCS template to expose via ACME. Only templates that can issue
           server authentication certificates are listed. The template gets its own
-          ACME directory URL: <code className="bg-slate-100 px-1 rounded text-xs">/acme/{'{'}<em>template</em>{'}'}/directory</code>
+          ACME directory URL: <code className="bg-sunken-strong px-1 rounded text-xs">/acme/{'{'}<em>template</em>{'}'}/directory</code>
         </p>
       </div>
 
       {loading && (
         <div className="flex items-center justify-center py-12">
           <Loader2 className="h-6 w-6 text-certus-500 animate-spin" />
-          <span className="text-sm text-slate-500 ml-2">Loading templates from CA...</span>
+          <span className="text-sm text-muted ml-2">Loading templates from CA...</span>
         </div>
       )}
 
       {error && (
-        <div className="bg-red-50 border border-red-200 rounded-xl p-4 flex items-start gap-3">
+        <div className="bg-red-50 dark:bg-red-500/10 border border-red-200 dark:border-red-500/30 rounded-xl p-4 flex items-start gap-3">
           <AlertTriangle className="h-5 w-5 text-red-500 mt-0.5" />
           <div>
-            <p className="text-sm font-medium text-red-900">Failed to load templates</p>
-            <p className="text-sm text-red-700 mt-1">{error}</p>
+            <p className="text-sm font-medium text-red-900 dark:text-red-200">Failed to load templates</p>
+            <p className="text-sm text-red-700 dark:text-red-300 mt-1">{error}</p>
           </div>
         </div>
       )}
 
       {!loading && ekuUnverified && (
-        <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex items-start gap-3">
+        <div className="bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/30 rounded-xl p-4 flex items-start gap-3">
           <ShieldAlert className="h-5 w-5 text-amber-600 mt-0.5" />
           <div>
-            <p className="text-sm font-semibold text-amber-900">EKU could not be verified</p>
-            <p className="text-sm text-amber-700 mt-1">
+            <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">EKU could not be verified</p>
+            <p className="text-sm text-amber-700 dark:text-amber-300 mt-1">
               This host may not be domain joined, or the service account cannot read the
               AD Configuration partition. Showing all templates. Confirm your choice
               issues server authentication certificates.
@@ -106,8 +106,8 @@ export function TemplatesStep({ state, onUpdate }: TemplatesStepProps) {
                 <label
                   className={`flex items-center gap-3 p-3 rounded-xl border cursor-pointer transition-colors ${
                     isSelected
-                      ? 'border-certus-300 bg-certus-50'
-                      : 'border-slate-200 bg-white hover:border-slate-300'
+                      ? 'border-certus-300 bg-certus-50 dark:bg-certus-500/10'
+                      : 'border-hairline bg-surface hover:border-hairline-strong'
                   }`}
                 >
                   <input
@@ -115,18 +115,18 @@ export function TemplatesStep({ state, onUpdate }: TemplatesStepProps) {
                     name="template"
                     checked={isSelected}
                     onChange={() => selectTemplate(template)}
-                    className="h-4 w-4 text-certus-600 border-slate-300 focus:ring-certus-500"
+                    className="h-4 w-4 text-certus-600 border-hairline-strong focus:ring-certus-500"
                   />
-                  <FileCheck2 className={`h-4 w-4 ${isSelected ? 'text-certus-600' : 'text-slate-400'}`} />
+                  <FileCheck2 className={`h-4 w-4 ${isSelected ? 'text-certus-600' : 'text-faint'}`} />
                   <div className="flex-1 min-w-0">
-                    <div className="text-sm font-medium text-slate-900">{template.displayName || template.name}</div>
-                    <div className="text-xs text-slate-500">
-                      Name: <code className="bg-slate-100 px-1 rounded">{template.name}</code>
+                    <div className="text-sm font-medium text-ink">{template.displayName || template.name}</div>
+                    <div className="text-xs text-muted">
+                      Name: <code className="bg-sunken-strong px-1 rounded">{template.name}</code>
                       {template.oid && <span className="ml-2">OID: {template.oid}</span>}
                     </div>
                   </div>
                   {isSelected && (
-                    <div className="text-xs text-certus-700 whitespace-nowrap">
+                    <div className="text-xs text-certus-700 dark:text-certus-300 whitespace-nowrap">
                       /acme/{template.name}/directory
                     </div>
                   )}
@@ -139,8 +139,8 @@ export function TemplatesStep({ state, onUpdate }: TemplatesStepProps) {
       )}
 
       {!loading && !error && templates.length > 0 && excludedCount > 0 && (
-        <div className="flex items-start gap-2 text-xs text-slate-500">
-          <Info className="h-4 w-4 text-slate-400 mt-0.5 shrink-0" />
+        <div className="flex items-start gap-2 text-xs text-muted">
+          <Info className="h-4 w-4 text-faint mt-0.5 shrink-0" />
           <p>
             {excludedCount} {excludedCount === 1 ? 'template' : 'templates'} on this CA{' '}
             {excludedCount === 1 ? 'was' : 'were'} hidden. Each either lacks the Server
@@ -152,7 +152,7 @@ export function TemplatesStep({ state, onUpdate }: TemplatesStepProps) {
       )}
 
       {!loading && templates.length === 0 && !error && (
-        <div className="text-center py-12 text-slate-400">
+        <div className="text-center py-12 text-faint">
           <FileCheck2 className="h-8 w-8 mx-auto mb-2" />
           {excludedCount > 0 ? (
             <p className="text-sm">
@@ -260,24 +260,27 @@ function AcmeViabilityChecklist({ template }: { template: SetupTemplate }) {
   const hasWarnings = items.some((i) => i.status === 'warn');
 
   return (
-    <div className="mt-2 ml-4 border border-slate-200 rounded-xl bg-white p-3 space-y-2">
-      <p className="text-xs font-semibold text-slate-700">ACME readiness</p>
+    <div className="mt-2 ml-4 border border-hairline rounded-xl bg-surface p-3 space-y-2">
+      <p className="text-xs font-semibold text-ink-soft">ACME readiness</p>
       <ul className="space-y-1.5">
         {items.map((item) => (
           <li key={item.label} className="flex items-start gap-2">
             {item.status === 'pass' && <CheckCircle2 className="h-4 w-4 text-emerald-500 mt-0.5 shrink-0" />}
             {item.status === 'warn' && <AlertTriangle className="h-4 w-4 text-amber-500 mt-0.5 shrink-0" />}
-            {item.status === 'info' && <Info className="h-4 w-4 text-slate-400 mt-0.5 shrink-0" />}
-            {item.status === 'unverified' && <HelpCircle className="h-4 w-4 text-slate-300 mt-0.5 shrink-0" />}
+            {item.status === 'info' && <Info className="h-4 w-4 text-faint mt-0.5 shrink-0" />}
+            {/* Fainter than `text-faint` as an opacity step, not a lighter slate:
+                a literal slate-300 would become the brightest icon here on a
+                dark page, inverting the "unverified is de-emphasised" reading. */}
+            {item.status === 'unverified' && <HelpCircle className="h-4 w-4 text-faint/60 mt-0.5 shrink-0" />}
             <div>
               <p className={`text-xs font-medium ${
-                item.status === 'warn' ? 'text-amber-900' : 'text-slate-700'
+                item.status === 'warn' ? 'text-amber-900 dark:text-amber-200' : 'text-ink-soft'
               }`}>
                 {item.label}
               </p>
               {item.detail && (
                 <p className={`text-xs ${
-                  item.status === 'warn' ? 'text-amber-700' : 'text-slate-500'
+                  item.status === 'warn' ? 'text-amber-700 dark:text-amber-300' : 'text-muted'
                 }`}>
                   {item.detail}
                 </p>
@@ -287,7 +290,7 @@ function AcmeViabilityChecklist({ template }: { template: SetupTemplate }) {
         ))}
       </ul>
       {hasWarnings && (
-        <p className="text-xs text-amber-800 border-t border-slate-100 pt-2">
+        <p className="text-xs text-amber-800 dark:text-amber-300 border-t border-hairline-soft pt-2">
           These checks are advisory and you can continue, but ACME issuance will fail or stall
           until the flagged settings are changed in the Certificate Templates console.
         </p>

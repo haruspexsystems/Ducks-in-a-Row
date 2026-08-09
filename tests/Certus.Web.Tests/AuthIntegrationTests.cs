@@ -218,6 +218,73 @@ public class AuthIntegrationTests : IClassFixture<AuthWebApplicationFactory>
         response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
     }
 
+    // ── Certificate revocation surface (issue #159) ─────────────────────
+    // The highest blast radius write on the dashboard, so its guards get
+    // their own explicit rows in this matrix even though they are the same
+    // class level policy and middleware as everything above.
+
+    [Fact]
+    public async Task RevokeCertificate_Anonymous_Returns401()
+    {
+        var response = await CreateClient(csrf: true).PostAsync(
+            "/api/certificates/1/revoke",
+            JsonContent(new { reason = 1, serialNumber = "AA" }));
+
+        response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
+    }
+
+    [Fact]
+    public async Task RevokeCertificate_AuthenticatedNonAdmin_Returns403()
+    {
+        var response = await CreateClient("alice", csrf: true).PostAsync(
+            "/api/certificates/1/revoke",
+            JsonContent(new { reason = 1, serialNumber = "AA" }));
+
+        response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+    }
+
+    [Fact]
+    public async Task RevokeCertificate_AdminWithoutCsrf_Returns403()
+    {
+        var response = await CreateClient(TestAuthHandler.AdminUser).PostAsync(
+            "/api/certificates/1/revoke",
+            JsonContent(new { reason = 1, serialNumber = "AA" }));
+
+        response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+    }
+
+    // ── Alert test send (issue #161) ────────────────────────────────────
+    // It fires outbound SMTP and an HTTP POST on demand, so its guards get
+    // explicit rows here. The CSRF row matters most: the client for this
+    // endpoint uses plain fetch to read the 409 and 429 bodies, which does not
+    // merge the CSRF header the way fetchJson does. Getting that wrong fails in
+    // production only, because the CSRF middleware is not registered when
+    // authentication is disabled, which is how every other test host runs.
+
+    [Fact]
+    public async Task SendTestAlert_Anonymous_Returns401()
+    {
+        var response = await CreateClient(csrf: true).PostAsync("/api/alerts/test", null);
+
+        response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
+    }
+
+    [Fact]
+    public async Task SendTestAlert_AuthenticatedNonAdmin_Returns403()
+    {
+        var response = await CreateClient("alice", csrf: true).PostAsync("/api/alerts/test", null);
+
+        response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+    }
+
+    [Fact]
+    public async Task SendTestAlert_AdminWithoutCsrf_Returns403()
+    {
+        var response = await CreateClient(TestAuthHandler.AdminUser).PostAsync("/api/alerts/test", null);
+
+        response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+    }
+
     // ── SPA fallback must not mask API responses ────────────────────────
 
     [Fact]
@@ -245,5 +312,30 @@ public class AuthIntegrationTests : IClassFixture<AuthWebApplicationFactory>
 
         response.StatusCode.Should().Be(HttpStatusCode.NotFound);
         response.Content.Headers.ContentType?.MediaType.Should().NotBe("text/html");
+    }
+
+    [Fact]
+    public async Task KnownApiRouteWrongMethod_Admin_Returns405()
+    {
+        // The /api fallback is an unconstrained catch-all, so it used to
+        // absorb a method mismatch as a 404 the same way the ACME one did
+        // (issue #147). /api/acme/eab/enforcement is GET and PUT only.
+        var response = await CreateClient(TestAuthHandler.AdminUser, csrf: true)
+            .DeleteAsync("/api/acme/eab/enforcement");
+
+        response.StatusCode.Should().Be(HttpStatusCode.MethodNotAllowed);
+        response.Content.Headers.Allow.Should().Contain(["GET", "PUT"]);
+        response.Content.Headers.ContentType?.MediaType.Should().Be("application/problem+json");
+    }
+
+    [Fact]
+    public async Task KnownApiRouteWrongMethod_Anonymous_StillReturns401()
+    {
+        // The fallback deliberately carries no [AllowAnonymous], so the deny by
+        // default policy still answers first and the 405 never leaks which
+        // admin routes exist (issue #27).
+        var response = await CreateClient().DeleteAsync("/api/acme/eab/enforcement");
+
+        response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
     }
 }

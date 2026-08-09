@@ -36,28 +36,83 @@ public sealed class WebhookAlertNotifier : IAlertNotifier
         ExpiryAlertBatch batch,
         CancellationToken cancellationToken = default)
     {
+        return await PostAsync(
+            BuildPayload(batch),
+            $"{batch.Certificates.Count} certificates ({batch.ThresholdDays}-day threshold)",
+            cancellationToken);
+    }
+
+    public async Task<AlertNotificationResult> SendServerCertificateAlertAsync(
+        ServerCertificateAlert alert,
+        CancellationToken cancellationToken = default)
+    {
+        var payload = new ServerCertificateWebhookPayload
+        {
+            Event = "server.certificate.renewal_failed",
+            Outcome = alert.Outcome,
+            Detail = alert.Detail,
+            TemplateName = alert.Template,
+            DaysRemaining = alert.DaysRemaining,
+            Timestamp = DateTime.UtcNow,
+        };
+
+        return await PostAsync(payload, $"server certificate renewal ({alert.Outcome})", cancellationToken);
+    }
+
+    /// <summary>
+    /// The operator triggered test POST (issue #161).
+    ///
+    /// It deliberately goes through the same PostAsync as a real alert, so the
+    /// HMAC signature, the custom headers, and the timeout are provably the ones
+    /// a real alert would use. A test that took a shortcut would prove nothing
+    /// about the path it is supposed to be testing.
+    ///
+    /// The triggering account is not in the payload. See the TestAlert doc: this
+    /// body goes to a third party endpoint.
+    /// </summary>
+    public async Task<AlertNotificationResult> SendTestAlertAsync(
+        TestAlert alert,
+        CancellationToken cancellationToken = default)
+    {
+        var payload = new TestWebhookPayload
+        {
+            Event = "test.alert",
+            Test = true,
+            Message =
+                "Test alert from Ducks in a Row. No certificate is expiring and no action is needed.",
+            Timestamp = alert.TriggeredAtUtc,
+        };
+
+        return await PostAsync(payload, "a test alert", cancellationToken);
+    }
+
+    /// <summary>
+    /// Serialize, sign, and POST a payload. Shared by both alert kinds so the
+    /// HMAC signature, the custom headers, and the failure reporting stay
+    /// identical whatever is being delivered.
+    /// </summary>
+    private async Task<AlertNotificationResult> PostAsync(
+        object payload, string description, CancellationToken cancellationToken)
+    {
         var webhook = _options.Webhook;
         if (webhook == null || !IsEnabled)
             return new AlertNotificationResult(false, "Webhook not configured");
 
         try
         {
-            var payload = BuildPayload(batch);
-            var json = JsonSerializer.Serialize(payload, JsonOptions);
+            var json = JsonSerializer.Serialize(payload, payload.GetType(), JsonOptions);
 
             var request = new HttpRequestMessage(HttpMethod.Post, webhook.Url)
             {
                 Content = new StringContent(json, Encoding.UTF8, "application/json")
             };
 
-            // Add HMAC signature if secret is configured
             if (!string.IsNullOrEmpty(webhook.Secret))
             {
                 var signature = ComputeHmacSha256(json, webhook.Secret);
                 request.Headers.Add("X-Certus-Signature", $"sha256={signature}");
             }
 
-            // Add custom headers
             foreach (var (key, value) in webhook.Headers)
             {
                 request.Headers.TryAddWithoutValidation(key, value);
@@ -74,8 +129,7 @@ public sealed class WebhookAlertNotifier : IAlertNotifier
             }
 
             _logger.LogInformation(
-                "Webhook alert sent for {Count} certificates ({Threshold}-day threshold) to {Url}",
-                batch.Certificates.Count, batch.ThresholdDays, webhook.Url);
+                "Webhook alert sent for {Description} to {Url}", description, webhook.Url);
 
             return new AlertNotificationResult(true);
         }
@@ -139,4 +193,36 @@ internal sealed class WebhookCertificate
     public string TemplateName { get; set; } = string.Empty;
     public DateTime NotAfter { get; set; }
     public int DaysRemaining { get; set; }
+}
+
+/// <summary>
+/// The server's own certificate carries no inventory identity (it is not a row
+/// in the certificate table as far as this alert is concerned), so it gets its
+/// own event name and shape rather than being squeezed into the expiry payload.
+/// </summary>
+internal sealed class ServerCertificateWebhookPayload
+{
+    public string Event { get; set; } = string.Empty;
+    public string Outcome { get; set; } = string.Empty;
+    public string? Detail { get; set; }
+    public string? TemplateName { get; set; }
+    public int? DaysRemaining { get; set; }
+    public DateTime Timestamp { get; set; }
+}
+
+/// <summary>
+/// The test payload. It carries no certificate list at all, which is the whole
+/// point: a receiver that blindly iterates certificates will fail on it rather
+/// than file a fake expiry warning.
+///
+/// <see cref="Test"/> is redundant with the event name and is there anyway, so a
+/// receiver can filter on one obvious boolean instead of string matching event
+/// names it may not have been written to expect.
+/// </summary>
+internal sealed class TestWebhookPayload
+{
+    public string Event { get; set; } = string.Empty;
+    public bool Test { get; set; }
+    public string Message { get; set; } = string.Empty;
+    public DateTime Timestamp { get; set; }
 }

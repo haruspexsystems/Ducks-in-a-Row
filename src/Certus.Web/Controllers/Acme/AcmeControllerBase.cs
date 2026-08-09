@@ -2,6 +2,7 @@ using System.Text.Json;
 using Certus.Core.Acme.Crypto;
 using Certus.Core.Acme.Models;
 using Certus.Core.Acme.Services;
+using Certus.Core.Adcs;
 using Certus.Core.Configuration;
 using Certus.Core.Data.Entities;
 using Microsoft.AspNetCore.Authorization;
@@ -40,6 +41,53 @@ public abstract class AcmeControllerBase : ControllerBase
     }
 
     /// <summary>
+    /// Returns an ACME error response carrying per identifier subproblems
+    /// (RFC 8555 §6.7.1), so a client can report exactly which identifiers
+    /// were refused and why instead of one opaque failure.
+    /// </summary>
+    protected IActionResult AcmeError(
+        int statusCode, string errorType, string detail, AcmeError[] subproblems)
+    {
+        var error = new AcmeError
+        {
+            Type = errorType,
+            Detail = detail,
+            Status = statusCode,
+            Subproblems = subproblems
+        };
+
+        return new ObjectResult(error)
+        {
+            StatusCode = statusCode,
+            ContentTypes = { "application/problem+json" }
+        };
+    }
+
+    /// <summary>
+    /// Returns a problem that also names the algorithms the server accepts,
+    /// for badSignatureAlgorithm responses (RFC 8555 §6.2: the problem
+    /// document SHOULD include an "algorithms" field). Kept on the base so
+    /// the problem+json envelope stays in one place.
+    /// </summary>
+    protected IActionResult AcmeError(
+        int statusCode, string errorType, string detail, string[] algorithms)
+    {
+        var error = new AcmeError
+        {
+            Type = errorType,
+            Detail = detail,
+            Status = statusCode,
+            Algorithms = algorithms
+        };
+
+        return new ObjectResult(error)
+        {
+            StatusCode = statusCode,
+            ContentTypes = { "application/problem+json" }
+        };
+    }
+
+    /// <summary>
     /// Maps a template resolution to its ACME problem response, or null when
     /// the template is enabled and the endpoint may proceed. Unknown keeps the
     /// historical 404; Disabled is the issue #85 policy response for templates
@@ -54,9 +102,39 @@ public abstract class AcmeControllerBase : ControllerBase
             TemplateAccess.Enabled => null,
             TemplateAccess.Unknown => AcmeError(404, AcmeErrorType.Malformed,
                 $"Unknown certificate template: '{template}'."),
+            TemplateAccess.BlockedByCeiling => AcmeError(403, AcmeErrorType.Unauthorized,
+                $"Certificate template '{template}' cannot issue TLS server or client " +
+                "certificates, so this ACME server will not serve it."),
             _ => AcmeError(403, AcmeErrorType.Unauthorized,
                 $"Certificate template '{template}' is not enabled for ACME on this server."),
         };
+    }
+
+    /// <summary>
+    /// Resolves the template named in the URL and maps every refusal to its ACME problem
+    /// response, so a caller only has to check whether Error is null. Resolution reaches the
+    /// CA, which can be down: without the guard the exception escapes the action and faults to
+    /// a bare 500 with no problem document and no nonce, which is what new-account and
+    /// new-order did until issue #147. Keeping the guard on the base means an endpoint added
+    /// later inherits it rather than repeating the omission.
+    /// </summary>
+    protected async Task<(TemplateResolution Resolution, IActionResult? Error)> ResolveTemplateAsync(
+        TemplateService templateService,
+        string template,
+        CancellationToken cancellationToken)
+    {
+        TemplateResolution resolution;
+        try
+        {
+            resolution = await templateService.ResolveAsync(template, cancellationToken);
+        }
+        catch (CaUnavailableException)
+        {
+            return (default!, AcmeError(503, AcmeErrorType.ServiceUnavailable,
+                "The ADCS Certificate Authority is unavailable. Try again shortly."));
+        }
+
+        return (resolution, TemplateAccessError(resolution, template));
     }
 
     /// <summary>

@@ -1,5 +1,4 @@
 using System.Runtime.InteropServices;
-using System.Security.Cryptography;
 using System.Security.Cryptography.Pkcs;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -44,6 +43,16 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
     private readonly object _templateAdCacheLock = new();
     private IDictionary<string, AdcsTemplateDirectoryLookup.TemplateAdInfo>? _cachedTemplateAd;
     private DateTime _templateAdCachedAtUtc;
+
+    // A result column key collision repeats on every row of every pass, so it is
+    // reported once per colliding name rather than once per row. Keyed by name
+    // rather than latched on a single flag: this client is a singleton for the
+    // life of the service, so one shared flag would mute a second, unrelated
+    // collision forever, which is the same silent degradation the warning exists
+    // to end. Guarded by its own lock because a collision is rare enough that
+    // contention is irrelevant and a torn HashSet is not.
+    private readonly HashSet<string> _warnedColumnCollisions =
+        new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// Creates a new ADCS client.
@@ -282,6 +291,12 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
         byte[] csrDer,
         CancellationToken cancellationToken = default)
     {
+        // Build the attribute string up front so its guard runs before anything
+        // logs or dispatches: a name carrying a newline must not reach the log
+        // either, where it could forge a line. AdcsRequestAttributes owns the
+        // format and refuses such a name rather than sanitizing it (issue #175).
+        var attributes = AdcsRequestAttributes.ForTemplate(templateName);
+
         return Task.Run(() =>
         {
             _logger.LogInformation("Submitting CSR for template {Template} to {Config}",
@@ -293,11 +308,12 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                 certRequest = new CertRequestClass();
                 dynamic d = certRequest;
 
-                // Convert DER to base64 for submission
+                // Convert DER to base64 for submission. The CSR and the
+                // attribute string are separate Submit parameters and are never
+                // concatenated, so no CSR content can reach the attribute string
+                // whatever the request encoding. Base64 is about what ADCS
+                // accepts here, not a safety boundary.
                 var csrBase64 = Convert.ToBase64String(csrDer);
-
-                // Set the template via request attributes
-                var attributes = $"CertificateTemplate:{templateName}";
 
                 // Submit as PKCS#10 in base64 encoding
                 var flags = RequestEncoding.Base64 | RequestEncoding.Pkcs10;
@@ -470,7 +486,13 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                 // included so SAN only certificates (typical for ACME issued
                 // ones, whose CSRs carry an empty subject DN) still get a
                 // display name and searchable SAN list parsed from the
-                // certificate itself.
+                // certificate itself. The same blob also yields the key
+                // algorithm, key size, signature algorithm, thumbprint, EKU,
+                // and key usage (issue #150), so that detail costs no extra CA
+                // round trip either. DispositionMessage and StatusCode are the
+                // CA's own account of why a request pended, was denied, or
+                // failed; they are read only on those dispositions (see
+                // MapToCertificateInfo).
                 var columns = new[]
                 {
                     ColumnName.RequestId,
@@ -481,19 +503,59 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                     ColumnName.NotBefore,
                     ColumnName.NotAfter,
                     ColumnName.Disposition,
+                    ColumnName.DispositionMessage,
+                    ColumnName.StatusCode,
                     ColumnName.RequesterName,
                     ColumnName.SubmittedWhen,
                     ColumnName.RevokedWhen,
                     ColumnName.RevokedReason,
-                    ColumnName.RawCertificate
+                    ColumnName.RawCertificate,
+                    // The subject the CSR asked for, which is the only name a
+                    // request row can have: the bare CommonName and
+                    // DistinguishedName above are the issued certificate's and
+                    // carry nothing until issuance (issue #186). Read back under
+                    // their qualified names, see RequestColumnName.
+                    RequestColumnName.DistinguishedName,
+                    RequestColumnName.CommonName
                 };
 
-                v.SetResultColumnCount(columns.Length);
+                // Resolve every index first and register only what resolved. A
+                // schema name the deployed certcli does not recognise otherwise
+                // throws straight out of the loop and takes the whole query with
+                // it, for every disposition pass. Degrading to a missing column
+                // is survivable; a dead sync is not.
+                //
+                // RequestID and Disposition are the exception. MapToCertificateInfo
+                // drops any row missing either one, so losing them turns every
+                // pass into a silent zero row success and the dashboard simply
+                // stops updating with nothing in the log to say why. Those two
+                // still fail loudly.
+                var resolvedColumns = new List<int>(columns.Length);
                 foreach (var col in columns)
                 {
-                    int idx = (int)v.GetColumnIndex(ColumnType.Schema, col);
-                    v.SetResultColumn(idx);
+                    try
+                    {
+                        resolvedColumns.Add((int)v.GetColumnIndex(ColumnType.Schema, col));
+                    }
+                    catch (Exception ex) when (!IsRequiredColumn(col))
+                    {
+                        // Deliberately broad. The dynamic IDispatch path does not
+                        // hand every COM failure back as a COMException: the CLR
+                        // maps well known HRESULTs to their managed equivalents,
+                        // which is why the OpenConnection catch below has to name
+                        // UnauthorizedAccessException for E_ACCESSDENIED. An
+                        // unknown schema name most likely arrives as E_INVALIDARG,
+                        // so catching COMException alone would let exactly the
+                        // failure this guard exists for through.
+                        _logger.LogWarning(ex,
+                            "CA view does not expose the {Column} column; continuing without it",
+                            col);
+                    }
                 }
+
+                v.SetResultColumnCount(resolvedColumns.Count);
+                foreach (var idx in resolvedColumns)
+                    v.SetResultColumn(idx);
 
                 // Apply restrictions based on query
                 ApplyRestrictions(v, query);
@@ -518,7 +580,7 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                         break;
 
                     object colEnum = e.EnumCertViewColumn();
-                    var values = ReadColumnValues(colEnum, columns.Length);
+                    var values = ReadColumnValues(colEnum, resolvedColumns.Count);
                     ReleaseCom(colEnum);
 
                     // A row without a readable Disposition cannot be classified
@@ -806,26 +868,104 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                 SortOrder.None,
                 dateValue);
         }
+
+        // Bound how far back a disposition pass reaches by arrival time. Used
+        // by the sync for the pending pass, whose table grows without limit on
+        // a busy CA. An admin chases a request that is stuck now, not one that
+        // stalled three years ago.
+        if (query.SubmittedAfter.HasValue)
+        {
+            int submittedIndex = (int)certView.GetColumnIndex(ColumnType.Schema, ColumnName.SubmittedWhen);
+            object submittedValue = query.SubmittedAfter.Value;
+            certView.SetRestriction(
+                submittedIndex,
+                SeekOperator.GreaterOrEqual,
+                SortOrder.None,
+                submittedValue);
+        }
+
+        // Bound a disposition pass by decision time instead. Used by the sync
+        // for the denied and failed passes (issue #187): a request submitted
+        // before the window but decided inside it is invisible to a
+        // SubmittedWhen bound, and its local row would say Pending forever.
+        // Never combine with a pending pass, which has no ResolvedWhen yet.
+        // The AdcsQiProbe run on the lab CA (2026-08-04) proved the
+        // restriction stacks with the Disposition equality on one view and
+        // that ResolvedWhen is a populated DateTime on decided rows. That run
+        // had ResolvedWhen registered as a result column, which this client
+        // does not do (it restricts only); the probe carries a pass in exactly
+        // this restrict only shape to close that difference on a lab run.
+        if (query.ResolvedAfter.HasValue)
+        {
+            int resolvedIndex = (int)certView.GetColumnIndex(ColumnType.Schema, ColumnName.ResolvedWhen);
+            object resolvedValue = query.ResolvedAfter.Value;
+            certView.SetRestriction(
+                resolvedIndex,
+                SeekOperator.GreaterOrEqual,
+                SortOrder.None,
+                resolvedValue);
+        }
     }
 
     /// <summary>
-    /// Strips the table qualifier from a CA view schema column name.
-    /// GetColumnIndex accepts unqualified names when the query is built, but
-    /// IEnumCERTVIEWCOLUMN::GetName returns the canonical schema name, which
+    /// Whether a result column is load bearing enough that failing to resolve it
+    /// should take the query down rather than degrade. Both of these gate
+    /// <see cref="MapToCertificateInfo"/>, which drops every row that lacks
+    /// either, so a missing one is indistinguishable from an empty CA.
+    /// </summary>
+    private static bool IsRequiredColumn(string column) =>
+        column == ColumnName.RequestId || column == ColumnName.Disposition;
+
+    /// <summary>
+    /// Schema names that must keep their table qualifier, because stripping it
+    /// would collide with a different column carrying a different value. See
+    /// <see cref="RequestColumnName"/>. Everything else normalizes, so a request
+    /// table column and its unqualified constant still meet.
+    /// </summary>
+    private static readonly HashSet<string> QualifiedKeyColumns =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            RequestColumnName.CommonName,
+            RequestColumnName.DistinguishedName,
+        };
+
+    /// <summary>
+    /// Turns a CA view schema column name into the key row values are stored
+    /// under. GetColumnIndex accepts unqualified names when the query is built,
+    /// but IEnumCERTVIEWCOLUMN::GetName returns the canonical schema name, which
     /// is table qualified for request table columns ("Request.Disposition",
     /// "Request.RequesterName", "Request.SubmittedWhen"). Both forms normalize
-    /// to the bare column name so lookups by the ColumnName constants hit
-    /// either way. Before this normalization those three lookups missed and
-    /// every synced certificate surfaced as Failed with no requester and no
-    /// request date.
+    /// to the bare column name so lookups by the ColumnName constants hit either
+    /// way. Before this normalization those three lookups missed and every
+    /// synced certificate surfaced as Failed with no requester and no request
+    /// date.
+    ///
+    /// The two columns in <see cref="QualifiedKeyColumns"/> are the exception
+    /// and keep their qualifier, because their bare form names a different
+    /// column (issue #186).
     /// </summary>
     internal static string NormalizeColumnName(string name)
     {
+        // Deliberately an allowlist rather than a rule about which table a name
+        // belongs to. Every other request table column normalizes to its bare
+        // form and is read by the ColumnName constants; only these two have a
+        // twin, and only they are exempt.
+        //
+        // TryGetValue rather than Contains so the stored constant is returned
+        // and not the caller's spelling. The match is case insensitive but the
+        // dictionary these keys land in is not, and MapToCertificateInfo reads
+        // them back by the exact RequestColumnName literal. Returning the input
+        // verbatim would file a differently cased name under a key nothing ever
+        // looks up, and unlike a collision that failure is invisible even to the
+        // warning below, because it is a distinct key rather than a duplicate.
+        if (QualifiedKeyColumns.TryGetValue(name, out var canonical))
+            return canonical;
+
         var lastDot = name.LastIndexOf('.');
         return lastDot >= 0 && lastDot < name.Length - 1 ? name[(lastDot + 1)..] : name;
     }
 
-    private static Dictionary<string, object?> ReadColumnValues(object colEnumObj, int count)
+    private Dictionary<string, object?> ReadColumnValues(object colEnumObj, int count)
     {
         dynamic colEnum = colEnumObj;
         var values = new Dictionary<string, object?>(count);
@@ -855,10 +995,26 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                 value = null; // Column may be null in the database
             }
 
-            // TryAdd: should two schema names ever collide after
-            // normalization, the first value wins instead of silently
-            // overwriting.
-            values.TryAdd(name, value);
+            // Should two schema names still collide after normalization, the
+            // first value wins rather than being silently overwritten, and the
+            // drop is reported. Silence here is what made issue #186 possible:
+            // a dropped column reads downstream exactly like a column the CA
+            // never returned, so the mapping degrades with nothing to say why.
+            // Once per client, because a collision repeats on every row of
+            // every pass.
+            if (!values.TryAdd(name, value))
+            {
+                bool firstForThisColumn;
+                lock (_warnedColumnCollisions)
+                    firstForThisColumn = _warnedColumnCollisions.Add(name);
+
+                if (firstForThisColumn)
+                    _logger.LogWarning(
+                        "CA view returned two result columns that both key as {Column}; the later one is " +
+                        "being dropped and whatever reads it will see nothing. Check NormalizeColumnName " +
+                        "against the names this CA build returns from IEnumCERTVIEWCOLUMN::GetName",
+                        name);
+            }
         }
 
         return values;
@@ -882,44 +1038,102 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                 return null;
 
             var serialNumber = values.GetValueOrDefault(ColumnName.SerialNumber)?.ToString() ?? "";
-            var commonName = values.GetValueOrDefault(ColumnName.CommonName)?.ToString() ?? "";
-            // Null coalescing alone is not enough here: the CA can return an
-            // empty string for DistinguishedName, which must also fall through
-            // to the CommonName column.
-            var dn = values.GetValueOrDefault(ColumnName.DistinguishedName)?.ToString();
-            if (string.IsNullOrWhiteSpace(dn))
-                dn = commonName;
+            var disposition = values.GetValueOrDefault(ColumnName.Disposition) is int disp ? disp : 0;
+            var status = disposition switch
+            {
+                DbDisposition.Issued => CertificateStatus.Issued,
+                DbDisposition.Revoked => CertificateStatus.Revoked,
+                DbDisposition.Pending => CertificateStatus.Pending,
+                DbDisposition.Denied => CertificateStatus.Denied,
+                _ => CertificateStatus.Failed
+            };
+
+            // Which subject column is authoritative depends on whether anything
+            // was actually issued, so the status is resolved before the name.
+            //
+            // On an issued or revoked row the certificate's own names win, as
+            // they always have: on an enrollee supplies subject template the CA
+            // policy can rewrite what the CSR asked for, and the dashboard must
+            // show what was signed.
+            //
+            // On a request row nothing was signed, so the request columns win
+            // instead. The bare columns are not reliably empty there, which the
+            // lab probe corrected on 2026-08-03: a policy module denial had the
+            // issued CommonName filled with a copy of the request CN, because
+            // the CA parses the subject before it refuses. Preferring the
+            // request columns gives the full DN the requester actually sent,
+            // which is what the detail page labels "Requested Subject".
+            //
+            // Precedence is the only thing the status decides. Every candidate is
+            // sanitized on every disposition (issue #224): a signature does not
+            // vouch for a name's rendering, and on an enrollee supplies subject
+            // template the issued columns are as requester authored as the request
+            // ones. Sanitizing per candidate rather than once at the end is load
+            // bearing, because a source that sanitizes away to null has to keep
+            // falling through the chain instead of collapsing it.
+            //
+            // Blank rather than null throughout: the CA returns an empty string
+            // as readily as a null through the IDispatch GetValue path, and both
+            // have to fall through.
+            var issuedDn = CertificateTextSanitizer.SanitizeSubject(
+                values.GetValueOrDefault(ColumnName.DistinguishedName)?.ToString());
+            var issuedCn = CertificateTextSanitizer.SanitizeSubject(
+                values.GetValueOrDefault(ColumnName.CommonName)?.ToString());
+            var dn = status is CertificateStatus.Pending
+                or CertificateStatus.Denied
+                or CertificateStatus.Failed
+                ? FirstNonBlank(
+                    CertificateTextSanitizer.SanitizeSubject(
+                        values.GetValueOrDefault(RequestColumnName.DistinguishedName)?.ToString()),
+                    CertificateTextSanitizer.SanitizeSubject(
+                        values.GetValueOrDefault(RequestColumnName.CommonName)?.ToString()),
+                    issuedDn,
+                    issuedCn)
+                : FirstNonBlank(issuedDn, issuedCn);
             var rawTemplate = values.GetValueOrDefault(ColumnName.CertificateTemplate)?.ToString() ?? "";
             var template = ResolveTemplateName(rawTemplate, templateMap);
             var notBefore = values.GetValueOrDefault(ColumnName.NotBefore) is DateTime nb ? nb : DateTime.MinValue;
             var notAfter = values.GetValueOrDefault(ColumnName.NotAfter) is DateTime na ? na : DateTime.MinValue;
-            var disposition = values.GetValueOrDefault(ColumnName.Disposition) is int disp ? disp : 0;
             var requester = values.GetValueOrDefault(ColumnName.RequesterName)?.ToString();
             var submitted = values.GetValueOrDefault(ColumnName.SubmittedWhen) is DateTime sw ? sw : DateTime.MinValue;
 
-            // SAN extraction and subject fallback from the certificate itself.
-            // ACME style CSRs often carry no subject DN, so the CA database
-            // subject columns are empty; the issued certificate is the
-            // authoritative source for both. SANs are optional: any decode
-            // failure keeps the row, just without them.
+            // One parse of the certificate blob the view already returned, for
+            // four things at once: the SAN list, the subject fallback, the
+            // cryptographic detail, and the DER itself for the single
+            // certificate download (issue #158). ACME style CSRs often carry no
+            // subject DN, so the CA database subject columns are empty and the
+            // issued certificate is the authoritative source. All of it is
+            // optional: any decode failure keeps the row, just without them.
             string? sans = null;
+            CertificateCryptoDetail? cryptoDetail = null;
+            byte[]? rawCertificate = null;
             if (values.GetValueOrDefault(ColumnName.RawCertificate) is string rawBase64 &&
                 !string.IsNullOrWhiteSpace(rawBase64))
             {
                 try
                 {
-                    var (certSubject, certSans) = ExtractSubjectAndSans(Convert.FromBase64String(rawBase64));
-                    sans = certSans;
-                    if (string.IsNullOrWhiteSpace(dn))
-                        dn = certSubject;
+                    var der = Convert.FromBase64String(rawBase64);
+                    var parsed = CertificateDerParser.Parse(der);
+                    if (parsed != null)
+                    {
+                        sans = parsed.SubjectAlternativeNames;
+                        cryptoDetail = parsed.Crypto;
+                        // Only bytes that decoded as a certificate are carried
+                        // forward, so nothing unparseable can reach the database
+                        // and later be handed to an admin as a download.
+                        rawCertificate = der;
+                        // Sanitized like every other candidate. This one is not
+                        // the safe fallback it looks like: it is the signed
+                        // subject as X509Certificate2 renders it, which passes
+                        // format characters through untouched, and it is reached
+                        // on every disposition rather than only issued ones.
+                        if (string.IsNullOrWhiteSpace(dn))
+                            dn = CertificateTextSanitizer.SanitizeSubject(parsed.Subject);
+                    }
                 }
                 catch (FormatException)
                 {
-                    // Not base64 on this build; leave SANs empty.
-                }
-                catch (CryptographicException)
-                {
-                    // Undecodable certificate blob; leave SANs empty.
+                    // Not base64 on this build; leave the parsed fields empty.
                 }
             }
 
@@ -929,17 +1143,12 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
             // activity feed (DashboardMetricsService.ExtractCn) and the
             // frontend inventory (extractCN) render a subject without "CN="
             // verbatim.
+            //
+            // Sanitized for its width rather than its characters: the SAN list is
+            // capped to the 2000 character SubjectAlternativeNames column, which is
+            // four times what Subject holds, so the first entry alone can overflow.
             if (string.IsNullOrWhiteSpace(dn) && !string.IsNullOrWhiteSpace(sans))
-                dn = FirstSanDisplayName(sans!);
-
-            var status = disposition switch
-            {
-                DbDisposition.Issued => CertificateStatus.Issued,
-                DbDisposition.Revoked => CertificateStatus.Revoked,
-                DbDisposition.Pending => CertificateStatus.Pending,
-                DbDisposition.Denied => CertificateStatus.Denied,
-                _ => CertificateStatus.Failed
-            };
+                dn = CertificateTextSanitizer.SanitizeSubject(FirstSanDisplayName(sans!));
 
             // Revocation metadata is meaningful only for revoked rows, and the
             // CA may surface sentinel values (a zero reason, a placeholder
@@ -956,10 +1165,33 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                 revokedReason = values.GetValueOrDefault(ColumnName.RevokedReason) is int rr ? rr : null;
             }
 
+            // The CA's own account of what happened to the request, gated on
+            // disposition for the same reason as the revocation fields above: an
+            // issued row carries "Issued" and a zero status code, which is noise
+            // rather than an explanation, and letting it through would leave a
+            // stale message behind when a pending request is finally approved.
+            // A zero StatusCode means success and never carries information.
+            string? dispositionMessage = null;
+            int? statusCode = null;
+            if (status is CertificateStatus.Pending
+                or CertificateStatus.Denied
+                or CertificateStatus.Failed)
+            {
+                dispositionMessage = CertificateTextSanitizer.SanitizeDispositionMessage(
+                    values.GetValueOrDefault(ColumnName.DispositionMessage)?.ToString());
+                statusCode = values.GetValueOrDefault(ColumnName.StatusCode) is int sc && sc != 0
+                    ? sc
+                    : null;
+            }
+
             return new CertificateInfo(
                 RequestId: requestId,
                 SerialNumber: serialNumber,
-                Subject: dn,
+                // Empty, never null, when no source carried a name. That is the
+                // established "nothing here" value: the sync tests for it with
+                // IsNullOrWhiteSpace to queue the row for the ACME backfill, and
+                // the Subject column is declared required.
+                Subject: dn ?? "",
                 SubjectAlternativeNames: sans,
                 TemplateName: template,
                 NotBefore: notBefore,
@@ -968,7 +1200,11 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                 Requestor: requester,
                 RequestDate: submitted,
                 RevokedWhen: revokedWhen,
-                RevokedReason: revokedReason);
+                RevokedReason: revokedReason,
+                CryptoDetail: cryptoDetail,
+                DispositionMessage: dispositionMessage,
+                StatusCode: statusCode,
+                RawCertificate: rawCertificate);
         }
         catch (Exception ex)
         {
@@ -976,6 +1212,22 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
             _logger.LogDebug(ex, "Skipping a CA row that could not be mapped to CertificateInfo");
             return null;
         }
+    }
+
+    /// <summary>
+    /// The first candidate that carries something, or null. The CA returns an
+    /// empty string as readily as a null for a column it has nothing for, so a
+    /// null coalescing chain would stop on the first empty string and never
+    /// reach the source that does hold the value.
+    /// </summary>
+    internal static string? FirstNonBlank(params string?[] candidates)
+    {
+        foreach (var candidate in candidates)
+        {
+            if (!string.IsNullOrWhiteSpace(candidate))
+                return candidate;
+        }
+        return null;
     }
 
     /// <summary>
@@ -989,36 +1241,6 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
         if (first.StartsWith("dns:", StringComparison.OrdinalIgnoreCase)) return first[4..];
         if (first.StartsWith("ip:", StringComparison.OrdinalIgnoreCase)) return first[3..];
         return first;
-    }
-
-    /// <summary>
-    /// Parses the subject DN and subject alternative names out of a DER
-    /// encoded certificate. SAN entries are formatted as "dns:name" and
-    /// "ip:address" joined with ", " to match the SyncedCertificate storage
-    /// format, capped to the entity's 2000 character column. Returns null SANs
-    /// when the certificate carries no SAN extension.
-    /// </summary>
-    internal static (string Subject, string? SubjectAlternativeNames) ExtractSubjectAndSans(byte[] der)
-    {
-        const int maxSanLength = 2000;
-
-        using var cert = new X509Certificate2(der);
-
-        string? sans = null;
-        var sanExtension = cert.Extensions.OfType<X509SubjectAlternativeNameExtension>().FirstOrDefault();
-        if (sanExtension != null)
-        {
-            var entries = sanExtension.EnumerateDnsNames().Select(d => $"dns:{d}")
-                .Concat(sanExtension.EnumerateIPAddresses().Select(ip => $"ip:{ip}"))
-                .ToList();
-            if (entries.Count > 0)
-            {
-                var joined = string.Join(", ", entries);
-                sans = joined.Length <= maxSanLength ? joined : joined[..maxSanLength];
-            }
-        }
-
-        return (cert.Subject, sans);
     }
 
     /// <summary>
@@ -1039,7 +1261,7 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
         var cms = new SignedCms();
         cms.Decode(pkcs7Bytes);
 
-        using var leaf = new X509Certificate2(leafDer);
+        using var leaf = X509CertificateLoader.LoadCertificate(leafDer);
 
         // Each X509Certificate2 pulled from the CMS holds a native cert context
         // handle, so dispose every one once the PEM is built (including the leaf

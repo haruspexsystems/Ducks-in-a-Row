@@ -28,7 +28,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
     if (this.state.error) {
       return (
         <div className="min-h-screen bg-[#F6F7F9] p-6">
-          <div className="mx-auto max-w-2xl rounded-lg border border-red-200 bg-red-50 p-6 text-red-700">
+          <div className="mx-auto max-w-2xl rounded-lg border border-red-200 dark:border-red-500/30 bg-red-50 dark:bg-red-500/10 p-6 text-red-700 dark:text-red-300">
             <h1 className="mb-1 text-lg font-semibold">Something went wrong</h1>
             <p className="text-sm">
               The dashboard hit an unexpected error and could not render this view. Reload the page to try again.

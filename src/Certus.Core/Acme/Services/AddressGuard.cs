@@ -60,6 +60,8 @@ public sealed class AddressGuard
             return true;
         if (_options.BlockUniqueLocalIpv6 && IsUniqueLocalIpv6(ip))
             return true;
+        if (_options.BlockPrivateRanges && IsPrivateIpv4(ip))
+            return true;
 
         foreach (var (network, prefixLength) in _blockedCidrs)
         {
@@ -115,6 +117,16 @@ public sealed class AddressGuard
             return false;
         var bytes = ip.GetAddressBytes();
         return (bytes[0] & 0xFE) == 0xFC; // fc00::/7
+    }
+
+    private static bool IsPrivateIpv4(IPAddress ip)
+    {
+        if (ip.AddressFamily != AddressFamily.InterNetwork)
+            return false;
+        var bytes = ip.GetAddressBytes();
+        return bytes[0] == 10                                // 10.0.0.0/8
+            || (bytes[0] == 172 && (bytes[1] & 0xF0) == 16)  // 172.16.0.0/12
+            || (bytes[0] == 192 && bytes[1] == 168);         // 192.168.0.0/16
     }
 
     private static List<(byte[] Network, int PrefixLength)> ParseCidrs(string[] cidrs)

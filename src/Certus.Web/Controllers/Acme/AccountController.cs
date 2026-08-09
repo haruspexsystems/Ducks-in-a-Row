@@ -3,6 +3,7 @@ using System.Threading.RateLimiting;
 using Certus.Core.Acme.Crypto;
 using Certus.Core.Acme.Models;
 using Certus.Core.Acme.Services;
+using Certus.Core.Data.Entities;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 
@@ -20,19 +21,28 @@ public sealed class AccountController : AcmeControllerBase
     private readonly NonceService _nonceService;
     private readonly JwsService _jwsService;
     private readonly TemplateService _templateService;
+    private readonly EabEnforcementPolicy _eabPolicy;
+    private readonly EabCredentialService _eabCredentials;
+    private readonly ILogger<AccountController> _logger;
 
     public AccountController(
         AccountService accountService,
         OrderService orderService,
         NonceService nonceService,
         JwsService jwsService,
-        TemplateService templateService)
+        TemplateService templateService,
+        EabEnforcementPolicy eabPolicy,
+        EabCredentialService eabCredentials,
+        ILogger<AccountController> logger)
     {
         _accountService = accountService;
         _orderService = orderService;
         _nonceService = nonceService;
         _jwsService = jwsService;
         _templateService = templateService;
+        _eabPolicy = eabPolicy;
+        _eabCredentials = eabCredentials;
+        _logger = logger;
     }
 
     /// <summary>
@@ -47,8 +57,8 @@ public sealed class AccountController : AcmeControllerBase
         CancellationToken cancellationToken)
     {
         // 1. Validate template: it must exist and be enabled for ACME (issue #85).
-        var resolution = await _templateService.ResolveAsync(template, cancellationToken);
-        var templateError = TemplateAccessError(resolution, template);
+        var (_, templateError) = await ResolveTemplateAsync(
+            _templateService, template, cancellationToken);
         if (templateError != null)
             return templateError;
 
@@ -145,12 +155,122 @@ public sealed class AccountController : AcmeControllerBase
             return Ok(AccountService.ToResponse(existing, AcmeUrl, template));
         }
 
+        // 8b. External account binding (RFC 8555 §7.3.4). Only requests that
+        // could register or bind are checked: the onlyReturnExisting path
+        // above is the read path and keeps working for existing clients in
+        // every mode; that is the grandfathering contract.
+        var eabMode = _eabPolicy.Mode;
+        EabCredential? eabCredential = null;
+        string? eabJwsJson = null;
+
+        // An explicit JSON null reads as absent, so a client library that
+        // always emits the member does not get treated as presenting one.
+        var providedEab = request.ExternalAccountBinding;
+        if (providedEab.HasValue &&
+            (providedEab.Value.ValueKind == JsonValueKind.Null
+             || providedEab.Value.ValueKind == JsonValueKind.Undefined))
+        {
+            providedEab = null;
+        }
+
+        if (providedEab == null)
+        {
+            // Required applies to registration, not to a re-POST from a key
+            // that already has an account: RFC 8555 §7.3 returns the existing
+            // account for a known key, and clients like certbot and
+            // cert-manager re-run plain registration routinely. Refusing
+            // those would cut grandfathered accounts off from their own
+            // account URL, breaking the grandfathering contract.
+            if (eabMode == EabEnforcementMode.Required &&
+                await _accountService.FindByThumbprintAsync(
+                    validation.JwkJson!, cancellationToken) == null)
+            {
+                return AcmeError(400, AcmeErrorType.ExternalAccountRequired,
+                    "This server requires external account binding. Register with the " +
+                    "key identifier and MAC key issued by your administrator.");
+            }
+        }
+        else if (eabMode == EabEnforcementMode.Off)
+        {
+            // The machinery is off: ignore a stale binding rather than fail
+            // clients still configured with one after the server stopped
+            // requiring it.
+            _logger.LogDebug(
+                "Ignoring externalAccountBinding on new-account while EAB enforcement is off");
+        }
+        else
+        {
+            // Optional or Required: a presented binding is always verified,
+            // and an invalid one always fails the request. Falling through to
+            // an unbound registration would silently drop the attribution the
+            // client asked for.
+            var eabElement = providedEab.Value;
+            var verification = await _eabCredentials.VerifyBindingAsync(
+                validation.JwkJson!, expectedUrl, eabElement, cancellationToken);
+
+            switch (verification.Outcome)
+            {
+                case EabVerificationOutcome.Verified:
+                    eabCredential = verification.Credential;
+                    eabJwsJson = eabElement.GetRawText();
+                    break;
+
+                case EabVerificationOutcome.UnsupportedAlgorithm:
+                    // RFC 8555 §6.2: badSignatureAlgorithm problems SHOULD
+                    // list the algorithms the server accepts.
+                    return AcmeError(400, AcmeErrorType.BadSignatureAlgorithm,
+                        verification.Detail ?? "Unsupported externalAccountBinding algorithm.",
+                        JwsService.SupportedMacAlgorithms);
+
+                case EabVerificationOutcome.Unauthorized:
+                    return AcmeError(403, AcmeErrorType.Unauthorized,
+                        verification.Detail ?? "External account binding verification failed.");
+
+                default:
+                    return AcmeError(400, AcmeErrorType.Malformed,
+                        verification.Detail ?? "Invalid externalAccountBinding.");
+            }
+        }
+
         // 9. Create (or find existing) account
         var (account, alreadyExists) = await _accountService.CreateAccountAsync(
-            validation.JwkJson!, request, cancellationToken);
+            validation.JwkJson!, request, eabCredential?.Id, eabJwsJson, cancellationToken);
 
         if (account == null)
             return AcmeError(500, AcmeErrorType.ServerInternal, "Failed to create account.");
+
+        // 9b. The bind and rebind rules when the account already existed
+        // (RFC 8555 §7.3 returns the existing account for a known key): an
+        // unbound account with a verified binding adopts it, the deliberate
+        // migration path for grandfathered accounts; the same credential
+        // again is an idempotent retry; a different credential never silently
+        // swaps the stored binding, because that would rewrite the account's
+        // attribution. A non valid account is never mutated: deactivation is
+        // terminal (RFC 8555 §7.3.6), so a re-registration must not bind it
+        // to a credential and surface it as a working bound account.
+        if (alreadyExists && eabCredential != null)
+        {
+            if (account.Status != "valid")
+            {
+                _logger.LogWarning(
+                    "new-account for existing account {AccountId} presented EAB credential " +
+                    "{KeyId}, but the account is {Status}; not binding",
+                    account.AccountId, eabCredential.KeyId, account.Status);
+            }
+            else if (account.ExternalAccountCredentialId == null)
+            {
+                await _accountService.BindAsync(
+                    account, eabCredential.Id, eabJwsJson!, cancellationToken);
+            }
+            else if (account.ExternalAccountCredentialId != eabCredential.Id)
+            {
+                _logger.LogWarning(
+                    "new-account for existing account {AccountId} presented EAB credential " +
+                    "{KeyId}, but the account is bound to a different credential; keeping " +
+                    "the original binding",
+                    account.AccountId, eabCredential.KeyId);
+            }
+        }
 
         var location = AcmeUrl($"/acme/{template}/acct/{account.AccountId}");
         Response.Headers["Location"] = location;

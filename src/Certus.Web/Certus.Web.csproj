@@ -16,7 +16,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Certus.Core\Certus.Core.csproj" />
-    <!-- Note: Certus.Adcs is NOT referenced here because it targets net8.0-windows.
+    <!-- Note: Certus.Adcs is NOT referenced here because it targets net10.0-windows.
          The concrete AdcsClient is registered in DI by Certus.Service (the production host).
          Certus.Web programs against IAdcsClient from Certus.Core only. -->
   </ItemGroup>

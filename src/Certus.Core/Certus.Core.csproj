@@ -6,16 +6,28 @@
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
     </PackageReference>
+    <!-- Direct reference exists only to lift the transitive native SQLite above
+         the advisory floor; see the comment in Directory.Packages.props. -->
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" />
     <PackageReference Include="BouncyCastle.Cryptography" />
     <PackageReference Include="DnsClient" />
+    <PackageReference Include="System.Formats.Cbor" />
+    <PackageReference Include="Microsoft.AspNetCore.DataProtection.Abstractions" />
     <PackageReference Include="MailKit" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Json" />
-    <PackageReference Include="Microsoft.Win32.Registry" />
     <PackageReference Include="Serilog.AspNetCore" />
   </ItemGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="Certus.Core.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The pinned Apple attestation root. AppleAttestationVerifier checks its
+         SHA-256 against AppleAttestationOids.RootSha256Fingerprint at load and
+         refuses to construct on mismatch. -->
+    <EmbeddedResource Include="Acme\Attestation\AppleEnterpriseAttestationRootCa.pem"
+                      LogicalName="Certus.Core.Acme.Attestation.AppleEnterpriseAttestationRootCa.pem" />
   </ItemGroup>
 
 </Project>
