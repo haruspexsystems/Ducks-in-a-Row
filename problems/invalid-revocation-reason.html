@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Invalid revocation reason | Ducks in a Row</title>
+<meta name="description" content="Ducks in a Row problem type invalid-revocation-reason: Invalid revocation reason.">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+<header><a class="home" href="/">Ducks in a Row</a></header>
+<main>
+<h1>Invalid revocation reason</h1>
+<p class="meta">HTTP 400 Bad Request<br><code>https://ducksinarow.dev/problems/invalid-revocation-reason</code></p>
+<h2>What it means</h2>
+<p>A revocation must carry one of the RFC 5280 reason codes 0 to 6:
+unspecified (0), key compromise (1), CA compromise (2), affiliation changed (3),
+superseded (4), cessation of operation (5) or certificate hold (6). The request
+carried something else, so nothing was sent to the CA.</p>
+<h2>What to do</h2>
+<p>Choose one of the reasons the revoke dialog offers. A script calling the dashboard
+API directly must send one of the codes above.</p>
+<p class="meta"><a href="/problems/">All problem types</a></p>
+</main>
+<footer>
+  <p>&copy; 2026 Haruspex Systems B.V., Zevenaar, the Netherlands. KVK 42142878.</p>
+  <p>&ldquo;Ducks in a Row&rdquo; is a trademark of Haruspex Systems B.V.</p>
+  <p>Licensing: <a href="mailto:licensing@haruspex.systems">licensing@haruspex.systems</a>.
+     Security: <a href="mailto:security@haruspex.systems">security@haruspex.systems</a>.</p>
+  <p>This site sets no cookies and runs no scripts.</p>
+</footer>
+</body>
+</html>

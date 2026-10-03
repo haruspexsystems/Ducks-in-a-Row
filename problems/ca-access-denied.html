@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CA access denied | Ducks in a Row</title>
+<meta name="description" content="Ducks in a Row problem type ca-access-denied: CA access denied.">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+<header><a class="home" href="/">Ducks in a Row</a></header>
+<main>
+<h1>CA access denied</h1>
+<p class="meta">HTTP 503 Service Unavailable<br><code>https://ducksinarow.dev/problems/ca-access-denied</code></p>
+<h2>What it means</h2>
+<p>The certification authority refused the Ducks in a Row service's own account for
+the operation you asked for. The response detail names the right that is missing and
+the operation that needs it: revoking a certificate needs <strong>Issue and Manage
+Certificates</strong> on the CA, and reading the certificate inventory needs
+<strong>Read</strong>.</p>
+<p>The rights belong to the computer account of the server that runs Ducks in a Row,
+not to you at the browser.</p>
+<h2>What to do</h2>
+<p>If you want the operation to work, grant the named right to the server's computer
+account in the Certification Authority console (CA Properties, Security), then try
+again. The Settings page card <em>Service rights on the CA</em> shows what the account
+holds.</p>
+<p>If you do not want the dashboard to revoke certificates, leave the right ungranted.
+Everything else keeps working.</p>
+<p class="meta"><a href="/problems/">All problem types</a></p>
+</main>
+<footer>
+  <p>&copy; 2026 Haruspex Systems B.V., Zevenaar, the Netherlands. KVK 42142878.</p>
+  <p>&ldquo;Ducks in a Row&rdquo; is a trademark of Haruspex Systems B.V.</p>
+  <p>Licensing: <a href="mailto:licensing@haruspex.systems">licensing@haruspex.systems</a>.
+     Security: <a href="mailto:security@haruspex.systems">security@haruspex.systems</a>.</p>
+  <p>This site sets no cookies and runs no scripts.</p>
+</footer>
+</body>
+</html>

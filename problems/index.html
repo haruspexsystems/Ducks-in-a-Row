@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Problem types | Ducks in a Row</title>
+<meta name="description" content="The problem types the Ducks in a Row dashboard returns, and what each one means.">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+<header><a class="home" href="/">Ducks in a Row</a></header>
+<main>
+<h1>Problem types</h1>
+<p>When the Ducks in a Row dashboard refuses a request, its answer is an RFC 9457
+problem document whose <code>type</code> is one of the addresses below. Each page says
+what the problem means and what to do about it.</p>
+<ul class="types">
+  <li><a href="/problems/ca-access-denied"><code>ca-access-denied</code></a>: CA access denied</li>
+  <li><a href="/problems/ca-error"><code>ca-error</code></a>: Certificate Authority error</li>
+  <li><a href="/problems/ca-unavailable"><code>ca-unavailable</code></a>: Certificate Authority is unavailable</li>
+  <li><a href="/problems/certificate-already-revoked"><code>certificate-already-revoked</code></a>: Certificate is already revoked</li>
+  <li><a href="/problems/certificate-not-revocable"><code>certificate-not-revocable</code></a>: Nothing to revoke</li>
+  <li><a href="/problems/certificate-unavailable"><code>certificate-unavailable</code></a>: No certificate to download</li>
+  <li><a href="/problems/invalid-revocation-reason"><code>invalid-revocation-reason</code></a>: Invalid revocation reason</li>
+  <li><a href="/problems/revocation-blocked-by-guardrail"><code>revocation-blocked-by-guardrail</code></a>: Blocked by the TLS certificate guardrail</li>
+  <li><a href="/problems/revocation-out-of-scope"><code>revocation-out-of-scope</code></a>: Outside the configured revocation scope</li>
+  <li><a href="/problems/revocation-target-mismatch"><code>revocation-target-mismatch</code></a>: Confirmation does not match this certificate</li>
+</ul>
+<p class="meta">ACME errors are not listed here. They carry the standard
+<code>urn:ietf:params:acme:error:</code> types from RFC 8555.</p>
+</main>
+<footer>
+  <p>&copy; 2026 Haruspex Systems B.V., Zevenaar, the Netherlands. KVK 42142878.</p>
+  <p>&ldquo;Ducks in a Row&rdquo; is a trademark of Haruspex Systems B.V.</p>
+  <p>Licensing: <a href="mailto:licensing@haruspex.systems">licensing@haruspex.systems</a>.
+     Security: <a href="mailto:security@haruspex.systems">security@haruspex.systems</a>.</p>
+  <p>This site sets no cookies and runs no scripts.</p>
+</footer>
+</body>
+</html>
