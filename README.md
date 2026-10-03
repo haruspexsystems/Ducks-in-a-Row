@@ -24,6 +24,7 @@ what is served.
 | Path | What it is |
 | --- | --- |
 | `index.html` | The home page |
+| `privacy.html` | The privacy notice, served at `/privacy` and linked from every footer |
 | `problems/index.html` | The list of problem types |
 | `problems/<slug>.html` | One page per problem type, served at `/problems/<slug>` |
 | `404.html` | Served by GitHub Pages for any address with no page |
