@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Certificate Authority is unavailable | Ducks in a Row</title>
+<meta name="description" content="Ducks in a Row problem type ca-unavailable: Certificate Authority is unavailable.">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+<header><a class="home" href="/">Ducks in a Row</a></header>
+<main>
+<h1>Certificate Authority is unavailable</h1>
+<p class="meta">HTTP 503 Service Unavailable<br><code>https://ducksinarow.dev/problems/ca-unavailable</code></p>
+<h2>What it means</h2>
+<p>Ducks in a Row could not reach the ADCS certification authority, so nothing was
+done. If you asked for a revocation, the certificate was <strong>not</strong>
+revoked.</p>
+<p>A fresh installation answers this for every CA operation until the setup wizard has
+connected a CA.</p>
+<h2>What to do</h2>
+<p>Check that the Certificate Services service is running on the CA and that the
+Ducks in a Row server can reach it, then try again shortly. The troubleshooting guide
+covers both the
+<a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/troubleshooting.md#ca-operations-answer-503-or-the-dashboard-sends-me-to-the-setup-wizard">unconfigured
+case</a> and a <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/troubleshooting.md#health-is-degraded-ca-not-reachable">CA that stopped
+answering</a>.</p>
+<p class="meta"><a href="/problems/">All problem types</a></p>
+</main>
+<footer>
+  <p>&copy; 2026 Haruspex Systems B.V., Zevenaar, the Netherlands. KVK 42142878.</p>
+  <p>&ldquo;Ducks in a Row&rdquo; is a trademark of Haruspex Systems B.V.</p>
+  <p>Licensing: <a href="mailto:licensing@haruspex.systems">licensing@haruspex.systems</a>.
+     Security: <a href="mailto:security@haruspex.systems">security@haruspex.systems</a>.</p>
+  <p>This site sets no cookies and runs no scripts.</p>
+</footer>
+</body>
+</html>

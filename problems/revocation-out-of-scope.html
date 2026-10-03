@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Outside the configured revocation scope | Ducks in a Row</title>
+<meta name="description" content="Ducks in a Row problem type revocation-out-of-scope: Outside the configured revocation scope.">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+<header><a class="home" href="/">Ducks in a Row</a></header>
+<main>
+<h1>Outside the configured revocation scope</h1>
+<p class="meta">HTTP 403 Forbidden<br><code>https://ducksinarow.dev/problems/revocation-out-of-scope</code></p>
+<h2>What it means</h2>
+<p>The certificate passed the TLS guardrail, but the revocation scope set on the
+Settings page does not cover it. The default scope covers certificates Ducks in a Row
+obtained plus anything on a template enabled for ACME; a custom scope covers only the
+templates it lists.</p>
+<h2>What to do</h2>
+<p>Widen the scope on the Settings page if this certificate should be in reach, or
+revoke it at the CA in the Certification Authority console.</p>
+<p>An ACME client revoking its own certificate is not subject to the scope.</p>
+<p class="meta"><a href="/problems/">All problem types</a></p>
+</main>
+<footer>
+  <p>&copy; 2026 Haruspex Systems B.V., Zevenaar, the Netherlands. KVK 42142878.</p>
+  <p>&ldquo;Ducks in a Row&rdquo; is a trademark of Haruspex Systems B.V.</p>
+  <p>Licensing: <a href="mailto:licensing@haruspex.systems">licensing@haruspex.systems</a>.
+     Security: <a href="mailto:security@haruspex.systems">security@haruspex.systems</a>.</p>
+  <p>This site sets no cookies and runs no scripts.</p>
+</footer>
+</body>
+</html>

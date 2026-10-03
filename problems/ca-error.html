@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Certificate Authority error | Ducks in a Row</title>
+<meta name="description" content="Ducks in a Row problem type ca-error: Certificate Authority error.">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+<header><a class="home" href="/">Ducks in a Row</a></header>
+<main>
+<h1>Certificate Authority error</h1>
+<p class="meta">HTTP 500 Internal Server Error or 503 Service Unavailable<br><code>https://ducksinarow.dev/problems/ca-error</code></p>
+<h2>What it means</h2>
+<p>The certification authority refused or failed an operation, and Ducks in a Row
+could not put a more precise name to it. A revocation the CA refused answers 500;
+an unexpected failure while syncing the inventory or reading the template list
+answers 503.</p>
+<h2>What to do</h2>
+<p>After a refused revocation the inventory has already been refreshed, so check the
+certificate's current status first: the CA may have revoked it anyway, or may hold it
+under a different status. The service log on the Ducks in a Row server
+(<code>C:\ProgramData\Ducks in a Row\logs\ducks-&lt;date&gt;.log</code>) records the
+CA's own answer. Then try again.</p>
+<p class="meta"><a href="/problems/">All problem types</a></p>
+</main>
+<footer>
+  <p>&copy; 2026 Haruspex Systems B.V., Zevenaar, the Netherlands. KVK 42142878.</p>
+  <p>&ldquo;Ducks in a Row&rdquo; is a trademark of Haruspex Systems B.V.</p>
+  <p>Licensing: <a href="mailto:licensing@haruspex.systems">licensing@haruspex.systems</a>.
+     Security: <a href="mailto:security@haruspex.systems">security@haruspex.systems</a>.</p>
+  <p>This site sets no cookies and runs no scripts.</p>
+</footer>
+</body>
+</html>
