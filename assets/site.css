@@ -68,6 +68,48 @@ code {
 ul.types { padding-left: 1.25rem; }
 ul.types li { margin-bottom: 0.4rem; }
 
+/* The sign-up form on /download. */
+form.signup { margin: 1.5rem 0 2rem; }
+
+form.signup label { display: block; font-weight: 600; margin-bottom: 0.3rem; }
+
+form.signup input[type="email"] {
+  width: 100%;
+  max-width: 28rem;
+  padding: 0.5rem 0.65rem;
+  font: inherit;
+  color: var(--ink);
+  background: var(--bg);
+  border: 1px solid var(--ink-soft);
+  border-radius: 4px;
+}
+
+form.signup .note { color: var(--ink-soft); font-size: 0.95rem; }
+
+form.signup .choice { display: flex; gap: 0.6rem; align-items: flex-start; }
+form.signup .choice input { flex: none; width: 1.1rem; height: 1.1rem; margin: 0.3rem 0 0; }
+form.signup .choice label { font-weight: 400; margin: 0; }
+
+form.signup button {
+  padding: 0.55rem 1.1rem;
+  font: inherit;
+  font-weight: 600;
+  color: var(--bg);
+  background: var(--accent);
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+form.signup input:focus-visible,
+form.signup button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The bot trap: hidden from people and screen readers, filled only by bots. */
+form.signup .trap { display: none; }
+
 footer {
   margin-top: 3rem;
   padding-top: 1rem;
