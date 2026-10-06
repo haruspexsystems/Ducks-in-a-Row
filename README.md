@@ -18,6 +18,11 @@ what is served.
   the list server redirects to `next` only when it matches a URL in its Trusted
   URLs setting exactly. Change any of them on both sides together.
 - **No prices.** Pricing is shared on request, not published.
+- **Claims follow the release.** Every claim on the home page is true of the latest public
+  release, never of the roadmap. The support period sentence is the one in the product's
+  `SECURITY.md`, word for word: change both together.
+- **`/thanks` links `releases/latest`.** That is right from 1.0.0 on, the first release that
+  is not a prerelease. Before it, `releases/latest` led only to the releases list.
 - **`/problems/<slug>` is a contract.** Every Ducks in a Row release from 1.0.0
   on names these addresses as the `type` of the problem documents its dashboard
   returns, so a page may be reworded or restyled but never renamed or removed. A
@@ -27,7 +32,7 @@ what is served.
 
 | Path | What it is |
 | --- | --- |
-| `index.html` | The home page |
+| `index.html` | The home page, the product page that launch posts link to |
 | `download.html` | The download page: the sign-up form for the security list, with the newsletter as an unticked option |
 | `thanks.html` | Where the list server sends people after they sign up; it holds the download link and is not indexed |
 | `privacy.html` | The privacy notice, served at `/privacy` and linked from every footer |
@@ -35,6 +40,9 @@ what is served.
 | `problems/<slug>.html` | One page per problem type, served at `/problems/<slug>` |
 | `404.html` | Served by GitHub Pages for any address with no page |
 | `assets/site.css` | The only stylesheet |
+| `assets/duck-128.png`, `assets/duck-256.png` | The mascot on the home page, at 1x and 2x |
+| `assets/og-image.png` | The 1200 by 630 picture link previews show, named by the home page's `og:image` |
+| `favicon.ico`, `apple-touch-icon.png` | The site icons; browsers fetch both from the root on every page, so no page links them |
 | `.nojekyll` | Tells GitHub Pages to serve the files as they are |
 | `CNAME` | Written by GitHub when the custom domain is set; do not edit |
 

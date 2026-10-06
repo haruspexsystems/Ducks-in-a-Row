@@ -3,24 +3,146 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ducks in a Row</title>
-<meta name="description" content="Ducks in a Row: ACME certificate automation and expiry alerts for Microsoft ADCS.">
+<title>Ducks in a Row: ACME and expiry alerts for Microsoft ADCS</title>
+<meta name="description" content="One Windows service in front of the ADCS certificate authority you already run. Machines renew their own certificates over ACME, and expiry alerts cover your CA's inventory and every CRL in its chain. No telemetry, ever.">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Ducks in a Row">
+<meta property="og:title" content="Ducks in a Row: ACME and expiry alerts for Microsoft ADCS">
+<meta property="og:description" content="One Windows service in front of the ADCS certificate authority you already run. Machines renew their own certificates over ACME, and expiry alerts cover your CA's inventory and every CRL in its chain. No telemetry, ever.">
+<meta property="og:url" content="https://ducksinarow.dev/">
+<meta property="og:image" content="https://ducksinarow.dev/assets/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="The Ducks in a Row mascot, a winking yellow duck in a knight's helmet.">
+<meta name="twitter:card" content="summary_large_image">
 <link rel="stylesheet" href="/assets/site.css">
 </head>
 <body>
 <header><a class="home" href="/">Ducks in a Row</a></header>
 <main>
-<h1>Ducks in a Row</h1>
-<p class="lead">One Windows service in front of the ADCS certificate authority you already
-run. Your machines request and renew their own certificates from it with a standard
-ACME client, and it warns you before anything in your CA's inventory expires.</p>
-<p>Nothing phones home. Ever.</p>
-<h2>Get it</h2>
-<ul>
-  <li><a href="/download">Download a release</a></li>
-  <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row#readme">Read the documentation and the source</a></li>
+<section class="hero">
+  <img class="mascot" src="/assets/duck-128.png" srcset="/assets/duck-128.png 1x, /assets/duck-256.png 2x" width="128" height="128" alt="">
+  <div>
+    <h1>Ducks in a Row</h1>
+    <p class="lead">If you run Active Directory Certificate Services (ADCS) with a small team,
+    certificate renewals tend to live in scripts and calendar reminders.</p>
+  </div>
+</section>
+<p>Ducks in a Row is one Windows service in front of the ADCS certificate authority you
+already run. Your machines, domain joined or not, request and renew their own certificates
+from it with a standard ACME client.</p>
+<p class="cta">
+  <a class="primary" href="/download">Download</a>
+  <a class="secondary" href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/README.md">Read the documentation</a>
+</p>
+
+<h2>What you get</h2>
+<ul class="features">
+  <li><strong>Expiry alerts, free.</strong> Email and webhook alerts for every certificate in
+  your CA's inventory.</li>
+  <li><strong>Pull, not push.</strong> Each machine asks for its own certificate, so no
+  credentials for your servers are stored anywhere and Ducks in a Row needs no rights on
+  them.</li>
+  <li><strong>One scoped credential per team.</strong> You set the names a team may request
+  with an external account binding credential, and the team serves itself within them.</li>
+  <li><strong>Your trust chain stays as it is.</strong> Certificates come from the ADCS you
+  already run and chain to the root you already trust.</li>
+  <li><strong>Rights checked before first use.</strong> The setup wizard proves what it can of
+  the service's rights on your CA, and says plainly what it cannot.</li>
+  <li><strong>Kubernetes too.</strong> cert-manager's built in ACME issuer works with it, with
+  no plugin in the cluster. The
+  <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/kubernetes.md">Kubernetes
+  chapter</a> says which parts our tests have run.</li>
+  <li><strong>Signed installers.</strong> Both installers, and every binary the MSI installs,
+  are code signed by Haruspex Systems B.V. and timestamped. Windows SmartScreen may still warn
+  about a new release while the certificate builds a reputation, so
+  <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/installation.md#check-the-download">check
+  the download</a> before you run it. Every release also carries a software bill of
+  materials.</li>
 </ul>
-<p class="meta">A fuller page is on its way.</p>
+
+<h2>The CRL nobody has in a calendar</h2>
+<p>A certificate that expires breaks one service. A certificate revocation list that expires
+breaks revocation checking for everything its CA ever signed, all at once, and for an offline
+root nothing automatic replaces it.</p>
+<p>Ducks in a Row watches every CRL in the chain of the CA you connect it to, the offline
+root's included. It reads them from the CA itself and from the distribution points over LDAP
+and HTTP, and it watches each copy separately: a root CRL renewed into the directory but never
+copied to the web server is reported, with the location named.</p>
+<p>A CRL published by hand gets warnings 30, 14, 7 and 1 days before it expires, by default.
+A CRL your CA replaces on a timer stays quiet unless the CA misses its own schedule, and warns
+again if it expires. The warnings go out by email and webhook, like certificate expiry, and
+they are part of the free core.</p>
+
+<h2>No telemetry. Ever.</h2>
+<p>Ducks in a Row runs entirely on your own servers and never sends data back to us or to
+anyone else. Fonts and other assets are bundled with the app, so the dashboard makes no
+third party requests. A tool that sits in front of your certificate authority should not be
+watching you, and this one does not.</p>
+
+<h2>Tiers</h2>
+<ul class="tiers">
+  <li>
+    <h3>Free</h3>
+    <p>The core, free in production on infrastructure you own or operate, or administer for
+    customers as part of a managed IT service. One CA, the dashboard and alerting, CRL
+    monitoring, all four ACME challenge types, external account binding, the setup wizard and
+    the signed installer.</p>
+    <p>No limit on certificates. Community support.</p>
+  </li>
+  <li>
+    <h3>Standard</h3>
+    <p>For estates that grow past one CA, with the first paid modules.</p>
+    <p>Support by email, best effort.</p>
+  </li>
+  <li>
+    <h3>Compliance</h3>
+    <p>For regulated organisations that need audit evidence and stronger controls.</p>
+    <p>The support subscription is included.</p>
+  </li>
+</ul>
+<p>The paid tiers are being shaped with our first customers, so what they hold is a
+direction, not yet a commitment. Paid modules are closed source and install beside the core,
+and nothing in the core moves behind them.</p>
+<p class="cta"><a class="secondary" href="mailto:licensing@haruspex.systems?subject=Early%20access%20pricing">Early access pricing: ask us</a></p>
+
+<h2>Support</h2>
+<p>Community help is free in
+<a href="https://github.com/haruspexsystems/Ducks-in-a-Row/discussions">GitHub Discussions</a>.
+A support subscription gives your organisation a first reply from a person by the end of the
+next business day, as a response target with no penalties. It is available on Free and
+Standard, and included in Compliance; ask
+<a href="mailto:licensing@haruspex.systems">licensing@haruspex.systems</a>. The
+<a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/SUPPORT.md">support
+page</a> has the details.</p>
+
+<h2>Security fixes</h2>
+<p>Ducks in a Row receives security fixes until 31 December 2031, at least five years after
+1.0.0 became generally available, delivered through upgrades to the latest release, with no
+backports.</p>
+<p>Security fixes are free to everyone, with or without a subscription. The address you give
+on the <a href="/download">download page</a> is how we tell you about each one. Report a
+vulnerability to <a href="mailto:security@haruspex.systems">security@haruspex.systems</a>, as
+the <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/SECURITY.md">security
+policy</a> describes.</p>
+
+<h2>License</h2>
+<p>Ducks in a Row is published under the Business Source License 1.1. It is source available
+and free in production on infrastructure you own or operate, or administer for customers as
+part of a managed IT service. Each version of the core becomes Apache License 2.0 four years
+after its release. Reselling it, or hosting it as a competing product, needs a commercial
+license. <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/LICENSING.md">Licensing
+in plain language</a>.</p>
+
+<h2>Contact</h2>
+<ul>
+  <li>Early access, support subscriptions and licensing:
+  <a href="mailto:licensing@haruspex.systems">licensing@haruspex.systems</a></li>
+  <li>Feedback and ideas: <a href="mailto:feedback@haruspex.systems">feedback@haruspex.systems</a></li>
+  <li>Security reports: <a href="mailto:security@haruspex.systems">security@haruspex.systems</a></li>
+  <li>Questions and help:
+  <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/discussions">GitHub Discussions</a></li>
+</ul>
 </main>
 <footer>
   <p>&copy; 2026 Haruspex Systems B.V., Zevenaar, the Netherlands. KVK 42142878.</p>
