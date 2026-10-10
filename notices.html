@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Security notices | Ducks in a Row</title>
+<meta name="description" content="Sign up to hear when a Ducks in a Row release fixes a vulnerability: what is affected, and which release fixes it.">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+<header><a class="home" href="/">Ducks in a Row</a></header>
+<main>
+<h1>Security notices</h1>
+<p class="lead">Ducks in a Row sends us nothing, so we can only tell you about a security fix
+if you ask. Leave your email address, and we write when a release fixes a vulnerability.</p>
+
+<!-- A plain form, no script, the same as the one on /download but with its own redirect.
+     It posts to our own list server (listmonk), which adds the address to the security
+     list, sends the confirmation email, then redirects to /subscribed. listmonk redirects
+     only to a URL listed exactly in its Trusted URLs setting, and the two list values are
+     the lists' UUIDs there: change neither here alone. Releases from 1.1.0 on link this
+     page from the product, so it may be reworded but never renamed or removed. -->
+<form class="signup" method="post" action="https://lists.ducksinarow.dev/subscription/form">
+  <input type="hidden" name="l" value="ea06d9e7-a54b-4deb-87b2-b49994995ff5">
+  <input type="hidden" name="next" value="https://ducksinarow.dev/subscribed">
+  <p>
+    <label for="email">Email address</label>
+    <input id="email" name="email" type="email" required maxlength="254" autocomplete="email" aria-describedby="email-use">
+  </p>
+  <p id="email-use" class="note">We use this address for security notices: what is affected
+  and which release fixes it. Nothing else, unless you tick the newsletter below.
+  <strong>You can object or unsubscribe at any time.</strong></p>
+  <!-- A trap for bots: listmonk refuses any sign-up that fills this field. -->
+  <div class="trap">
+    <label for="nonce">Leave this field empty</label>
+    <input id="nonce" name="nonce" type="text" tabindex="-1" autocomplete="off">
+  </div>
+  <p class="choice">
+    <input id="newsletter" name="l" type="checkbox" value="e61300fb-dc69-494d-a4bd-032f8f8c6fc4">
+    <label for="newsletter">Also send me the newsletter: release news and the occasional
+    survey. Optional, and you can unsubscribe at any time.</label>
+  </p>
+  <p><button type="submit">Sign me up</button></p>
+</form>
+
+<p class="meta">We send you an email to confirm the address before any notice. The
+<a href="/privacy">privacy notice</a> explains what we keep, and why.</p>
+<p class="meta">Rather not give an address? Watch the repository's
+<a href="https://github.com/haruspexsystems/Ducks-in-a-Row/security/advisories">security
+advisories</a> on GitHub instead.</p>
+</main>
+<footer>
+  <p>&copy; 2026 Haruspex Systems B.V., Zevenaar, the Netherlands. KVK 42142878.</p>
+  <p>&ldquo;Ducks in a Row&rdquo; is a trademark of Haruspex Systems B.V.</p>
+  <p>Licensing: <a href="mailto:licensing@haruspex.systems">licensing@haruspex.systems</a>.
+     Security: <a href="mailto:security@haruspex.systems">security@haruspex.systems</a>.</p>
+  <p>This site sets no cookies and runs no scripts. <a href="/privacy">Privacy notice</a>.</p>
+</footer>
+</body>
+</html>
