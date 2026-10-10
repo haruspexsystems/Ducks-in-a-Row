@@ -110,6 +110,91 @@ form.signup button:focus-visible {
 /* The bot trap: hidden from people and screen readers, filled only by bots. */
 form.signup .trap { display: none; }
 
+/* The home page. Every rule below is scoped to a class only index.html uses, so the
+   problem pages and the form are untouched. */
+.hero {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1.5rem;
+  margin: 1.5rem 0 0.5rem;
+}
+
+.hero .mascot { flex: none; width: 128px; height: 128px; }
+.hero > div { flex: 1 1 18rem; min-width: 0; }
+.hero h1 { margin-top: 0; }
+
+.cta { display: flex; flex-wrap: wrap; gap: 0.75rem; margin: 1.5rem 0 2rem; }
+
+.cta a {
+  display: inline-block;
+  padding: 0.55rem 1.1rem;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.cta a.primary { color: var(--bg); background: var(--accent); }
+.cta a.secondary { color: var(--accent); background: transparent; }
+
+.cta a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+ul.features { padding-left: 1.25rem; }
+ul.features li { margin-bottom: 0.6rem; }
+
+ul.tiers {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
+  gap: 1rem;
+  margin: 1rem 0 1.5rem;
+  padding: 0;
+  list-style: none;
+}
+
+ul.tiers > li {
+  background: var(--code-bg);
+  border-radius: 6px;
+  padding: 1rem 1.1rem 0.4rem;
+}
+
+/* Free is the whole core, so it takes the full row; the paid tiers sit side by side. */
+ul.tiers > li:first-child { grid-column: 1 / -1; }
+
+ul.tiers h3 { font-size: 1.15rem; margin: 0 0 0.5rem; }
+ul.tiers p { margin: 0 0 0.6rem; }
+
+@media (max-width: 30rem) {
+  .hero .mascot { width: 96px; height: 96px; }
+}
+
+/* Paper: dark text on white whatever the screen's colour scheme, and the button links
+   printed as plain links, since browsers drop backgrounds when printing. */
+@media print {
+  :root {
+    --bg: #fff;
+    --ink: #000;
+    --ink-soft: #333;
+    --rule: #999;
+    --accent: #000;
+    --code-bg: #fff;
+  }
+
+  .cta a.primary,
+  .cta a.secondary {
+    color: var(--ink);
+    background: none;
+    border: 0;
+    padding: 0;
+    text-decoration: underline;
+  }
+
+  ul.tiers > li { border: 1px solid var(--rule); }
+}
+
 footer {
   margin-top: 3rem;
   padding-top: 1rem;
