@@ -185,7 +185,7 @@ public sealed class CertificatesController : ControllerBase
 
                 case CertificateRevocationStatus.AlreadyRevoked:
                     return Problem(
-                        type: "https://ducksinarow.app/problems/certificate-already-revoked",
+                        type: DashboardProblemType.CertificateAlreadyRevoked,
                         title: "Certificate is already revoked",
                         detail: "The certification authority already lists this certificate as " +
                                 "revoked, so no second revocation was sent.",
@@ -193,7 +193,7 @@ public sealed class CertificatesController : ControllerBase
 
                 case CertificateRevocationStatus.NotRevocable:
                     return Problem(
-                        type: "https://ducksinarow.app/problems/certificate-not-revocable",
+                        type: DashboardProblemType.CertificateNotRevocable,
                         title: "Nothing to revoke",
                         detail: "This row is a request that never became a certificate, so " +
                                 "there is nothing to revoke at the certification authority.",
@@ -201,7 +201,7 @@ public sealed class CertificatesController : ControllerBase
 
                 case CertificateRevocationStatus.TargetMismatch:
                     return Problem(
-                        type: "https://ducksinarow.app/problems/revocation-target-mismatch",
+                        type: DashboardProblemType.RevocationTargetMismatch,
                         title: "Confirmation does not match this certificate",
                         detail: "The serial number confirmed in the dialog is not this " +
                                 "certificate's serial. Reload the page and try again.",
@@ -209,7 +209,7 @@ public sealed class CertificatesController : ControllerBase
 
                 case CertificateRevocationStatus.InvalidReason:
                     return Problem(
-                        type: "https://ducksinarow.app/problems/invalid-revocation-reason",
+                        type: DashboardProblemType.InvalidRevocationReason,
                         title: "Invalid revocation reason",
                         detail: "The revocation reason must be one of the RFC 5280 codes 0 " +
                                 "to 6.",
@@ -220,7 +220,7 @@ public sealed class CertificatesController : ControllerBase
                 // retrying changes nothing.
                 case CertificateRevocationStatus.BlockedByGuardrail:
                     return Problem(
-                        type: "https://ducksinarow.app/problems/revocation-blocked-by-guardrail",
+                        type: DashboardProblemType.RevocationBlockedByGuardrail,
                         title: "Blocked by the TLS certificate guardrail",
                         detail: result.RefusalDetail ??
                                 "This is not a TLS server or client certificate, so the " +
@@ -229,7 +229,7 @@ public sealed class CertificatesController : ControllerBase
 
                 case CertificateRevocationStatus.OutOfScope:
                     return Problem(
-                        type: "https://ducksinarow.app/problems/revocation-out-of-scope",
+                        type: DashboardProblemType.RevocationOutOfScope,
                         title: "Outside the configured revocation scope",
                         detail: result.RefusalDetail ??
                                 "The revocation scope configured in Settings does not cover " +
@@ -241,7 +241,7 @@ public sealed class CertificatesController : ControllerBase
 
                 default:
                     return Problem(
-                        type: "https://ducksinarow.app/problems/ca-error",
+                        type: DashboardProblemType.CaError,
                         title: "Certificate Authority error",
                         detail: "The certification authority refused the revocation. The " +
                                 "inventory was refreshed; check the certificate's current status.",
@@ -252,7 +252,7 @@ public sealed class CertificatesController : ControllerBase
         {
             _logger.LogWarning(ex, "Revocation of certificate {CertificateId}: CA is unavailable", id);
             return Problem(
-                type: "https://ducksinarow.app/problems/ca-unavailable",
+                type: DashboardProblemType.CaUnavailable,
                 title: "Certificate Authority is unavailable",
                 detail: "The ADCS Certificate Authority cannot be reached. The certificate was " +
                         "not revoked. Try again shortly.",
@@ -262,7 +262,7 @@ public sealed class CertificatesController : ControllerBase
         {
             _logger.LogWarning(ex, "Revocation of certificate {CertificateId}: CA denied access", id);
             return Problem(
-                type: "https://ducksinarow.app/problems/ca-access-denied",
+                type: DashboardProblemType.CaAccessDenied,
                 title: "CA revoke access denied",
                 detail: ex.Message,
                 statusCode: 503);
@@ -340,7 +340,7 @@ public sealed class CertificatesController : ControllerBase
     }
 
     private ObjectResult CertificateUnavailable(int id) => Problem(
-        type: "https://ducksinarow.app/problems/certificate-unavailable",
+        type: DashboardProblemType.CertificateUnavailable,
         title: "No certificate to download",
         detail: $"Certificate {id} has no stored certificate. A request that never became a " +
                 "certificate has none, and a row synced before this version will gain one on the " +
@@ -348,25 +348,30 @@ public sealed class CertificatesController : ControllerBase
         statusCode: StatusCodes.Status404NotFound);
 
     /// <summary>
-    /// A download file name for one certificate, with characters invalid in
-    /// file names stripped, mirroring the CA certificate downloads in
-    /// CaCertificatesController.
+    /// A download file name for one certificate, sanitized by
+    /// CertificateTextSanitizer.SanitizeFileNameComponent, mirroring the CA
+    /// certificate downloads in CaCertificatesController.
     ///
     /// The precedence matches certificateDisplayName on the dashboard: the
     /// subject common name, then the first SAN, then the serial. An ACME issued
     /// certificate routinely carries no subject DN at all, so the SAN step is
     /// the normal case rather than a fallback. The internal id is the last
     /// resort, so the file is always named something.
+    ///
+    /// A name made entirely of format characters now sanitizes to nothing and
+    /// falls through to the next candidate rather than naming the file after a
+    /// string that renders as empty (issue #232).
     /// </summary>
     private static string FileName(X509Certificate2 certificate, int id)
     {
-        var candidate = Sanitize(certificate.GetNameInfo(X509NameType.SimpleName, forIssuer: false));
+        var candidate = CertificateTextSanitizer.SanitizeFileNameComponent(
+            certificate.GetNameInfo(X509NameType.SimpleName, forIssuer: false));
 
         if (candidate == null)
-            candidate = Sanitize(FirstDnsName(certificate));
+            candidate = CertificateTextSanitizer.SanitizeFileNameComponent(FirstDnsName(certificate));
 
         if (candidate == null)
-            candidate = Sanitize(certificate.SerialNumber);
+            candidate = CertificateTextSanitizer.SanitizeFileNameComponent(certificate.SerialNumber);
 
         return candidate ?? $"certificate-{id}";
     }
@@ -386,21 +391,6 @@ public sealed class CertificatesController : ControllerBase
         {
             return null; // Malformed SAN extension; fall through to the serial.
         }
-    }
-
-    /// <summary>
-    /// Strips characters the file system rejects, plus the wildcard star, which
-    /// is legal in a certificate name and not in a file name. Returns null when
-    /// nothing usable is left, so the caller moves to the next candidate.
-    /// </summary>
-    private static string? Sanitize(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return null;
-
-        var invalid = Path.GetInvalidFileNameChars();
-        var cleaned = new string(value.Where(c => !invalid.Contains(c) && c != '*').ToArray()).Trim();
-        return string.IsNullOrWhiteSpace(cleaned) ? null : cleaned;
     }
 
     /// <summary>
@@ -432,7 +422,7 @@ public sealed class CertificatesController : ControllerBase
         {
             _logger.LogWarning(ex, "Manual sync: CA is unavailable");
             return Problem(
-                type: "https://ducksinarow.app/problems/ca-unavailable",
+                type: DashboardProblemType.CaUnavailable,
                 title: "Certificate Authority is unavailable",
                 detail: "The ADCS Certificate Authority cannot be reached. Try again shortly.",
                 statusCode: 503);
@@ -441,7 +431,7 @@ public sealed class CertificatesController : ControllerBase
         {
             _logger.LogWarning(ex, "Manual sync: CA view access denied");
             return Problem(
-                type: "https://ducksinarow.app/problems/ca-access-denied",
+                type: DashboardProblemType.CaAccessDenied,
                 title: "CA view access denied",
                 detail: ex.Message,
                 statusCode: 503);
@@ -450,7 +440,7 @@ public sealed class CertificatesController : ControllerBase
         {
             _logger.LogError(ex, "Manual sync failed");
             return Problem(
-                type: "https://ducksinarow.app/problems/ca-error",
+                type: DashboardProblemType.CaError,
                 title: "Certificate Authority error",
                 detail: "An unexpected error occurred while syncing from the certificate authority.",
                 statusCode: 503);
@@ -518,6 +508,20 @@ public sealed class CertificatesController : ControllerBase
                     name = t.Name,
                     displayName = t.DisplayName,
                     oid = t.Oid,
+                    // The OID as published is the one value this endpoint hands
+                    // out that nothing else reports on, so a deceptive
+                    // character in it travels with it (issue #292). The fault
+                    // itself carries no OID text, which is the point: a caller
+                    // that renders the value can say why it may not read as it
+                    // looks without being handed the characters again.
+                    //
+                    // The display name fault is deliberately not carried here.
+                    // The setup wizard already explains it where the
+                    // remediation lives and the URL guard already refuses it,
+                    // so a copy on this endpoint would be a second one nothing
+                    // reads and one more thing to keep in step.
+                    oidWarning = SetupTemplateNameWarning.From(
+                        TemplateNameUsability.Inspect(t).OidFault),
                     extendedKeyUsages = t.ExtendedKeyUsages,
                     viability = t.Viability,
                     ekuVerified = t.ExtendedKeyUsages != null,
@@ -532,7 +536,7 @@ public sealed class CertificatesController : ControllerBase
         {
             _logger.LogWarning(ex, "Templates endpoint: CA is unavailable");
             return Problem(
-                type: "https://ducksinarow.app/problems/ca-unavailable",
+                type: DashboardProblemType.CaUnavailable,
                 title: "Certificate Authority is unavailable",
                 detail: "The ADCS Certificate Authority cannot be reached. Try again shortly.",
                 statusCode: 503);
@@ -541,7 +545,7 @@ public sealed class CertificatesController : ControllerBase
         {
             _logger.LogError(ex, "Failed to retrieve templates from CA");
             return Problem(
-                type: "https://ducksinarow.app/problems/ca-error",
+                type: DashboardProblemType.CaError,
                 title: "Certificate Authority error",
                 detail: "An unexpected error occurred while contacting the certificate authority.",
                 statusCode: 503);

@@ -13,6 +13,12 @@ interface FilterChipsProps {
  * The visible label per state. Exported so the filtered empty state names the
  * active chip with the exact wording the chip itself shows (issue #157).
  */
+// The export is deliberate and CertificateListPage depends on it, so the cost
+// is accepted rather than removed: this one file reloads instead of hot
+// patching when edited in the dev host. Undoing that means a separate module
+// for the labels and a changed import, a refactor rather than part of making
+// the lint script real (issue #254).
+// eslint-disable-next-line react-refresh/only-export-components
 export const STATE_LABELS: Record<CertificateState, string> = {
   valid: 'Valid',
   expiring: 'Expiring soon',

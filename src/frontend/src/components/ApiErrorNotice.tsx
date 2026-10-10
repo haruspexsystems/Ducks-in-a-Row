@@ -22,9 +22,9 @@ export function ApiErrorNotice({
           <h2 className="text-lg font-semibold">Authentication required</h2>
         </div>
         <p className="text-sm">
-          Certus uses Windows Integrated Authentication. Sign in with a Windows
-          account, or check that this site is in your browser's intranet zone so
-          credentials are sent automatically.
+          Ducks in a Row uses Windows Integrated Authentication. Sign in with a
+          Windows account, or check that this site is in your browser's intranet
+          zone so credentials are sent automatically.
         </p>
       </div>
     );
@@ -38,7 +38,8 @@ export function ApiErrorNotice({
           <h2 className="text-lg font-semibold">Not authorized</h2>
         </div>
         <p className="text-sm">
-          You are signed in, but your account is not in the Certus admin group.
+          You are signed in, but your account is not in the Ducks in a Row admin
+          group.
           Ask an administrator to add you to the configured group.
         </p>
       </div>

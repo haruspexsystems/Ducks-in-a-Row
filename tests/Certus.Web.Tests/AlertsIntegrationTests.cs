@@ -198,11 +198,28 @@ public class AlertsIntegrationTests
         json.Should().NotContain("\"headers\"");
     }
 
+    /// <summary>
+    /// This factory ships no Certus:Alerts section, so the whole smtp block
+    /// serializes as null and no transport key appears at all. That is the only
+    /// thing this test proves, and it used to claim more: under the name
+    /// "DoesNotCarryTheSmtpTransportSettings" it asserted the endpoint carries
+    /// no "username", which was true here for the wrong reason and false on any
+    /// configured host. Issue #261 found the real leak with the endpoint's own
+    /// assertion sitting green beside it.
+    ///
+    /// The real guards are elsewhere and need a populated transport:
+    /// AlertConfigViewTests.From_NeverCarriesEitherHalfOfTheSmtpCredentialInAnyForm
+    /// in Certus.Core.Tests, and
+    /// AlertConfigWriteIntegrationTests.GetConfig_NeverReturnsASecretValueAndNotAnUnappliedHostEither.
+    /// </summary>
     [Fact]
-    public async Task GetConfig_DoesNotCarryTheSmtpTransportSettings()
+    public async Task GetConfig_WithNoAlertsSectionAtAll_CarriesANullSmtpBlock()
     {
         var response = await _client.GetAsync("/api/alerts/config");
         var json = await response.Content.ReadAsStringAsync();
+
+        JsonSerializer.Deserialize<JsonElement>(json)
+            .GetProperty("smtp").ValueKind.Should().Be(JsonValueKind.Null);
 
         json.Should().NotContain("\"host\"");
         json.Should().NotContain("\"port\"");

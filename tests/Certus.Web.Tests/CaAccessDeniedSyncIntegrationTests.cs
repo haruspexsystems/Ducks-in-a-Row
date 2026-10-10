@@ -39,7 +39,7 @@ public class CaAccessDeniedSyncIntegrationTests
 
         root.GetProperty("status").GetInt32().Should().Be(503);
         root.GetProperty("type").GetString()
-            .Should().Be("https://ducksinarow.app/problems/ca-access-denied");
+            .Should().Be("https://ducksinarow.dev/problems/ca-access-denied");
         // The reader's fix differs from the unreachable case, so the exact
         // remediation text must flow through to the problem detail.
         root.GetProperty("detail").GetString()
@@ -119,6 +119,10 @@ public class CaAccessDeniedSyncIntegrationTests
 
         public Task<IReadOnlyList<CertificateInfo>> QueryCertificatesAsync(
             CertificateQuery query, CancellationToken cancellationToken = default)
+            => throw Build();
+
+        public Task<CaRequestStatus?> GetRequestStatusAsync(
+            int requestId, CancellationToken cancellationToken = default)
             => throw Build();
 
         public Task RevokeCertificateAsync(

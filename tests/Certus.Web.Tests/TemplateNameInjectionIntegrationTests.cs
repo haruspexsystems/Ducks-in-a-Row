@@ -166,6 +166,11 @@ public class TemplateNameInjectionIntegrationTests : IDisposable
     [InlineData("%E2%80%AE", "a right to left override, U+202E")]
     [InlineData("%E2%80%8B", "a zero width space, U+200B")]
     [InlineData("%C2%AD", "a soft hyphen, U+00AD")]
+    // The issue #234 payload, reproduced over HTTP. Categories Zl and Zp are
+    // neither Control nor Format, so this exact request was answered normally
+    // until the guards moved onto the shared scanner.
+    [InlineData("%E2%80%A8", "the Unicode line separator, U+2028")]
+    [InlineData("%E2%80%A9", "the Unicode paragraph separator, U+2029")]
     public async Task AcmeDirectory_TemplateSegmentCarryingAnUnsafeCharacter_IsRefused(
         string encoded, string because)
     {
@@ -175,10 +180,51 @@ public class TemplateNameInjectionIntegrationTests : IDisposable
         response.StatusCode.Should().Be(HttpStatusCode.BadRequest,
             $"a URL carrying {because} is refused before it is logged");
 
+        // An ACME path answers the ACME envelope, so a client renders a real
+        // error rather than "unexpected response" (issue #147's reasoning,
+        // applied to this guard by issue #235). The detail names the code point
+        // and nothing else.
+        response.Content.Headers.ContentType!.MediaType
+            .Should().Be("application/problem+json");
+        (await ParseJsonAsync(response)).GetProperty("type").GetString()
+            .Should().Be("urn:ietf:params:acme:error:malformed");
+
         var body = await response.Content.ReadAsStringAsync();
-        body.Should().Contain("control or formatting character");
+        body.Should().Contain("U+");
         body.Should().NotContain("cdc:");
         body.Should().NotContain("rmd:");
+    }
+
+    [Fact]
+    public async Task AcmeDirectory_DisplayNameCarryingASoftHyphen_SaysToUseTheProgrammaticName()
+    {
+        // Issue #235's own shape. A template display name is free text out of
+        // Active Directory, a soft hyphen is what a paste from a word processor
+        // leaves in one, and issue #17 lets a client address the template by
+        // that name. The operator sees a correct looking name everywhere, so
+        // the refusal has to say what to do instead.
+        var response = await _client.GetAsync("/acme/Web%C2%ADServer/directory");
+
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+
+        var body = await response.Content.ReadAsStringAsync();
+        body.Should().Contain("U+00AD");
+        body.Should().Contain("formatting character");
+        body.Should().Contain("programmatic name");
+    }
+
+    [Fact]
+    public async Task Api_PathCarryingASoftHyphen_KeepsThePlainErrorBody()
+    {
+        // The dashboard side is deliberately unchanged: only /acme gets the
+        // protocol envelope.
+        var response = await _client.GetAsync("/api/setup/%C2%ADstatus");
+
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        response.Content.Headers.ContentType!.MediaType
+            .Should().NotBe("application/problem+json");
+        (await response.Content.ReadAsStringAsync())
+            .Should().Contain("The request URL contains a control, line separator, or formatting character.");
     }
 
     [Fact]
@@ -190,6 +236,10 @@ public class TemplateNameInjectionIntegrationTests : IDisposable
         // one.
         var response = await _client.GetAsync("/acme/NoSuchTemplate/directory");
 
+        // Both refusals carry the "malformed" code, which is the registry's
+        // general purpose one and what AcmeProblemResults uses for every fault
+        // RFC 8555 gives no code of its own. The status code is what tells the
+        // two apart, so it is asserted here rather than left implicit.
         response.StatusCode.Should().Be(HttpStatusCode.NotFound);
         (await ParseJsonAsync(response)).GetProperty("type").GetString()
             .Should().Be("urn:ietf:params:acme:error:malformed");

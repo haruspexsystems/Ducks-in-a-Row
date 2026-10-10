@@ -56,8 +56,7 @@
          SettingsController.GetInfo) without ever touching the MSI version. Update
          both together with the release tag; drop VersionSuffix entirely for a
          non prerelease version like 1.0.0. -->
-    <VersionPrefix>0.10.0</VersionPrefix>
-    <VersionSuffix>beta.1</VersionSuffix>
+    <VersionPrefix>1.0.0</VersionPrefix>
     <Product>Ducks in a Row</Product>
     <Company>Haruspex Systems B.V.</Company>
     <Copyright>Copyright © Haruspex Systems B.V. 2026</Copyright>

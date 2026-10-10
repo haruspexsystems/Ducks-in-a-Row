@@ -137,15 +137,18 @@ public class AlertConfigViewTests
     /// ciphertext is itself withheld, because a blob in a browser response is
     /// an offline attack surface for no benefit).
     ///
-    /// This assertion has narrowed twice as fields became writable. Issue #162
-    /// moved the host and from address into the clear, and the full transport
-    /// (port, TLS mode, username, from name) followed when it became dashboard
-    /// writable: a field an administrator can set but cannot see is one they
-    /// cannot safely edit. The password is the boundary that remains, and this
-    /// test is what holds it.
+    /// This assertion narrowed twice as fields became writable, then widened
+    /// back once. Issue #162 moved the host and from address into the clear and
+    /// the full transport followed when it became dashboard writable, on the
+    /// rule that a field an administrator can set but cannot see is one they
+    /// cannot safely edit. Issue #261 pulled the username back out: it is the
+    /// account half of a relay credential, <c>AlertErrorRedactor</c> already
+    /// refused to let it reach an error message, and the write side now carries
+    /// the editing story through the clearUsername flag instead. Both halves of
+    /// the credential are the boundary now, and this test is what holds it.
     /// </summary>
     [Fact]
-    public void From_NeverCarriesTheSmtpPasswordInAnyForm()
+    public void From_NeverCarriesEitherHalfOfTheSmtpCredentialInAnyForm()
     {
         var options = new AlertOptions
         {
@@ -168,8 +171,16 @@ public class AlertConfigViewTests
         json.Should().NotContain("hunter2");
         json.Should().NotContain("CfDJ8-opaque-protected-blob");
 
+        // Both the value and the property name. The QA secret guard flags a
+        // field called "username" on sight, without reading it, so a masked or
+        // blanked value under the old name would still be a finding, and this
+        // mirrors that rule rather than only the leak it caught.
+        json.Should().NotContain("svc-ducks");
+        json.Should().NotContain("\"username\"");
+
         // The recipient list is deliberately kept: an operator has to be able to
-        // see who is being told. Presence is all that is said about the password.
+        // see who is being told. Presence is all that is said about either half
+        // of the credential.
         json.Should().Contain("ops@example.com");
         view.Smtp!.HasCredentials.Should().BeTrue();
         view.Smtp.HasPassword.Should().BeTrue();
@@ -204,8 +215,12 @@ public class AlertConfigViewTests
             },
         }, []);
         explicitMode.Smtp!.TlsMode.Should().Be("starttls");
-        explicitMode.Smtp.Username.Should().Be("svc-ducks");
         explicitMode.Smtp.FromName.Should().Be("Ducks Notifier");
+
+        // The username is set on the options above but reported as presence
+        // only since issue #261, so it is the one writable transport field this
+        // test cannot read back.
+        explicitMode.Smtp.HasCredentials.Should().BeTrue();
     }
 
     [Fact]
@@ -506,6 +521,10 @@ public class AlertConfigViewTests
 
         public Task<AlertNotificationResult> SendTestAlertAsync(
             TestAlert alert, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+
+        public Task<AlertNotificationResult> SendCrlAlertAsync(
+            CrlAlert alert, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
     }
 }

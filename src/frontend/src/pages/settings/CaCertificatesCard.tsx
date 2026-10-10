@@ -3,6 +3,7 @@ import { AlertTriangle, Landmark, Loader2 } from 'lucide-react';
 import { fetchCaCertificates, type CaCertificateSummary } from '@/api/settings';
 import { ApiError } from '@/api/client';
 import { DownloadLink } from '@/components/DownloadLink';
+import { extractCN } from '@/types';
 
 /**
  * Settings card listing the connected CA's signing certificate chain with
@@ -82,7 +83,16 @@ const roleBadge: Record<CaCertificateSummary['role'], { label: string; classes: 
 
 function CertificateRow({ certificate }: { certificate: CaCertificateSummary }) {
   const badge = roleBadge[certificate.role] ?? roleBadge.intermediate;
-  const cn = certificate.subject.replace(/^CN=/i, '').split(',')[0];
+
+  // Read the name through the shared reader rather than splitting on the first
+  // comma (issue #294). These subjects are X509Certificate2.Subject, the Windows
+  // CertNameToStr display form, so a certification authority whose common name
+  // carries a comma arrives with the whole value quoted: the local split showed
+  // CN="Corp, Inc CA", O=Example as "Corp, and it missed a common name that was
+  // not first in the subject. extractCN falls back to the whole subject, which
+  // is the right answer for a certificate that carries no common name at all.
+  const cn = extractCN(certificate.subject);
+  const remaining = describeRemaining(certificate.notAfter);
 
   return (
     <li className="py-3 flex flex-wrap items-center gap-3">
@@ -97,6 +107,7 @@ function CertificateRow({ certificate }: { certificate: CaCertificateSummary }) 
         </div>
         <p className="text-xs text-muted mt-0.5">
           Expires {new Date(certificate.notAfter).toLocaleDateString()}
+          <span className={`ml-1.5 ${remaining.classes}`}>{remaining.label}</span>
           <span className="mx-1.5">·</span>
           <span className="font-mono">{certificate.thumbprint.slice(0, 16)}…</span>
         </p>
@@ -113,4 +124,22 @@ function CertificateRow({ certificate }: { certificate: CaCertificateSummary }) 
       </div>
     </li>
   );
+}
+
+/**
+ * How long a CA certificate has left (issue #447).
+ *
+ * The thresholds are wider than a leaf's on purpose. ADCS never issues a
+ * certificate that outlives its own CA certificate, so as one runs down the
+ * certificates it issues quietly shrink to match, and Microsoft's own guidance
+ * is to renew a CA at half its lifetime. A year of warning is the point at
+ * which that starts to matter; ninety days is late.
+ */
+function describeRemaining(notAfter: string): { label: string; classes: string } {
+  const days = Math.floor((new Date(notAfter).getTime() - Date.now()) / 86_400_000);
+
+  if (days <= 0) return { label: '(expired)', classes: 'text-red-600 dark:text-red-400' };
+  if (days <= 90) return { label: `(${days} days left)`, classes: 'text-red-600 dark:text-red-400' };
+  if (days <= 365) return { label: `(${days} days left)`, classes: 'text-amber-600 dark:text-amber-400' };
+  return { label: `(${Math.floor(days / 365)} years left)`, classes: 'text-faint' };
 }

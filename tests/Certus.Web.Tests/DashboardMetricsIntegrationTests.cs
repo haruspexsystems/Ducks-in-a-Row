@@ -151,15 +151,21 @@ public class DashboardMetricsIntegrationTests
     {
         await SeedAsync();
 
-        var response = await _client.GetAsync("/api/dashboard/registrations?days=30");
+        // One constant drives the request, the array lengths, and the window
+        // arithmetic below. Before issue #260 the query string said 30 and the
+        // expectation said 29 with nothing but matching literals holding them
+        // together, so editing one silently broke the other.
+        const int Days = 30;
+
+        var response = await _client.GetAsync($"/api/dashboard/registrations?days={Days}");
         response.StatusCode.Should().Be(HttpStatusCode.OK);
 
         var body = await ParseJsonAsync(response);
         var registrations = body.GetProperty("registrations");
         var renewals = body.GetProperty("renewals");
 
-        registrations.GetArrayLength().Should().Be(30);
-        renewals.GetArrayLength().Should().Be(30);
+        registrations.GetArrayLength().Should().Be(Days);
+        renewals.GetArrayLength().Should().Be(Days);
 
         // The expectation is computed from the shared database rather than
         // hardcoded, honouring this file's tolerance rule: sibling tests in
@@ -169,13 +175,30 @@ public class DashboardMetricsIntegrationTests
         // Issued and Revoked rows: SeedAsync guarantees a Pending row inside
         // the window, so an endpoint that counted requests again would sum
         // higher than this expectation.
+        //
+        // Both bounds are load bearing, and the upper one is issue #260.
+        // GetRegistrationsAsync fetches with the same lower bound and then
+        // buckets into a fixed length array, dropping every date past the end
+        // of it, so a row dated in the future is counted here and missing from
+        // the series. The assertion then fails by exactly one and names the
+        // metrics endpoint, when the real cause is a sibling test's seed date.
+        // That is what happened on PR #259.
+        //
+        // Residual, knowingly unguarded: the endpoint reads UtcNow inside the
+        // request and this block reads it again afterwards, so a UTC midnight
+        // landing between the two shifts the windows a day apart. It is a
+        // millisecond wide gap once a day. If this ever fails by one bucket
+        // at midnight UTC, that is why.
         int expected;
         using (var scope = _factory.Services.CreateScope())
         {
             var db = scope.ServiceProvider.GetRequiredService<CertusDbContext>();
-            var since = DateTime.UtcNow.Date.AddDays(-29);
+            var since = DateTime.UtcNow.Date.AddDays(-(Days - 1));
+            var until = since.AddDays(Days);
             expected = await db.SyncedCertificates.CountAsync(c =>
-                (c.Status == "Issued" || c.Status == "Revoked") && c.RequestDate >= since);
+                (c.Status == "Issued" || c.Status == "Revoked")
+                && c.RequestDate >= since
+                && c.RequestDate < until);
         }
 
         expected.Should().BeGreaterThanOrEqualTo(3, "the seed adds three certificates in window");

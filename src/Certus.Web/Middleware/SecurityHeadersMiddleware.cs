@@ -1,3 +1,5 @@
+using Certus.Web.Routing;
+
 namespace Certus.Web.Middleware;
 
 /// <summary>
@@ -57,10 +59,21 @@ public sealed class SecurityHeadersMiddleware
         headers["Referrer-Policy"] = "strict-origin-when-cross-origin";
         headers["Content-Security-Policy"] = ContentSecurityPolicy;
 
-        // API responses should not be cached
+        // API responses should not be cached. The ACME issuer certificate endpoint
+        // is the one exception: it is the cacheable "up" target of RFC 8555 §7.4.2
+        // and sets its own Cache-Control, so stamping it here would leave the
+        // response contradicting itself with a stale Pragma. The exception is
+        // gated on GET and HEAD (issue #373), because the same path also answers
+        // an authenticated POST-as-GET, and that arm sets no Cache-Control of its
+        // own and must not be publicly cacheable.
         var path = context.Request.Path.Value ?? string.Empty;
-        if (path.StartsWith("/api/", StringComparison.OrdinalIgnoreCase) ||
-            path.StartsWith("/acme/", StringComparison.OrdinalIgnoreCase))
+        var isCacheableIssuerCertificateFetch =
+            ProtocolPaths.IsAcmeIssuerCertificatePath(context.Request.Path) &&
+            (HttpMethods.IsGet(context.Request.Method) ||
+             HttpMethods.IsHead(context.Request.Method));
+        if ((path.StartsWith("/api/", StringComparison.OrdinalIgnoreCase) ||
+             path.StartsWith("/acme/", StringComparison.OrdinalIgnoreCase)) &&
+            !isCacheableIssuerCertificateFetch)
         {
             headers["Cache-Control"] = "no-store";
             headers["Pragma"] = "no-cache";

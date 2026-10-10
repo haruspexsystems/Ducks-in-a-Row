@@ -8,6 +8,8 @@ import { AllowedDomainsCard } from './settings/AllowedDomainsCard';
 import { RevocationScopeCard } from './settings/RevocationScopeCard';
 import { AlertsCard } from './settings/AlertsCard';
 import { CaCertificatesCard } from './settings/CaCertificatesCard';
+import { CrlStatusCard } from './settings/CrlStatusCard';
+import { ServiceRightsCard } from './settings/ServiceRightsCard';
 
 export function SettingsPage() {
   const { data: systemInfo } = useQuery({
@@ -92,6 +94,10 @@ export function SettingsPage() {
       <AlertsCard />
 
       <CaCertificatesCard />
+
+      <ServiceRightsCard />
+
+      <CrlStatusCard />
     </div>
   );
 }

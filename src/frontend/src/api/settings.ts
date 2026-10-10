@@ -438,6 +438,44 @@ export async function fetchCaCertificates(): Promise<CaCertificateSummary[]> {
   return fetchJson('/api/settings/ca-certificates');
 }
 
+/**
+ * One place a CRL is published, and what was last read from it. A CA publishes
+ * the same CRL to several locations, and the interesting case is when they
+ * disagree: a root CRL renewed into the directory but never copied to the web
+ * server leaves the web server serving one that expires.
+ */
+export interface CrlSourceStatus {
+  source: string;
+  crlNumber: string | null;
+  thisUpdate: string | null;
+  nextUpdate: string | null;
+  nextPublish: string | null;
+  signatureStatus: string | null;
+  publishFlags: number | null;
+  lastReadAt: string | null;
+  lastCheckedAt: string;
+  lastError: string | null;
+}
+
+/** Every CRL being watched for one CA key and kind. */
+export interface CrlStatusGroup {
+  scope: 'issuing' | 'parent';
+  kind: 'base' | 'delta';
+  issuerName: string;
+  autoPublished: boolean;
+  sources: CrlSourceStatus[];
+}
+
+export interface CrlStatusResponse {
+  crls: CrlStatusGroup[];
+  lastCheckedAt: string | null;
+}
+
+/** Fetch what the CRL monitor last saw (admin only). */
+export async function fetchCrlStatus(): Promise<CrlStatusResponse> {
+  return fetchJson('/api/settings/crl-status');
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

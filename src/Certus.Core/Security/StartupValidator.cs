@@ -206,10 +206,11 @@ public sealed class StartupValidator
             warnings++;
         }
 
-        // Check ACME rate limit values — a non positive limit or window makes the
-        // fixed window limiter throw when a request first hits the policy, so warn
-        // loudly here instead. Skip when disabled: the limiter is never registered,
-        // so the values are inert.
+        // Check ACME rate limit values. A non positive limit or window makes the
+        // sliding window limiter throw when a request first hits the policy, so
+        // warn loudly here instead. The segment count is clamped rather than
+        // fatal, so its warning reports a value being overridden. Skip when
+        // disabled: the limiter is never registered, so the values are inert.
         if (_rateLimitOptions.Enabled)
         {
             if (_rateLimitOptions.NewAccountLimit < 1)
@@ -230,10 +231,37 @@ public sealed class StartupValidator
                 warnings++;
             }
 
+            if (_rateLimitOptions.PollLimit < 1)
+            {
+                _logger.LogWarning("Certus:RateLimiting:PollLimit is less than 1 — ACME authorization and order polling requests will be rejected while rate limiting is enabled");
+                warnings++;
+            }
+
             if (_rateLimitOptions.WindowSeconds < 1)
             {
                 _logger.LogWarning("Certus:RateLimiting:WindowSeconds is less than 1 — the rate limit window must be at least 1 second");
                 warnings++;
+            }
+
+            if (_rateLimitOptions.SegmentsPerWindow < 1)
+            {
+                _logger.LogWarning("Certus:RateLimiting:SegmentsPerWindow is less than 1 — the sliding window limiter requires at least 1 segment, so 1 is being used instead");
+                warnings++;
+            }
+
+            // Not a warning. Partitioning on the source address is correct for a
+            // direct deployment, which is the common one, so counting this as a
+            // fault would put a permanent warning on every healthy install. But it
+            // fails silently behind a proxy: UseCertusForwardedHeaders is a no-op
+            // while TrustedProxies is empty, so every client arrives as the proxy
+            // and shares one partition. Say so once, plainly (issue #263).
+            if (_authOptions.TrustedProxies.Length == 0)
+            {
+                _logger.LogInformation(
+                    "ACME rate limits partition on the caller's source IP address, and " +
+                    "Auth:TrustedProxies is empty — if Certus sits behind a reverse proxy or " +
+                    "NAT gateway, every ACME client counts as one caller against a shared limit. " +
+                    "Set Auth:TrustedProxies to the proxy's address so the real client address is used.");
             }
         }
 

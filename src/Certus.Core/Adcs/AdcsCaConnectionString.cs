@@ -1,4 +1,4 @@
-using System.Globalization;
+using Certus.Core.Security;
 
 namespace Certus.Core.Adcs;
 
@@ -41,19 +41,26 @@ public static class AdcsCaConnectionString
     /// Whether a CA connection string is safe to record and to write to the
     /// log. Null, empty, or whitespace passes: see the note on presence above.
     ///
-    /// Two character categories are refused, matching
-    /// <see cref="AdcsRequestAttributes.TryValidateTemplateName"/>. Control
-    /// characters, all of them rather than only carriage return and line feed,
-    /// because the C0 range, DEL, and the C1 range all have a claim on being
-    /// treated as a line break by something that reads the log. And Unicode
-    /// format characters (category Cf), which include the bidirectional
-    /// overrides U+202A to U+202E, the isolates U+2066 to U+2069, and the tag
-    /// block U+E0020 to U+E007F, because the connection string is shown on the
-    /// wizard and the settings screens and an embedded right to left override
-    /// makes one CA read as another while a tag sequence hides text entirely.
-    /// This is the call
-    /// <see cref="CertificateTextSanitizer.SanitizeDispositionMessage"/> already
-    /// makes for CA authored text reaching the same surfaces.
+    /// Three character categories are refused, matching
+    /// <see cref="AdcsRequestAttributes.TryValidateTemplateName"/> and scanned by
+    /// the same <see cref="DeceptiveCharacters"/>. Control characters, all of
+    /// them rather than only carriage return and line feed, because the C0
+    /// range, DEL, and the C1 range all have a claim on being treated as a line
+    /// break by something that reads the log. Line separators (U+2028 and
+    /// U+2029, categories Zl and Zp), which have the same claim and which every
+    /// guard in the product passed until issue #234. And Unicode format
+    /// characters (category Cf), which include the bidirectional overrides
+    /// U+202A to U+202E, the isolates U+2066 to U+2069, and the tag block
+    /// U+E0020 to U+E007F, because the connection string is shown on the wizard
+    /// and the settings screens and an embedded right to left override makes one
+    /// CA read as another while a tag sequence hides text entirely. This is the
+    /// call <see cref="CertificateTextSanitizer.SanitizeDispositionMessage"/>
+    /// already makes for CA authored text reaching the same surfaces, tab and the
+    /// two line break characters excepted: a CA legitimately composes a multi line
+    /// message and the detail page renders one, so that function keeps those three
+    /// and
+    /// <see cref="CertificateTextSanitizer.SanitizeDispositionMessageForLog"/>
+    /// flattens them for the log instead. A CA address needs none of them.
     ///
     /// Values are refused, never stripped. A connection string is an address,
     /// so quietly rewriting one would point the service at a CA nobody asked
@@ -81,44 +88,31 @@ public static class AdcsCaConnectionString
             return false;
         }
 
-        for (var i = 0; i < caConnectionString.Length; i++)
+        if (DeceptiveCharacters.Find(caConnectionString) is { } found)
         {
-            var c = caConnectionString[i];
-
-            if (char.IsControl(c))
+            error = found.Class switch
             {
-                error =
+                DeceptiveCharacterClass.Control =>
                     $"The CA connection string contains a control character " +
-                    $"(U+{(int)c:X4}) at position {i}. A line break there would forge " +
+                    $"(U+{found.CodePoint:X4}) at position {found.Position}. A line break there would forge " +
                     $"entries in the service log, which is the record of what the CA " +
                     $"was asked to do. Use the CA's connection string in the form " +
-                    $"host\\CA name.";
-                return false;
-            }
+                    $"host\\CA name.",
 
-            // Read the category from the string rather than the char, so a
-            // format character above the BMP is caught. Those arrive as a
-            // surrogate pair, and the category of a lone surrogate is Surrogate
-            // and never Format, so a per char lookup misses the whole class.
-            // The tag block U+E0020 to U+E007F is the one that matters: it
-            // encodes arbitrary ASCII invisibly, so a connection string could
-            // carry hidden text through every screen that shows it. The string
-            // overload resolves the pair; at the trailing half it answers
-            // Surrogate, which is correct because the pair was already judged
-            // at its leading half.
-            if (CharUnicodeInfo.GetUnicodeCategory(caConnectionString, i) == UnicodeCategory.Format)
-            {
-                var codePoint = char.IsHighSurrogate(c)
-                    ? char.ConvertToUtf32(caConnectionString, i)
-                    : c;
+                DeceptiveCharacterClass.LineSeparator =>
+                    $"The CA connection string contains a line separator character " +
+                    $"(U+{found.CodePoint:X4}) at position {found.Position}. Some log readers treat it as " +
+                    $"a line break, so it would forge entries in the service log wherever " +
+                    $"the log is read by one of them. Use the CA's connection string in " +
+                    $"the form host\\CA name.",
 
-                error =
+                _ =>
                     $"The CA connection string contains a formatting character " +
-                    $"(U+{codePoint:X4}) at position {i}. Those characters can make the CA " +
+                    $"(U+{found.CodePoint:X4}) at position {found.Position}. Those characters can make the CA " +
                     $"display as a different host. Use the CA's connection string in " +
-                    $"the form host\\CA name.";
-                return false;
-            }
+                    $"the form host\\CA name.",
+            };
+            return false;
         }
 
         error = null;

@@ -20,6 +20,18 @@ public static class ChallengeHttpHandlerFactory
             AllowAutoRedirect = options.AllowRedirects,
             ConnectCallback = async (context, cancellationToken) =>
             {
+                // Vet the port as well as the address (issue #345). The guard
+                // reads the host and nothing else, so before this an identifier
+                // that carried its own port, "10.0.0.5:22", sent the validator
+                // to an arbitrary internal service and the answer told the
+                // client whether it was listening. 80 is the port RFC 8555
+                // section 8.3 makes the request on; 443 stays legal because the
+                // same section permits a redirect to https, which AllowRedirects
+                // turns on. Every other port is the primitive being closed.
+                var port = context.DnsEndPoint.Port;
+                if (!IsPermittedPort(port))
+                    throw new AddressBlockedException(context.DnsEndPoint.Host, port);
+
                 var ip = await guard.ResolveAndVetAsync(context.DnsEndPoint.Host, cancellationToken);
                 var socket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
                 try
@@ -36,4 +48,13 @@ public static class ChallengeHttpHandlerFactory
             }
         };
     }
+
+    /// <summary>
+    /// The ports challenge validation may open a connection on. 80 is the one
+    /// RFC 8555 section 8.3 makes the http-01 request on. 443 is here because
+    /// the same section permits the challenge server to redirect to https, and
+    /// <see cref="ChallengeValidationOptions.AllowRedirects"/> lets an operator
+    /// turn that on. Everything else is refused before the socket exists.
+    /// </summary>
+    public static bool IsPermittedPort(int port) => port is 80 or 443;
 }

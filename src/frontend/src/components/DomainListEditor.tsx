@@ -48,7 +48,7 @@ export function DomainListEditor({
               add();
             }
           }}
-          placeholder="home.local"
+          placeholder="corp.example.com"
           disabled={disabled}
           className="flex-1 px-3 py-2 border border-hairline-strong rounded-lg text-sm
                      placeholder:text-faint focus:outline-none focus:ring-2

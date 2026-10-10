@@ -18,6 +18,11 @@ public sealed class NewOrderRequest
     [JsonPropertyName("notAfter")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? NotAfter { get; set; }
+
+    // RFC 9773 §5: the ARI identifier of the certificate this order replaces.
+    [JsonPropertyName("replaces")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Replaces { get; set; }
 }
 
 /// <summary>
@@ -43,6 +48,15 @@ public sealed class OrderResponse
     [JsonPropertyName("notAfter")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? NotAfter { get; set; }
+
+    /// <summary>
+    /// The ARI identifier of the certificate this order replaces. RFC 9773 §5
+    /// requires a server that accepted the field to reflect it in every
+    /// response for the order.
+    /// </summary>
+    [JsonPropertyName("replaces")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Replaces { get; set; }
 
     /// <summary>
     /// URLs of the authorizations the client must complete.

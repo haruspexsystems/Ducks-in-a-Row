@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Certus.Core.Configuration;
+using Certus.Core.Security;
 
 namespace Certus.Core.Setup;
 
@@ -127,11 +128,16 @@ public sealed class SetupStatus
     /// last known state beats an empty one. AllowedDomainsPolicy relies on
     /// this to avoid caching a fail open decision off a momentary read
     /// failure.
+    ///
+    /// A file the service cannot trust (<see cref="TrustedFile"/>) reads as
+    /// absent, which is success with an empty status: no template is exposed
+    /// over ACME, so nothing in it takes effect (issue #489). The service host
+    /// logs the verdict at startup.
     /// </summary>
     public static bool TryLoad(string path, out SetupStatus status)
     {
         status = new SetupStatus();
-        if (!File.Exists(path))
+        if (!File.Exists(path) || !TrustedFile.Check(path).IsTrusted)
             return true;
 
         try
@@ -149,23 +155,21 @@ public sealed class SetupStatus
     }
 
     /// <summary>
-    /// Save setup status to the given file path. Written to a temporary file
-    /// and moved into place, like <c>SettingsOverlay.Save</c>: this file is
+    /// Save setup status to the given file path through
+    /// <see cref="AtomicFile"/>, like <c>SettingsOverlay.Save</c>: this file is
     /// rewritten during live operation (issue #93 external URL changes), and
     /// a torn write would make <see cref="Load"/> return an empty status,
     /// which reopens the wizard. The ACME template policy reads through
     /// <see cref="TryLoad"/> and fails closed (issue #101), so a torn write
-    /// narrows template exposure rather than widening it.
+    /// narrows template exposure rather than widening it. The temporary name is
+    /// random, so no one can stage the write for the service (issue #489).
     /// </summary>
     public void Save(string path)
     {
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir))
-            Directory.CreateDirectory(dir);
+            ProtectedFolder.EnsureExists(dir);
 
-        var json = JsonSerializer.Serialize(this, JsonOptions);
-        var tempPath = path + ".tmp";
-        File.WriteAllText(tempPath, json);
-        File.Move(tempPath, path, overwrite: true);
+        AtomicFile.WriteAllText(path, JsonSerializer.Serialize(this, JsonOptions));
     }
 }

@@ -65,6 +65,11 @@ sc.exe create $ServiceName `
     depend= ""
 
 sc.exe description $ServiceName "Ducks in a Row ACME-to-ADCS certificate proxy. Provides RFC 8555 ACME protocol access to Active Directory Certificate Services."
+# Recovery actions, for development boxes only. The MSI deliberately does not
+# configure these, and never has: see "If the service stops" in
+# docs/installation.md for the reasoning. Do not read this line as a
+# description of what a production install does. The installation guide once
+# did, and was wrong about the product for as long as it said so (issue #338).
 sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/10000/restart/30000
 
 Write-Host ""

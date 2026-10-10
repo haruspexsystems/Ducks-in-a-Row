@@ -225,18 +225,19 @@ public sealed class CaCertificatesController : ControllerBase
     }
 
     /// <summary>
-    /// A download file name from the certificate CN, with characters invalid
-    /// in file names stripped. Falls back to a generic name when nothing
-    /// usable remains.
+    /// A download file name from the certificate CN, sanitized by
+    /// CertificateTextSanitizer.SanitizeFileNameComponent. Falls back to a
+    /// generic name when nothing usable remains.
+    ///
+    /// The CN here is the CA's own, so it is authored by whoever named the
+    /// certification authority rather than by a requester. It shares the
+    /// sanitizer with the dashboard download anyway (issue #232): the length cap
+    /// and the reserved device name guard answer for a well meant CA name just
+    /// as much as for a hostile one, and one rule is easier to keep true than two.
     /// </summary>
     private static string FileName(X509Certificate2 certificate)
     {
         var cn = certificate.GetNameInfo(X509NameType.SimpleName, forIssuer: false);
-        if (string.IsNullOrWhiteSpace(cn))
-            return "ca-certificate";
-
-        var invalid = Path.GetInvalidFileNameChars();
-        var cleaned = new string(cn.Where(c => !invalid.Contains(c)).ToArray()).Trim();
-        return string.IsNullOrWhiteSpace(cleaned) ? "ca-certificate" : cleaned;
+        return CertificateTextSanitizer.SanitizeFileNameComponent(cn) ?? "ca-certificate";
     }
 }

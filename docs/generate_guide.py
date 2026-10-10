@@ -17,12 +17,21 @@ from reportlab.platypus.doctemplate import PageTemplate, BaseDocTemplate
 from reportlab.platypus.tableofcontents import TableOfContents
 from reportlab.lib.colors import Color
 from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase.pdfmetrics import stringWidth
 from xml.sax.saxutils import escape
 import os
+import re
+import xml.etree.ElementTree as ET
 
-# Product version, stamped on the cover and footer. Kept in one place so the
-# guide never drifts from the release it documents.
-VERSION = "0.10.0-beta.1"
+import guide_markdown as md
+import guide_manifest as manifest
+
+# Product version, stamped on the cover and every page footer. It lives in
+# guide_manifest so the staleness check can read it without importing
+# ReportLab, and it is read from Directory.Build.props rather than written
+# here: the literal this replaced claimed the guide "never drifts from the
+# release it documents" while sitting two releases behind, on all 26 pages.
+VERSION = manifest.read_version()
 
 # Brand colors aligned with the web UI palette
 # (src/frontend/src/features/dashboard/lib/colors.ts and tailwind.config.js),
@@ -44,6 +53,7 @@ LOGO_PATH = os.path.join(
     os.path.dirname(__file__), "..", "src", "frontend", "src", "assets", "duck-logo.png"
 )
 IMAGES_DIR = os.path.join(os.path.dirname(__file__), "images")
+DOCS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 class GuideDocTemplate(BaseDocTemplate):
@@ -429,6 +439,428 @@ def make_table(headers, rows, col_widths=None):
     return t
 
 
+# --------------------------------------------------------------------------
+# Markdown to flowables
+#
+# The guide is built from the markdown in this folder so the two cannot say
+# different things. guide_markdown.py owns the grammar; everything below owns
+# how a block looks on the page.
+# --------------------------------------------------------------------------
+
+# The generated PDF. A link to it from inside itself is meaningless, so those
+# degrade to plain text rather than pointing a reader at the file they are
+# already reading.
+SELF_REFERENCE = "Ducks-in-a-Row-Installation-Guide.pdf"
+
+# Where a link to a repo file that is not a guide chapter should send a reader.
+REPO_BLOB_URL = "https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/"
+
+# The built in Type1 fonts this document uses are WinAnsi encoded, so a
+# character outside cp1252 is drawn as a black box. Failing the build instead
+# means a stray arrow or emoji is caught here rather than in print.
+ENCODING = "cp1252"
+
+
+# The manifest lives in guide_manifest so the staleness check can read the
+# chapter list without the rendering toolchain installed.
+Chapter = manifest.Chapter
+CHAPTERS = manifest.CHAPTERS
+
+
+def _check_encoding(text, source, what):
+    """Refuse a character the guide's fonts cannot draw."""
+    try:
+        text.encode(ENCODING)
+    except UnicodeEncodeError as exc:
+        bad = text[exc.start:exc.end]
+        raise SystemExit(
+            "%s: %s contains %r (U+%04X), which the guide's WinAnsi fonts "
+            "cannot draw. Replace it in the markdown."
+            % (source, what, bad, ord(bad[0]))
+        )
+
+
+def _destination(filename, anchor):
+    """A PDF destination name unique to one heading in one chapter.
+
+    Heading slugs collide across chapters. Five do today, and one of them is
+    reachable: acme-clients.md has a section "External account binding" and
+    there is also a chapter of that name, so both would emit the same
+    destination and the link meaning "the section below" could land on the other
+    chapter instead. Qualifying by file makes the name unique by construction
+    rather than by nobody happening to reuse a heading.
+    """
+    stem = filename[:-3] if filename.endswith(".md") else filename
+    return "%s--%s" % (md.slug(stem), anchor)
+
+
+def build_anchor_index(chapters, docs_dir):
+    """Map (file, anchor) to the destination the renderer will emit.
+
+    Built in a pre-pass so a link written for the web docs, such as one to
+    another chapter's section, resolves inside the PDF too. Keyed on the file as
+    well as the anchor so a bare "#section" resolves within the document that
+    wrote it, which is what it means on the web.
+    """
+    index = {}
+    for chapter in chapters:
+        title_anchor = md.slug(chapter.title)
+        # The chapter itself, for a link that names the file with no anchor.
+        index[(chapter.filename, None)] = _destination(
+            chapter.filename, title_anchor
+        )
+        for block in md.parse_file(os.path.join(docs_dir, chapter.filename)):
+            if block["kind"] != md.HEADING:
+                continue
+            if block["level"] == 1:
+                # The renderer titles the chapter from the manifest, so register
+                # the file's own h1 slug against the same destination; a link
+                # written against either name resolves.
+                index[(chapter.filename, md.slug(block["text"]))] = index[
+                    (chapter.filename, None)
+                ]
+                continue
+            anchor = md.slug(block["text"])
+            index[(chapter.filename, anchor)] = _destination(
+                chapter.filename, anchor
+            )
+    return index
+
+
+def _resolve_link(href, source, anchors):
+    """Return the ReportLab href for a markdown link target, or None for plain.
+
+    Four classes, and they behave differently: an external URL passes through,
+    a link to another chapter or to an anchor becomes an internal jump, a link
+    to a repo file that is not a chapter goes to the public repo, and a link to
+    this very PDF stops being a link at all.
+    """
+    if href.startswith(("http://", "https://", "mailto:")):
+        return href
+
+    if SELF_REFERENCE in href:
+        return None
+
+    if href.startswith("#"):
+        # Within the document that wrote it, as on the web.
+        target = anchors.get((source, href[1:]))
+        if target is None:
+            raise SystemExit(
+                "%s: link to %s does not match any heading in that file"
+                % (source, href)
+            )
+        return "#" + target
+
+    filename, _, anchor = href.partition("#")
+
+    if anchor:
+        target = anchors.get((filename, anchor))
+        if target is not None:
+            return "#" + target
+        # A section of a file the guide does not carry: send the reader to the
+        # repo rather than dropping the link.
+        return REPO_BLOB_URL + "docs/" + href
+
+    if (filename, None) in anchors:
+        return "#" + anchors[(filename, None)]
+
+    if filename.startswith("../"):
+        return REPO_BLOB_URL + filename[3:]
+
+    return REPO_BLOB_URL + "docs/" + filename
+
+
+def inline_markup(runs, source, anchors):
+    """Turn parsed inline runs into the mini HTML a Paragraph understands."""
+    out = []
+    for run in runs:
+        kind = run[0]
+        if kind == md.TEXT:
+            out.append(escape(run[1]))
+        elif kind == md.CODE_SPAN:
+            out.append(code(escape(run[1])))
+        elif kind == md.BOLD:
+            out.append(bold(inline_markup(run[1], source, anchors)))
+        elif kind == md.ITALIC:
+            out.append("<i>%s</i>" % inline_markup(run[1], source, anchors))
+        elif kind == md.LINK:
+            inner = inline_markup(run[1], source, anchors)
+            href = _resolve_link(run[2], source, anchors)
+            if href is None:
+                out.append(inner)
+            else:
+                out.append(
+                    '<link href="%s" color="#0F766E">%s</link>'
+                    % (escape(href), inner)
+                )
+        else:
+            raise SystemExit("%s: unknown inline run %r" % (source, kind))
+    return "".join(out)
+
+
+def _plain_cell(cell):
+    """The visible text of a table cell, with the markdown markup removed."""
+    return "".join(md._plain(run) for run in md.parse_inline(cell))
+
+
+def _measure(text, font="Helvetica"):
+    """Width of a string in points, in the font the cell actually uses.
+
+    make_table sets header cells in Helvetica-Bold and body cells in Helvetica,
+    both at 9pt, and inline code renders in Courier. Measuring a bold header
+    with the regular face under-reads it, which is what broke "Outbound" across
+    two lines on the challenge table.
+    """
+    return stringWidth(text, font, 9)
+
+
+def _cell_font(raw):
+    """Courier if the cell is inline code, because Courier is the wider face."""
+    return "Courier" if "`" in raw else "Helvetica"
+
+
+def _fair_share(minimum, total):
+    """Max min fair division of a width that cannot satisfy every column."""
+    settled = [None] * len(minimum)
+    pending = list(range(len(minimum)))
+    remaining = float(total)
+
+    while pending:
+        share = remaining / len(pending)
+        modest = [i for i in pending if minimum[i] <= share]
+        if not modest:
+            # Everything left is greedy, so they split what is left evenly.
+            for i in pending:
+                settled[i] = share
+            break
+        for i in modest:
+            settled[i] = minimum[i]
+            remaining -= minimum[i]
+            pending.remove(i)
+
+    return settled
+
+
+def auto_col_widths(headers, rows, total=6.5 * inch):
+    """Pick column widths, because markdown carries none.
+
+    Two measurements per column. The natural width is how wide the longest cell
+    would like to be, and it decides how the spare width is shared. The minimum
+    width is the longest single token, and it is a floor: a column narrower than
+    its longest word does not wrap, it breaks the word. That is what turned
+    "cert-manager" into "cert-ma nager" and "HTTP-01" into "HTTP-0 1" in the
+    first draft of this.
+
+    Every column starts at its floor and the remainder is shared in proportion
+    to what each column still wants. Allocating proportionally first and
+    repairing afterwards does not work: the repair has to be renormalised to fit
+    the table width, and the renormalisation is what undoes the repair.
+
+    CHAPTERS carries a per table override for anything this still reads wrong.
+    """
+    columns = len(headers)
+    # make_table sets LEFTPADDING and RIGHTPADDING to 8 each, plus 2pt of slack
+    # so a column that measures exactly wide enough is not tipped over by
+    # rounding. Under-counting this is the difference between a column that
+    # wraps and one that breaks a word in half: at exactly 16.0 the widest
+    # client name landed on the boundary and rendered as "cert-ma nager".
+    padding = 18.0
+
+    natural = []
+    minimum = []
+    for i in range(columns):
+        header = headers[i]
+        body = [row[i] for row in rows]
+
+        widths = [_measure(_plain_cell(header), "Helvetica-Bold")]
+        widths += [_measure(_plain_cell(c), _cell_font(c)) for c in body]
+        natural.append(max(widths) + padding)
+
+        tokens = [(t, "Helvetica-Bold") for t in _plain_cell(header).split()]
+        for cell in body:
+            tokens += [(t, _cell_font(cell)) for t in _plain_cell(cell).split()]
+        longest_token = max((_measure(t, f) for t, f in tokens), default=0.0)
+        # A column never needs more room than it would use on a single line.
+        minimum.append(min(longest_token + padding, natural[-1]))
+
+    floor_total = sum(minimum)
+    if floor_total >= total:
+        # More unbreakable text than the page is wide, so something has to
+        # break. Sharing in proportion is the wrong way to choose: it shaves
+        # every column equally, so a modest column loses the few points that
+        # kept its longest word whole while a greedy one keeps most of its
+        # surplus. Breaking a 35 character identifier is expected; breaking
+        # "cert-manager" reads as a bug.
+        #
+        # Max min fairness picks the other way round. Each column takes an
+        # equal share of what is left, anything that fits inside its share is
+        # settled at exactly what it needs, and the rest divide the remainder
+        # again. Small columns come out whole and the long identifiers absorb
+        # the shortfall.
+        return _fair_share(minimum, total)
+
+    spare = total - floor_total
+    want = [natural[i] - minimum[i] for i in range(columns)]
+    want_total = sum(want)
+    if want_total <= 0.01:
+        return [w + spare / columns for w in minimum]
+    return [minimum[i] + spare * want[i] / want_total for i in range(columns)]
+
+
+def indented_code_block(text, styles, indent):
+    """A code block that sits inside a list item keeps the item's indent."""
+    if not indent:
+        return code_block(text, styles)
+    style = ParagraphStyle(
+        "CodeBlockIndent%d" % indent,
+        parent=styles["CodeBlock"],
+        leftIndent=styles["CodeBlock"].leftIndent + 14,
+    )
+    shim = {"CodeBlock": style}
+    return code_block(text, shim)
+
+
+def bullet_paragraph(markup, styles, depth, marker):
+    """One list item. Ordered items carry their own number as the bullet."""
+    style = styles["BulletText"]
+    if depth:
+        style = ParagraphStyle(
+            "BulletTextNested%d" % depth,
+            parent=style,
+            leftIndent=style.leftIndent + 18 * depth,
+            bulletIndent=style.bulletIndent + 18 * depth,
+        )
+    glyph = "%s." % marker if marker else "&bull;"
+    return Paragraph("<bullet>%s</bullet>%s" % (glyph, markup), style)
+
+
+def render_chapter(chapter, number, styles, anchors, docs_dir):
+    """Render one markdown file as the flowables of one numbered chapter."""
+    path = os.path.join(docs_dir, chapter.filename)
+    blocks = md.parse_file(path)
+    source = chapter.filename
+
+    story = []
+    seen_h1 = False
+    table_ordinal = 0
+
+    for block in blocks:
+        kind = block["kind"]
+
+        if kind == md.HEADING:
+            _check_encoding(block["text"], source, "a heading")
+            markup = inline_markup(
+                md.parse_inline(block["text"]), source, anchors
+            )
+            if block["level"] == 1:
+                # The manifest title wins over the file's own h1, so the guide
+                # can read "Quick Start" where the web page reads "Quickstart".
+                seen_h1 = True
+                story.append(
+                    Paragraph(
+                        '<a name="%s"/>%d. %s'
+                        % (
+                            _destination(source, md.slug(chapter.title)),
+                            number,
+                            escape(chapter.title),
+                        ),
+                        styles["SectionTitle"],
+                    )
+                )
+                continue
+
+            anchor = md.slug(block["text"])
+            # A numbered h2 keeps the teal step treatment the guide already
+            # used for walkthrough steps.
+            style = (
+                styles["StepNumber"]
+                if block["level"] == 2 and re.match(r"^\d+\.\s", block["text"])
+                else styles["SubSection" if block["level"] == 2 else "SubSubSection"]
+            )
+            story.append(
+                Paragraph(
+                    '<a name="%s"/>%s' % (_destination(source, anchor), markup),
+                    style,
+                )
+            )
+            continue
+
+        if kind == md.PARA:
+            _check_encoding(block["text"], source, "a paragraph")
+            story.append(
+                Paragraph(
+                    inline_markup(md.parse_inline(block["text"]), source, anchors),
+                    styles["BodyText2"],
+                )
+            )
+            continue
+
+        if kind == md.QUOTE:
+            _check_encoding(block["text"], source, "a callout")
+            story.append(
+                Paragraph(
+                    inline_markup(md.parse_inline(block["text"]), source, anchors),
+                    styles["Warning" if block["severity"] == "warning" else "Note"],
+                )
+            )
+            continue
+
+        if kind == md.CODE:
+            _check_encoding(block["text"], source, "a code block")
+            story.append(
+                indented_code_block(block["text"], styles, block["indent"])
+            )
+            continue
+
+        if kind == md.BULLET:
+            _check_encoding(block["text"], source, "a list item")
+            story.append(
+                bullet_paragraph(
+                    inline_markup(md.parse_inline(block["text"]), source, anchors),
+                    styles,
+                    block["depth"],
+                    block["marker"],
+                )
+            )
+            continue
+
+        if kind == md.TABLE:
+            table_ordinal += 1
+            headers = block["headers"]
+            rows = block["rows"]
+            for cell in headers + [c for row in rows for c in row]:
+                _check_encoding(cell, source, "a table cell")
+            widths = chapter.col_widths.get(
+                table_ordinal, auto_col_widths(headers, rows)
+            )
+            story.append(Spacer(1, 6))
+            story.append(
+                make_table(
+                    [inline_markup(md.parse_inline(h), source, anchors)
+                     for h in headers],
+                    [[inline_markup(md.parse_inline(c), source, anchors)
+                      for c in row] for row in rows],
+                    widths,
+                )
+            )
+            story.append(Spacer(1, 10))
+            continue
+
+        if kind == md.IMAGE:
+            _check_encoding(block["alt"], source, "an image caption")
+            name = block["src"].rsplit("/", 1)[-1]
+            story.extend(figure(name, block["alt"], styles))
+            continue
+
+        raise SystemExit("%s: unknown block %r" % (source, kind))
+
+    if not seen_h1:
+        raise SystemExit(
+            "%s: no top level heading, so the chapter has no title" % source
+        )
+    return story
+
+
 def build_document():
     """Build the complete PDF document."""
     styles = build_styles()
@@ -443,6 +875,11 @@ def build_document():
         title="Ducks in a Row Installation & Configuration Guide",
         author="DucksInARow",
         subject="ACME-to-ADCS Certificate Proxy",
+        # Fixes the creation timestamp and document id, so regenerating
+        # unchanged sources produces byte identical output. That is what
+        # lets CI diff the committed PDF and fail when it has drifted from
+        # the markdown it is built from.
+        invariant=1,
     )
 
     frame = Frame(
@@ -479,1019 +916,20 @@ def build_document():
     story.append(toc)
     story.append(PageBreak())
 
-    # === 1. QUICK START ===
-    story.append(Paragraph("1. Quick Start", styles["SectionTitle"]))
-    story.append(Paragraph(
-        "Get Ducks in a Row from a fresh download to a working ACME proxy. Plan for about "
-        "fifteen minutes the first time, most of it spent on Active Directory permissions.",
-        styles["BodyText2"]
-    ))
-    story.append(Spacer(1, 6))
-
-    story.append(Paragraph("Step 1: Install Prerequisites", styles["StepNumber"]))
-    story.append(Paragraph(
-        f"If you install with {bold('Ducks-in-a-Row-Setup.exe')} (recommended), the "
-        f"ASP.NET Core 10.0 runtime is installed for you, offline, from the installer "
-        f"itself. If you install the bare MSI instead, first download and install the "
-        f"{bold('ASP.NET Core 10.0 Hosting Bundle')} from the official .NET download "
-        f"page. Either way, install the ADCS management tools and reboot the server "
-        f"if prompted.",
-        styles["BodyText2"]
-    ))
-    story.append(code_block(
-        "# Bare MSI only: download and install the .NET 10 Hosting Bundle from:\n"
-        "# https://dotnet.microsoft.com/download/dotnet/10.0\n\n"
-        "# Then install ADCS Remote Administration Tools (elevated PowerShell):\n"
-        "Install-WindowsFeature RSAT-ADCS-Mgmt", styles))
-    story.append(Paragraph(
-        f'{bold("Critical:")} The ADCS RSAT tools must be installed on the Ducks in a Row server '
-        f'even though it is not the CA server. Ducks in a Row communicates with ADCS through the '
-        f'ADCS COM classes, which are registered by the RSAT feature. Without them, CA '
-        f'connectivity fails with COM activation errors.',
-        styles["Warning"]
-    ))
-
-    story.append(Paragraph("Step 2: Run the Installer", styles["StepNumber"]))
-    story.append(Paragraph(
-        "Run Ducks-in-a-Row-Setup.exe. It installs the ASP.NET Core runtime when the "
-        "server does not have it, then opens the install wizard. On a server that "
-        "already has the runtime, the bare MSI also works, either directly or from "
-        "an elevated command prompt:",
-        styles["BodyText2"]
-    ))
-    story.append(code_block("msiexec /i Ducks-in-a-Row.msi", styles))
-    story.append(Paragraph(
-        "The install wizard asks for the destination folder, the data folder (database, logs, "
-        "and runtime configuration), and whether to start the service immediately.",
-        styles["BodyText2"]
-    ))
-
-    story.append(Paragraph("Step 3: Run the Setup Wizard", styles["StepNumber"]))
-    story.append(Paragraph(
-        "Open the setup page (the completion screen offers to open it for you) and sign in "
-        "as a member of the administrator group. The wizard discovers the CAs published in "
-        "Active Directory, tests the connection to the CA you pick, lists its templates and "
-        "lets you choose one, validates the external URL, then applies the configuration "
-        "and restarts the service by itself.",
-        styles["BodyText2"]
-    ))
-    for fn, cap in [
-        ("setup-01-welcome.png", "Welcome step: what you need before you start."),
-        ("setup-02-connection.png", "Connection step: pick a discovered CA and test it."),
-        ("setup-03-templates.png", "Templates step: choose a template and check ACME readiness."),
-        ("setup-04-external-url.png",
-         "External URL step: confirm the URL and, optionally, enrol an HTTPS certificate."),
-        ("setup-05-review.png", "Review step: apply the configuration and copy the certbot command."),
-    ]:
-        story.extend(figure(fn, cap, styles))
-
-    story.append(Paragraph("Step 4: Verify", styles["StepNumber"]))
-    story.append(Paragraph(
-        "Open a browser and navigate to the following URLs:",
-        styles["BodyText2"]
-    ))
-    story.append(code_block(
-        "https://your-server:5001/health    (should return Healthy)\n"
-        "https://your-server:5001/setup     (setup wizard)\n"
-        "https://your-server:5001           (dashboard)", styles))
-    story.append(Paragraph(
-        "The HTTPS endpoint uses a self signed certificate out of the box, so your browser "
-        "warns on first visit. Plain HTTP on port 5000 is available for lab use.",
-        styles["BodyText2"]
-    ))
-
-    story.append(Paragraph(
-        f"{bold('Note:')} Until the setup wizard completes, the service runs unconfigured: the "
-        f"wizard and dashboard are reachable, and CA operations answer 503.",
-        styles["Note"]
-    ))
-
-    # === 2. SYSTEM REQUIREMENTS ===
-    story.append(Paragraph("2. System Requirements", styles["SectionTitle"]))
-
-    story.append(Paragraph("Server Requirements", styles["SubSection"]))
-    req_table = make_table(
-        ["Requirement", "Details"],
-        [
-            ["Operating System", "Windows Server. Verified on Server 2019 and Server 2025. "
-                                 "On Server 2022, install current Windows updates first: the .NET 10 "
-                                 "runtime requires Control-flow Enforcement Technology there, and an "
-                                 "installation not serviced since early 2022 does not provide it "
-                                 "(build 20348.587 is confirmed too old; check with winver). The service then "
-                                 "crashes before it can log, and the installer reports the misleading "
-                                 "Error 1920. Server 2019 predates the requirement; Server 2025 ships "
-                                 "with it"],
-            ["Runtime", "ASP.NET Core 10.0 (installed automatically by Ducks-in-a-Row-Setup.exe; "
-                        "install the Hosting Bundle manually only for the bare MSI)"],
-            ["Windows Feature", "RSAT-ADCS-Mgmt (ADCS Remote Administration Tools)"],
-            ["Processor", "2 x64 cores minimum. The work is mostly I/O bound (COM and RPC "
-                          "calls to the CA, plus SQLite), with short bursts of certificate crypto"],
-            ["Memory", "1 GB minimum, 2 GB recommended"],
-            ["Disk", "About 500 MB for the application and the .NET runtime. Plan at least 5 GB "
-                     "free for database growth, logs and upgrades. At roughly 1000 ACME accounts "
-                     "renewing over 3 years the database reaches the low hundreds of MB; log "
-                     "files are capped at 30 daily files"],
-            ["Network", "TCP 5000 (HTTP) and TCP 5001 (HTTPS), both configurable"],
-            ["Domain", "Must be domain-joined for ADCS connectivity"],
-        ],
-        col_widths=[1.8 * inch, 4.7 * inch]
-    )
-    story.append(req_table)
-    story.append(Spacer(1, 8))
-
-    story.append(Paragraph("Installing Prerequisites", styles["SubSection"]))
-    story.append(Paragraph(
-        "Run the following commands in an elevated PowerShell session on the Ducks in a Row "
-        "server before installing:",
-        styles["BodyText2"]
-    ))
-    story.append(code_block(
-        "# Install ADCS Remote Administration Tools\n"
-        "Install-WindowsFeature RSAT-ADCS-Mgmt\n\n"
-        "# Verify the feature is installed\n"
-        "Get-WindowsFeature RSAT-ADCS-Mgmt\n\n"
-        "# Verify the .NET 10 runtime is installed (after the setup bundle or\n"
-        "# a manual Hosting Bundle install)\n"
-        "dotnet --list-runtimes", styles))
-    story.append(Paragraph(
-        f'{bold("Why RSAT-ADCS-Mgmt is required:")} Ducks in a Row communicates with the ADCS '
-        f'Certification Authority through the ADCS COM classes, which are registered on the '
-        f'system by the ADCS Remote Server Administration Tools. Without this feature '
-        f'installed, the COM objects cannot be instantiated and the service fails with '
-        f'{code("DISP_E_MEMBERNOTFOUND")} (0x80020003) errors during certificate sync and '
-        f'CA queries.',
-        styles["Note"]
-    ))
-    story.append(Spacer(1, 8))
-
-    story.append(Paragraph("ADCS Requirements", styles["SubSection"]))
-    story.append(Paragraph(
-        "To issue certificates through ADCS, the following must be in place:",
-        styles["BodyText2"]
-    ))
-    adcs_bullets = [
-        "An Active Directory Certificate Services (ADCS) Certification Authority (Enterprise CA)",
-        "ADCS Remote Administration Tools (RSAT-ADCS-Mgmt) installed on the Ducks in a Row server",
-        "DCOM/RPC network access from the Ducks in a Row server to the CA server (TCP 135 + dynamic ports 49152-65535)",
-        "The server's machine account must have Enroll permission on the target certificate templates",
-        "The server's machine account must have Read permission on the CA itself, or the dashboard inventory stays empty",
-        "Certificate templates must be published to Active Directory",
-    ]
-    for item in adcs_bullets:
-        story.append(Paragraph(
-            f"<bullet>&bull;</bullet>{item}",
-            styles["BulletText"]
-        ))
-
-    story.append(Spacer(1, 8))
-    story.append(Paragraph("Network Ports", styles["SubSection"]))
-    story.append(Paragraph(
-        "The following network ports must be open between the Ducks in a Row server and other systems:",
-        styles["BodyText2"]
-    ))
-    ports_table = make_table(
-        ["Direction", "Port", "Protocol", "Purpose"],
-        [
-            ["Inbound to the server", "5000, 5001", "TCP", "ACME clients and dashboard browsers (HTTP and HTTPS)"],
-            ["Outbound to CA", "135", "TCP", "DCOM/RPC endpoint mapper"],
-            ["Outbound to CA", "49152-65535", "TCP", "DCOM/RPC dynamic ports"],
-            ["Outbound to targets", "80", "TCP", "HTTP-01 challenge validation"],
-            ["Outbound to DNS", "53", "TCP/UDP", "DNS-01 challenge validation"],
-            ["Outbound to targets", "443", "TCP", "TLS-ALPN-01 challenge validation"],
-        ],
-        col_widths=[1.5 * inch, 1.2 * inch, 0.9 * inch, 2.9 * inch]
-    )
-    story.append(ports_table)
-
-    story.append(PageBreak())
-
-    # === 3. INSTALLATION ===
-    story.append(Paragraph("3. Installation", styles["SectionTitle"]))
-
-    story.append(Paragraph("What the Installer Does", styles["SubSection"]))
-    story.append(Paragraph(
-        "The Ducks in a Row MSI installer performs the following actions automatically:",
-        styles["BodyText2"]
-    ))
-
-    install_table = make_table(
-        ["Action", "Details"],
-        [
-            ["Install application files", "C:\\Program Files\\Ducks in a Row\\ (or the folder you choose)"],
-            ["Create the data folder", "C:\\ProgramData\\Ducks in a Row\\ (or the folder you choose; recorded in the registry)"],
-            ["Create logs directory", "logs\\ inside the data folder"],
-            ["Register Windows Service", "DucksInARow (auto-start, runs as LocalSystem)"],
-            ["Start the service", "Service starts immediately after install (optional)"],
-            ["Create firewall rules", "Inbound TCP 5000 and 5001 (Ducks in a Row Certificate Proxy)"],
-            ["Add a Start Menu shortcut", "Ducks in a Row shortcut that opens the web UI"],
-        ],
-        col_widths=[2.0 * inch, 4.5 * inch]
-    )
-    story.append(install_table)
-    story.append(Spacer(1, 8))
-
-    story.append(Paragraph("Silent Installation", styles["SubSection"]))
-    story.append(Paragraph(
-        "For automated deployments, use a silent install with logging. INSTALLFOLDER, "
-        "DATAFOLDER, and START_SERVICE are optional properties:",
-        styles["BodyText2"]
-    ))
-    story.append(code_block(
-        'msiexec /i Ducks-in-a-Row.msi /qn INSTALLFOLDER="D:\\Ducks in a Row" '
-        'DATAFOLDER="D:\\DucksData" START_SERVICE=0 /l*v "C:\\temp\\ducks-install.log"', styles))
-    story.append(Paragraph(
-        f'{code("INSTALLFOLDER")} and {code("DATAFOLDER")} default to the Program Files and '
-        f'ProgramData folders shown above. Choose the data folder at install time; moving it '
-        f'on a later upgrade is not supported. {code("START_SERVICE=0")} registers the service '
-        f'but leaves it stopped. A {code("/qn")} install never launches a browser.',
-        styles["BodyText2"]
-    ))
-
-    story.append(Paragraph("Service Recovery", styles["SubSection"]))
-    story.append(Paragraph(
-        "The Ducks in a Row service is configured to restart automatically on failure. "
-        "The recovery policy uses escalating delays:",
-        styles["BodyText2"]
-    ))
-    recovery_table = make_table(
-        ["Failure", "Action", "Delay"],
-        [
-            ["First failure", "Restart the service", "5 seconds"],
-            ["Second failure", "Restart the service", "10 seconds"],
-            ["Subsequent failures", "Restart the service", "30 seconds"],
-        ],
-        col_widths=[2.0 * inch, 2.5 * inch, 2.0 * inch]
-    )
-    story.append(recovery_table)
-
-    story.append(PageBreak())
-
-    # === 4. CONFIGURATION ===
-    story.append(Paragraph("4. Configuration", styles["SectionTitle"]))
-
-    story.append(Paragraph(
-        f'Configuration is layered. Shipped defaults live in {code("appsettings.json")} in the '
-        f'installation folder. The setup wizard writes instance settings (the CA connection '
-        f'string and external URL) to {code("settings.json")} in the data folder, which '
-        f'overrides the defaults and survives upgrades. Environment variables override both. '
-        f'After editing either file, restart the service for changes to take effect.',
-        styles["BodyText2"]
-    ))
-
-    story.append(Paragraph("Core Settings", styles["SubSection"]))
-    core_table = make_table(
-        ["Setting", "Default", "Description"],
-        [
-            [Paragraph(code("CaConnectionString"), styles["TableCell"]),
-             "null", "ADCS CA connection string in hostname\\CAName format; the setup wizard sets it"],
-            [Paragraph(code("DatabasePath"), styles["TableCell"]),
-             "ducks.db in the data folder", "Full path to the SQLite database file"],
-            [Paragraph(code("ExternalUrl"), styles["TableCell"]),
-             "null", "Public URL that ACME clients use to reach the server; the setup wizard sets it"],
-            [Paragraph(code("SyncIntervalMinutes"), styles["TableCell"]),
-             "5", "How often to sync certificates from the ADCS CA database"],
-            [Paragraph(code("RequestHistoryDays"), styles["TableCell"]),
-             "30", "How far back to sync pending, denied, and failed requests so their "
-                   "detail pages can show the CA's own explanation. Issued and revoked "
-                   "certificates are always synced in full. Set to 0 to skip those passes"],
-            [Paragraph(code("EnableWalMode"), styles["TableCell"]),
-             "true", "Enable SQLite WAL mode for better concurrent performance"],
-        ],
-        col_widths=[1.8 * inch, 0.8 * inch, 3.9 * inch]
-    )
-    story.append(core_table)
-    story.append(Spacer(1, 8))
-
-    story.append(Paragraph("Allowed Domains", styles["SubSection"]))
-    story.append(Paragraph(
-        "The allowed domain list restricts which DNS names ACME clients can order "
-        "certificates for. Each entry covers the domain itself and all of its subdomains: "
-        f'an entry of {code("home.local")} also allows {code("web.home.local")}, so wildcard '
-        "entries are not needed and are not accepted. Orders for names outside the list are "
-        f'refused with a {code("rejectedIdentifier")} error naming each refused domain, and '
-        "every refusal is recorded on the dashboard activity feed.",
-        styles["BodyText2"]
-    ))
-    story.append(Paragraph(
-        "The setup wizard turns the restriction on for new installs on a domain joined "
-        "server, prefilled with the AD domain. Manage it later on the Settings page under "
-        f'Allowed Domains. The list is stored in {code("ducks-setup.json")} in the data '
-        f'folder, not in {code("appsettings.json")}, and unlike the settings above it applies '
-        "immediately: no service restart is needed.",
-        styles["BodyText2"]
-    ))
-    story.append(Paragraph(
-        f'{bold("Scope:")} this is an ACME layer policy inside Ducks in a Row. The CA itself '
-        "can still issue certificates for any name through its own tools (the Certification "
-        "Authority console, certreq, or autoenrollment). To constrain the CA itself, use CA "
-        "side controls such as name constraints or template ACLs; the allowed domain list "
-        "complements them, it does not replace them.",
-        styles["Note"]
-    ))
-    story.append(Spacer(1, 8))
-
-    story.append(Paragraph("Authentication Settings", styles["SubSection"]))
-    story.append(Paragraph(
-        "The dashboard and setup API use Windows Integrated Authentication and are limited "
-        "to the administrator group.",
-        styles["BodyText2"]
-    ))
-    auth_table = make_table(
-        ["Setting", "Default", "Description"],
-        [
-            [Paragraph(code("Auth:Mode"), styles["TableCell"]),
-             "Negotiate", "Windows Integrated Authentication for the dashboard"],
-            [Paragraph(code("Auth:AdminGroup"), styles["TableCell"]),
-             "null", "Group allowed into the dashboard and setup; null means the built in Administrators group"],
-            [Paragraph(code("Auth:RequireHttps"), styles["TableCell"]),
-             "true", "HSTS and HTTP to HTTPS redirect outside development"],
-            [Paragraph(code("Auth:TrustedProxies"), styles["TableCell"]),
-             "[]", "Reverse proxy IPs whose X-Forwarded-* headers are trusted"],
-        ],
-        col_widths=[1.8 * inch, 0.8 * inch, 3.9 * inch]
-    )
-    story.append(auth_table)
-    story.append(Spacer(1, 8))
-
-    story.append(Paragraph("Minimum Required Configuration", styles["SubSection"]))
-    story.append(Paragraph(
-        "The setup wizard writes everything the service needs. For reference, after setup the "
-        f'{code("settings.json")} file in the data folder looks like this:',
-        styles["BodyText2"]
-    ))
-    story.append(code_block(
-        '{\n'
-        '  "Certus": {\n'
-        '    "CaConnectionString": "CA-SERVER\\\\MyCA",\n'
-        '    "ExternalUrl": "https://ducks.yourdomain.local:5001"\n'
-        '  }\n'
-        '}', styles))
-    story.append(Paragraph(
-        f'{bold("Important:")} The {code("ExternalUrl")} must be reachable by ACME clients on your '
-        f'network. This URL is embedded in ACME directory responses and challenge URLs. Use HTTPS '
-        f'in production environments.',
-        styles["Warning"]
-    ))
-
-    story.append(Paragraph("Kestrel Web Server", styles["SubSection"]))
-    story.append(Paragraph(
-        f'By default, Ducks in a Row listens on all interfaces on TCP 5000 (HTTP) and TCP 5001 '
-        f'(HTTPS). The HTTPS endpoint uses a self signed certificate out of the box, generated '
-        f'in the data folder as {code("ducks-selfsigned.pfx")}, so browsers warn on first '
-        f'visit and ACME clients will not trust it.',
-        styles["BodyText2"]
-    ))
-    story.append(Paragraph(
-        f'{bold("The easiest fix is built in.")} On the external URL step, the setup wizard can '
-        f'enrol an HTTPS certificate for this server from the CA you connected, install it, and '
-        f'reload the service. The Settings page can renew it later. Use that first.',
-        styles["Note"]
-    ))
-    story.append(Paragraph(
-        "If you would rather supply your own certificate, point Kestrel at one your clients "
-        "already trust (for example, a certificate issued by your own CA whose root your "
-        "clients trust):",
-        styles["BodyText2"]
-    ))
-    story.append(code_block(
-        '"Kestrel": {\n'
-        '  "Endpoints": {\n'
-        '    "Https": {\n'
-        '      "Url": "https://0.0.0.0:5001",\n'
-        '      "Certificate": {\n'
-        '        "Path": "C:\\\\ProgramData\\\\Ducks in a Row\\\\ducks.pfx",\n'
-        '        "Password": "your-pfx-password"\n'
-        '      }\n'
-        '    }\n'
-        '  }\n'
-        '}', styles))
-    story.append(Paragraph(
-        f'For a quick lab test only, you can set {code("Auth:RequireHttps")} to '
-        f'{code("false")} and use plain HTTP on port 5000 instead.',
-        styles["BodyText2"]
-    ))
-
-    story.append(Paragraph("Logging", styles["SubSection"]))
-    story.append(Paragraph(
-        f'Ducks in a Row uses Serilog for structured logging. Logs are written to '
-        f'{code("logs\\")} in the data folder with daily rotation and a 30-day '
-        f'retention policy. Adjust the minimum log level in the Serilog configuration section:',
-        styles["BodyText2"]
-    ))
-    story.append(code_block(
-        '"Serilog": {\n'
-        '  "MinimumLevel": {\n'
-        '    "Default": "Information",\n'
-        '    "Override": {\n'
-        '      "Microsoft.AspNetCore": "Warning",\n'
-        '      "Microsoft.EntityFrameworkCore": "Warning"\n'
-        '    }\n'
-        '  }\n'
-        '}', styles))
-
-    story.append(PageBreak())
-
-    # === 5. ADCS CONFIGURATION ===
-    story.append(Paragraph("5. ADCS Configuration", styles["SectionTitle"]))
-
-    story.append(Paragraph("Finding Your CA Connection String", styles["SubSection"]))
-    story.append(Paragraph(
-        "The CA connection string follows the format "
-        f'{code("hostname\\CAName")}. The setup wizard finds it for you, so you rarely need '
-        f'to build it by hand. The manual options below are a fallback.',
-        styles["BodyText2"]
-    ))
-
-    story.append(Paragraph("Option A: Let the Setup Wizard Discover It", styles["SubSubSection"]))
-    story.append(Paragraph(
-        f'Open {code("https://your-server:5001/setup")} after installation. The wizard '
-        f'discovers the ADCS CAs published in Active Directory, lets you pick one, and tests '
-        f'connectivity through the same path the service uses. This is the recommended way and '
-        f'needs no connection string typed by hand.',
-        styles["BodyText2"]
-    ))
-
-    story.append(Paragraph("Option B: From the CA Server", styles["SubSubSection"]))
-    story.append(Paragraph(
-        f'Open the Certification Authority MMC snap-in ({code("certsrv.msc")}) on your CA server. '
-        f'The CA name appears in the console tree. The connection string is the CA server hostname '
-        f'followed by a backslash and the CA name.',
-        styles["BodyText2"]
-    ))
-
-    story.append(Paragraph("Option C: Using PowerShell", styles["SubSubSection"]))
-    story.append(Paragraph(
-        "Run this on any domain-joined machine to discover CAs in your forest:",
-        styles["BodyText2"]
-    ))
-    story.append(code_block(
-        "certutil -config - -ping", styles))
-    story.append(Paragraph(
-        "This displays a list of available CAs. The output includes the connection "
-        "string in the required format.",
-        styles["BodyText2"]
-    ))
-
-    story.append(Paragraph("Certificate Template Permissions", styles["SubSection"]))
-    story.append(Paragraph(
-        "For Ducks in a Row to issue certificates on behalf of ACME clients, the server's "
-        "machine account needs Enroll permission on each certificate template you plan to use. "
-        "To configure this:",
-        styles["BodyText2"]
-    ))
-    template_steps = [
-        f'Open the Certification Authority MMC ({code("certsrv.msc")}) on your CA server.',
-        "Right-click the target certificate template and select Properties.",
-        "Go to the Security tab.",
-        f'Add the Ducks in a Row server machine account (e.g., {code("DUCKS-SERVER$")}).',
-        "Grant the Enroll permission. Do not grant Autoenroll.",
-        "Click OK and repeat for each template.",
-    ]
-    for i, step in enumerate(template_steps, 1):
-        story.append(Paragraph(
-            f"<bullet>{i}.</bullet>{step}",
-            styles["BulletText"]
-        ))
-
-    story.append(Spacer(1, 8))
-    story.append(Paragraph("CA Read Permission", styles["SubSection"]))
-    story.append(Paragraph(
-        "The machine account also needs Read permission on the CA itself (Certification "
-        "Authority console, CA properties, Security tab). Read is what lets the dashboard "
-        "sync the certificate inventory. Without it, enrolment still works but the dashboard "
-        "stays empty.",
-        styles["BodyText2"]
-    ))
-
-    story.append(Spacer(1, 8))
-    story.append(Paragraph("Template URL Mapping", styles["SubSection"]))
-    story.append(Paragraph(
-        "Each ADCS certificate template is exposed as its own ACME directory endpoint. "
-        "ACME clients target the URL for the specific template they need:",
-        styles["BodyText2"]
-    ))
-    template_table = make_table(
-        ["Template Name", "ACME Directory URL"],
-        [
-            ["WebServer", "https://your-server:5001/acme/WebServer/directory"],
-            ["(your template name)", "https://your-server:5001/acme/{template-name}/directory"],
-        ],
-        col_widths=[2.0 * inch, 4.5 * inch]
-    )
-    story.append(template_table)
-
-    story.append(Paragraph(
-        f"{bold('Note:')} The template segment is the template's programmatic name (its AD cn) "
-        f"or its display name, matched case insensitively. Display names with spaces work; "
-        f"the client URL encodes them.",
-        styles["Note"]
-    ))
-
-    story.append(PageBreak())
-
-    # === 6. TESTING YOUR INSTALLATION ===
-    story.append(Paragraph("6. Testing Your Installation", styles["SectionTitle"]))
-
-    story.append(Paragraph("Service Status", styles["SubSection"]))
-    story.append(Paragraph(
-        "Verify the Ducks in a Row service is running:",
-        styles["BodyText2"]
-    ))
-    story.append(code_block(
-        "Get-Service DucksInARow\n\n"
-        "# Expected output:\n"
-        "# Status   Name          DisplayName\n"
-        "# ------   ----          -----------\n"
-        "# Running  DucksInARow   Ducks in a Row Certificate Proxy", styles))
-
-    story.append(Paragraph("Health Endpoint", styles["SubSection"]))
-    story.append(Paragraph(
-        "The health check endpoint reports the status of the database and CA connectivity:",
-        styles["BodyText2"]
-    ))
-    story.append(code_block(
-        "Invoke-RestMethod https://your-server:5001/health\n\n"
-        "# Returns: Healthy, Degraded, or Unhealthy", styles))
-    health_table = make_table(
-        ["Status", "Meaning"],
-        [
-            ["Healthy", "Database is accessible and CA connection is working"],
-            ["Degraded", "Database is working but CA is not reachable"],
-            ["Unhealthy", "Database is not accessible"],
-        ],
-        col_widths=[1.5 * inch, 5.0 * inch]
-    )
-    story.append(health_table)
-    story.append(Spacer(1, 8))
-
-    story.append(Paragraph("ACME Directory", styles["SubSection"]))
-    story.append(Paragraph(
-        "Test that ACME endpoints are responding correctly:",
-        styles["BodyText2"]
-    ))
-    story.append(code_block(
-        "Invoke-RestMethod https://your-server:5001/acme/WebServer/directory | ConvertTo-Json\n\n"
-        '# Expected: JSON with newNonce, newAccount, newOrder URLs', styles))
-
-    story.append(Paragraph("Firewall Verification", styles["SubSection"]))
-    story.append(Paragraph(
-        "Confirm the firewall rules (HTTP and HTTPS) were created by the installer:",
-        styles["BodyText2"]
-    ))
-    story.append(code_block(
-        'Get-NetFirewallRule -DisplayName "Ducks in a Row Certificate Proxy*"', styles))
-
-    story.append(Paragraph("Dashboard Access", styles["SubSection"]))
-    story.append(Paragraph(
-        f'Open {code("https://your-server:5001")} in a browser and sign in as a member of '
-        f'the administrator group. The dashboard displays certificate inventory, expiry '
-        f'status, and template information. On first access, you may be redirected to the '
-        f'setup wizard at {code("/setup")}.',
-        styles["BodyText2"]
-    ))
-    story.extend(figure(
-        "dashboard-overview.png",
-        "The dashboard after the first sync, showing the certificate inventory and expiry tiles.",
-        styles,
-    ))
-
-    story.append(Paragraph("CA Connectivity Test", styles["SubSection"]))
-    story.append(Paragraph(
-        f'The setup wizard at {code("https://your-server:5001/setup")} includes a built in '
-        f'connectivity test. Click {bold("Test Connection")} to verify DCOM/RPC communication '
-        f'with your ADCS CA. The test will report the CA name, server, and available templates.',
-        styles["BodyText2"]
-    ))
-
-    story.append(PageBreak())
-
-    # === 7. CONNECTING ACME CLIENTS ===
-    story.append(Paragraph("7. Connecting ACME Clients", styles["SectionTitle"]))
-    story.append(Paragraph(
-        "Ducks in a Row implements RFC 8555 (ACME), so any standard ACME client works out of "
-        "the box. No agent or proprietary software is needed on your endpoints. Use the HTTPS "
-        "endpoint (5001) in production; plain HTTP (5000) is for lab use only. The example "
-        "commands are representative; exact flags vary by client version, so check each "
-        "client's own documentation for your release.",
-        styles["BodyText2"]
-    ))
-    story.append(Paragraph(
-        f"{bold('Trusting the server TLS:')} ACME clients reject an untrusted TLS certificate "
-        f"on the ACME server itself. Give Ducks in a Row a certificate your clients already "
-        f"trust (for example, one chained to your internal CA root), or add that root to each "
-        f"client's trust store. The examples below note the per client switch for a lab where "
-        f"the server still uses its self signed certificate.",
-        styles["Note"]
-    ))
-
-    story.append(Paragraph("Certbot (Linux)", styles["SubSection"]))
-    story.append(code_block(
-        "# HTTP-01, certbot answers the challenge itself on port 80\n"
-        "certbot certonly --standalone \\\n"
-        "  --server https://your-server:5001/acme/WebServer/directory \\\n"
-        "  --email you@example.com \\\n"
-        "  -d host.corp.example.com \\\n"
-        "  --key-type rsa --rsa-key-size 2048", styles))
-    story.append(Paragraph(
-        f"{bold('Key type:')} If your ADCS template uses an RSA CSP (the default Web Server "
-        f"ACME template does), your ACME client must request an RSA key. Most modern clients "
-        f"default to elliptic curve keys, which the CA policy module rejects at finalize with "
-        f"{code('Denied by Policy Module')}. The last line above forces RSA for certbot. "
-        f"Other clients: lego {code('--key-type rsa2048')}, acme.sh {code('--keylength 2048')}, "
-        f"dehydrated {code('KEY_ALGO=&quot;rsa&quot;')}.",
-        styles["Warning"]
-    ))
-    story.append(Paragraph(
-        f"Accounts do not need to be registered in advance and no external account binding is "
-        f"required; the client creates an account from its own key on first use. For a lab "
-        f"server with an untrusted TLS certificate, set {code('REQUESTS_CA_BUNDLE')} to your "
-        f"CA root PEM so certbot trusts the endpoint.",
-        styles["BodyText2"]
-    ))
-
-    story.append(Paragraph("win-acme (Windows)", styles["SubSection"]))
-    story.append(Paragraph(
-        "Run wacs.exe and, in the menu, set the ACME server to the template directory URL, "
-        "then create a certificate. Unattended example:",
-        styles["BodyText2"]
-    ))
-    story.append(code_block(
-        "wacs.exe --source iis --siteid 1 ^\n"
-        "  --baseuri https://your-server:5001/acme/WebServer/directory", styles))
-    story.append(Paragraph(
-        "win-acme uses the Windows certificate trust store, so import your CA root on the "
-        "machine running it if the server certificate is not already trusted.",
-        styles["BodyText2"]
-    ))
-
-    story.append(Paragraph("Caddy", styles["SubSection"]))
-    story.append(code_block(
-        "# Caddyfile\n"
-        "{\n"
-        "  acme_ca https://your-server:5001/acme/WebServer/directory\n"
-        "  # For an internal CA, point Caddy at the root so it trusts the ACME endpoint\n"
-        "  acme_ca_root /etc/ssl/certs/corp-root.pem\n"
-        "  email you@example.com\n"
-        "}\n\n"
-        "host.corp.example.com {\n"
-        '  respond "Hello from Caddy"\n'
-        "}", styles))
-
-    story.append(Paragraph("Traefik", styles["SubSection"]))
-    story.append(code_block(
-        "# traefik.yml\n"
-        "certificatesResolvers:\n"
-        "  ducks:\n"
-        "    acme:\n"
-        "      caServer: https://your-server:5001/acme/WebServer/directory\n"
-        "      email: you@example.com\n"
-        "      storage: /etc/traefik/acme.json\n"
-        "      httpChallenge:\n"
-        "        entryPoint: web", styles))
-    story.append(Paragraph(
-        "Traefik uses the host or container trust store. Add your CA root there if the ACME "
-        "endpoint certificate is not already trusted.",
-        styles["BodyText2"]
-    ))
-
-    story.append(Paragraph("Posh-ACME (PowerShell)", styles["SubSection"]))
-    story.append(code_block(
-        "Import-Module Posh-ACME\n\n"
-        "# Point Posh-ACME at the template directory.\n"
-        "# Add -SkipCertificateCheck only for a lab server with untrusted TLS.\n"
-        "Set-PAServer -DirectoryUrl https://your-server:5001/acme/WebServer/directory\n\n"
-        "New-PAAccount -Contact you@example.com -AcceptTOS\n\n"
-        "New-PACertificate -Domain host.corp.example.com -Plugin WebRoot `\n"
-        "  -PluginArgs @{ WebRootPath = 'C:\\inetpub\\wwwroot' }", styles))
-
-    story.append(Paragraph("Challenge Types", styles["SubSection"]))
-    challenge_table = make_table(
-        ["Type", "Use Case", "How It Works"],
-        [
-            ["HTTP-01", "Standard web servers",
-             "Fetches http://{domain}/.well-known/acme-challenge/{token}"],
-            ["DNS-01", "Wildcards, hosts with no inbound HTTP",
-             "Looks up the TXT record at _acme-challenge.{domain}"],
-            ["TLS-ALPN-01", "TLS only environments",
-             "Opens a TLS connection on port 443 and checks the ALPN certificate"],
-        ],
-        col_widths=[1.2 * inch, 1.8 * inch, 3.5 * inch]
-    )
-    story.append(challenge_table)
-    story.append(Paragraph(
-        "The Ducks in a Row server is the party that performs validation, so the server "
-        "needs outbound reachability to the domain or DNS being validated.",
-        styles["BodyText2"]
-    ))
-    story.append(Paragraph(
-        "Outbound validation is screened. The server always refuses to validate targets on "
-        "loopback, link local (including the cloud metadata address), and IPv6 unique local "
-        "addresses. The RFC 1918 private ranges are allowed by default, because an internal "
-        f"CA usually issues for exactly those addresses. Set "
-        f"{code('Certus:Acme:ChallengeValidation:BlockPrivateRanges')} to {code('true')} when "
-        f"every validation target is public, or list extra ranges in "
-        f"{code('AdditionalBlockedCidrs')}. The hardening guide in the docs folder covers "
-        "the tradeoff.",
-        styles["BodyText2"]
-    ))
-
-    story.append(PageBreak())
-
-    # === 8. ALERT CONFIGURATION ===
-    story.append(Paragraph("8. Alert Configuration", styles["SectionTitle"]))
-    story.append(Paragraph(
-        "Ducks in a Row monitors certificate expiry and sends notifications through email "
-        "and webhooks. Alerts are included in the free tier with no limits.",
-        styles["BodyText2"]
-    ))
-
-    story.append(Paragraph("Alert Thresholds", styles["SubSection"]))
-    story.append(Paragraph(
-        "By default, alerts fire at 30, 14, 7, and 1 day(s) before certificate expiry. "
-        "Each certificate receives at most one alert per threshold (no duplicates). The "
-        "monitor checks for expiring certificates every 60 minutes by default "
-        f'({code("CheckIntervalMinutes")}).',
-        styles["BodyText2"]
-    ))
-
-    story.append(Paragraph("SMTP Email Alerts", styles["SubSection"]))
-    story.append(Paragraph(
-        "The whole SMTP transport can be set from the Alerts card on the Settings page: "
-        "relay host, port, transport security, username and password, sender address and "
-        "sender name, and the recipients. That is the recommended route, it needs no file "
-        "editing, and the password is stored encrypted in the data directory rather than "
-        "in a configuration file. The block below is what a fresh install starts from and "
-        "remains available for scripted or unattended configuration; the file remains the "
-        f'only way to configure the webhook. {code("TlsMode")} accepts {code("none")}, '
-        f'{code("starttls")} or {code("implicit")}; without it, {code("UseSsl")} plus the '
-        "port decide (465 means implicit TLS, anything else negotiates mandatory STARTTLS).",
-        styles["BodyText2"]
-    ))
-    story.append(code_block(
-        '"Certus:Alerts": {\n'
-        '  "Enabled": true,\n'
-        '  "CheckIntervalMinutes": 60,\n'
-        '  "ThresholdDays": [30, 14, 7, 1],\n'
-        '  "Smtp": {\n'
-        '    "Host": "smtp.yourdomain.local",\n'
-        '    "Port": 587,\n'
-        '    "TlsMode": "starttls",\n'
-        '    "Username": "ducks@yourdomain.local",\n'
-        '    "Password": "your-smtp-password",\n'
-        '    "FromAddress": "ducks@yourdomain.local",\n'
-        '    "FromName": "Ducks in a Row",\n'
-        '    "Recipients": ["admin@yourdomain.local"]\n'
-        '  }\n'
-        '}', styles))
-    story.append(Paragraph(
-        f'<b>Once a setting has been saved from the dashboard, the file no longer decides it.</b> '
-        f'Saving on the Alerts card writes the whole writable set, {code("Enabled")}, '
-        f'{code("CheckIntervalMinutes")}, {code("ThresholdDays")}, and every SMTP transport '
-        "field, into a settings file in the data directory, which outranks appsettings.json. "
-        "Editing those keys in the file after that has no effect, and the Alerts card lists "
-        "which ones it now owns so the situation is visible rather than puzzling. A password "
-        "saved from the dashboard is protected with the machine's Data Protection keyring: "
-        "it never appears in any file in readable form, it is never returned by the API, and "
-        "after restoring the data directory onto a different machine it cannot be decrypted "
-        "by design, so save it again from the Settings page there. The webhook block is "
-        "never written by the dashboard and is always read from the file.",
-        styles["BodyText2"]
-    ))
-    story.append(Paragraph(
-        "An environment variable or command line argument still outranks both. Where one is "
-        "in use, the Alerts card disables that field and says why, rather than accepting an "
-        "edit that could never come into force.",
-        styles["BodyText2"]
-    ))
-
-    story.append(Paragraph("Webhook Alerts", styles["SubSection"]))
-    story.append(Paragraph(
-        "Webhooks send a JSON payload via HTTP POST. The payload is signed with HMAC-SHA256 "
-        f'using the configured secret. The signature is sent in the {code("X-Certus-Signature")} header.',
-        styles["BodyText2"]
-    ))
-    story.append(code_block(
-        '"Webhook": {\n'
-        '  "Url": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL",\n'
-        '  "Secret": "your-hmac-secret",\n'
-        '  "Headers": {\n'
-        '    "X-Custom-Header": "value"\n'
-        '  }\n'
-        '}', styles))
-
-    story.append(Paragraph("Alert History", styles["SubSection"]))
-    story.append(Paragraph(
-        f'Sent alerts are recorded and available through the API at '
-        f'{code("GET /api/alerts/history")} and {code("GET /api/alerts/summary")}, '
-        f'and in the dashboard on the Settings page.',
-        styles["BodyText2"]
-    ))
-
-    story.append(Paragraph("Alerts in the Dashboard", styles["SubSection"]))
-    story.append(Paragraph(
-        "The Alerts card on the Settings page shows whether expiry monitoring is on, how "
-        "often it checks, the warning thresholds in force, who is on the email recipient "
-        "list, whether a webhook is configured, and the most recent alerts including any "
-        "that failed.",
-        styles["BodyText2"]
-    ))
-    story.append(Paragraph(
-        "Expiry monitoring, the check interval, the warning thresholds, the SMTP relay host, "
-        "the sender address and the recipient list can all be changed here and saved. "
-        "<b>A saved change is not in force until the service restarts.</b> Alerting reads its "
-        "settings once when the service starts, so the card keeps showing what the service is "
-        "actually running on and offers a <b>Restart now</b> button beside the notice. Until "
-        "that restart, the figures on the card and the expiry counts elsewhere in the "
-        "dashboard reflect the old settings, which is deliberate: appearing to have changed "
-        "monitoring when it has not is worse than asking for a restart.",
-        styles["BodyText2"]
-    ))
-    story.append(Paragraph(
-        "The card never shows the SMTP username or password, the webhook secret, or the "
-        "webhook address, and none of them can be set from it. Sending one is refused rather "
-        "than ignored. The webhook address is withheld because it commonly carries an access "
-        "token in the URL, which is how most webhook services authenticate. The relay host and "
-        "sender address are shown, because neither is a credential and a field that can be "
-        "edited but not seen cannot be edited safely.",
-        styles["BodyText2"]
-    ))
-    story.append(Paragraph(
-        "The card also has a <b>Send a test</b> button, which delivers over every configured "
-        "channel and reports what each one did. Use it after changing SMTP settings: mail "
-        "configuration fails quietly, and this is the fastest way to find out that it has. "
-        "The test is clearly marked as a test in both channels, so a recipient cannot mistake "
-        "it for a real expiry warning: the email subject leads with "
-        f'{code("[Ducks in a Row TEST]")}, and the webhook payload carries the event '
-        f'{code("test.alert")} with {code("test: true")} and no certificate list. It is signed '
-        "with the same HMAC secret as a real alert, so it proves the real delivery path.",
-        styles["BodyText2"]
-    ))
-    story.append(Paragraph(
-        "A test writes nothing to the alert history, so it cannot be mistaken later for a real "
-        "warning and cannot suppress one. There is a cooldown of about a minute between tests, "
-        "shared by everyone signed in.",
-        styles["BodyText2"]
-    ))
-    story.append(Paragraph(
-        "A delivered test proves delivery only. It does not mean expiry monitoring is switched "
-        f'on: that is the separate {code("Enabled")} setting, and the card says so when it is off.',
-        styles["BodyText2"]
-    ))
-
-    story.append(PageBreak())
-
-    # === 9. TROUBLESHOOTING ===
-    story.append(Paragraph("9. Troubleshooting", styles["SectionTitle"]))
-
-    trouble_items = [
-        (
-            "Service fails to start",
-            f'Check the Windows Event Log (Application) and the log files at '
-            f'{code("logs\\")} in the data folder. Common causes: missing .NET 10 runtime, '
-            f'invalid {code("appsettings.json")} or {code("settings.json")} syntax (trailing '
-            f'commas, missing quotes), or ports 5000 or 5001 already in use by another process. '
-            f'To see the actual error, run the executable directly from an elevated PowerShell: '
-            f'{code("&amp; &quot;C:\\Program Files\\Ducks in a Row\\DucksInARow.Service.exe&quot;")}'
-        ),
-        (
-            "CA operations answer 503, or the dashboard routes to the setup wizard",
-            "No CA is configured yet. The service starts unconfigured and never falls back to a "
-            "fake CA on its own. Complete the setup wizard; it discovers the CAs in Active "
-            "Directory, tests the connection, applies the configuration, and restarts the "
-            "service."
-        ),
-        (
-            "COM activation or DISP_E_MEMBERNOTFOUND errors during CA operations",
-            f'The ADCS COM classes are not registered on the Ducks in a Row server. Install the '
-            f'ADCS Remote Administration Tools: '
-            f'{code("Install-WindowsFeature RSAT-ADCS-Mgmt")} and then restart the service. '
-            f'This feature must be installed even though this server is not the CA server. '
-            f'The COM class registrations are provided by the RSAT feature package.'
-        ),
-        (
-            "Health endpoint returns Degraded",
-            "The database is working but the CA is not reachable. Verify the "
-            f'{code("CaConnectionString")} (in {code("settings.json")} in the data folder) is '
-            f'correct and uses the format {code("hostname\\CAName")}. Confirm DCOM/RPC traffic '
-            f'is not blocked by a firewall (TCP 135 and dynamic ports 49152-65535), and the '
-            f'server has network access to the CA. Test with: '
-            f'{code("certutil -config &quot;SERVER\\CA&quot; -ping")}'
-        ),
-        (
-            "Health endpoint returns Unhealthy",
-            f'The SQLite database is not accessible. Verify the {code("DatabasePath")} points to a '
-            f'valid, writable location. Check that the data folder exists and the LocalSystem '
-            f'account has write access.'
-        ),
-        (
-            "ACME client gets connection refused",
-            'Verify the service is running (' + code("Get-Service DucksInARow") + '), the firewall rule '
-            'exists (' + code("Get-NetFirewallRule -DisplayName &quot;Ducks in a Row*&quot;") + '), and the '
-            '' + code("ExternalUrl") + ' in configuration matches how clients reach the server.'
-        ),
-        (
-            "Certificate request fails with template error",
-            "The template name in the directory URL must match a template the CA publishes, "
-            "either by its programmatic name (AD cn) or its display name; names are matched "
-            "case insensitively. Confirm the template is published to Active Directory and "
-            "the server's machine account has Enroll permission."
-        ),
-        (
-            "ACME client reports a TLS or certificate trust error",
-            f'The HTTPS endpoint uses a self signed certificate by default '
-            f'({code("ducks-selfsigned.pfx")} in the data folder), and ACME clients reject '
-            f'untrusted TLS on the ACME server. Give Ducks in a Row a certificate your '
-            f'clients trust, or add that certificate root to each client trust store.'
-        ),
-        (
-            "Cannot reach the dashboard, or get a 401",
-            f'The dashboard and setup API use Windows Integrated Authentication and are '
-            f'limited to the administrator group. Sign in as a member of the built in '
-            f'Administrators group, or set {code("Auth:AdminGroup")} to the Windows or '
-            f'Active Directory group you want to allow, then restart the service.'
-        ),
-        (
-            "DCOM authentication errors",
-            "The Ducks in a Row server must be domain joined. Verify the machine account has not "
-            "been disabled or moved to a restricted OU. Check that DCOM port ranges (TCP 135 + "
-            "dynamic ports 49152-65535) are open between this server and the CA server."
-        ),
-        (
-            "Service exits silently with no log output",
-            f'Run the executable directly to see the error: '
-            f'{code("dotnet &quot;C:\\Program Files\\Ducks in a Row\\DucksInARow.Service.dll&quot;")} '
-            f'Common causes include malformed JSON in {code("appsettings.json")} or '
-            f'{code("settings.json")} (use a JSON validator to check syntax), missing .NET '
-            f'runtime, or file permission issues. '
-            f'Set the environment variable {code("ASPNETCORE_ENVIRONMENT=Development")} '
-            f'before running to enable detailed error output.'
-        ),
-        (
-            "Dashboard shows no certificates",
-            f'The machine account needs Read permission on the CA (Certification Authority '
-            f'console, CA properties, Security tab); without it, enrolment still works but the '
-            f'inventory sync cannot read the CA database and the log reports "CA view access '
-            f'denied". The sync also runs only every {code("SyncIntervalMinutes")} (default '
-            f'5), so wait for the first cycle or restart the service to force one.'
-        ),
-        (
-            "ACME order rejected: domain is not in the allowed domain list",
-            f'The allowed domain restriction is on and the requested name falls outside every '
-            f'allowed domain. The client sees a {code("rejectedIdentifier")} error naming the '
-            f'refused domains. On the Settings page under Allowed Domains, add the domain '
-            f'(subdomains of an entry are covered automatically) or turn the restriction off. '
-            f'Changes apply immediately with no restart, and each rejected order also appears '
-            f'on the dashboard activity feed as Rejected.'
-        ),
-    ]
-
-    for title, desc in trouble_items:
-        story.append(Paragraph(title, styles["SubSection"]))
-        story.append(Paragraph(desc, styles["BodyText2"]))
-
-    story.append(PageBreak())
-
-    # === 10. UNINSTALLING ===
-    story.append(Paragraph("10. Uninstalling", styles["SectionTitle"]))
-    story.append(Paragraph(
-        "Ducks in a Row can be removed through Windows Add/Remove Programs or from the command line:",
-        styles["BodyText2"]
-    ))
-    story.append(code_block(
-        "msiexec /x Ducks-in-a-Row.msi", styles))
-
-    story.append(Paragraph("What the uninstaller removes:", styles["SubSection"]))
-    remove_items = [
-        "All application files from C:\\Program Files\\Ducks in a Row\\",
-        "The DucksInARow Windows Service registration (the service is stopped first)",
-        "The Ducks in a Row Certificate Proxy firewall rules",
-    ]
-    for item in remove_items:
-        story.append(Paragraph(
-            f"<bullet>&bull;</bullet>{item}",
-            styles["BulletText"]
-        ))
-
-    story.append(Spacer(1, 8))
-    story.append(Paragraph("What the uninstaller preserves:", styles["SubSection"]))
-    keep_items = [
-        "The SQLite database (ducks.db in the data folder)",
-        "Log files (logs\\ in the data folder)",
-        "The data folder itself (default C:\\ProgramData\\Ducks in a Row\\)",
-    ]
-    for item in keep_items:
-        story.append(Paragraph(
-            f"<bullet>&bull;</bullet>{item}",
-            styles["BulletText"]
-        ))
-    story.append(Spacer(1, 8))
-    story.append(Paragraph(
-        "To perform a complete removal including all data, delete the data directory manually "
-        "after uninstalling:",
-        styles["BodyText2"]
-    ))
-    story.append(code_block(
-        'Remove-Item -Recurse -Force "C:\\ProgramData\\Ducks in a Row"', styles))
+    # === CHAPTERS ===
+    # Every chapter is rendered from its markdown file in this folder, so the
+    # guide and the web docs cannot disagree about what the product does. The
+    # chapter number comes from the position in CHAPTERS and is never written
+    # down, so reordering the guide cannot strand a stale number.
+    anchors = build_anchor_index(CHAPTERS, DOCS_DIR)
+    for number, chapter in enumerate(CHAPTERS, 1):
+        story.extend(render_chapter(chapter, number, styles, anchors, DOCS_DIR))
+        story.append(PageBreak())
+
+    # The colophon shares the last chapter's page, as it did when the prose
+    # lived here, so drop the break the loop just added.
+    if story and isinstance(story[-1], PageBreak):
+        story.pop()
 
     story.append(Spacer(1, 1.0 * inch))
     # Final footer
@@ -1512,7 +950,16 @@ def build_document():
     # Build the PDF. multiBuild runs the extra passes the table of contents
     # needs to resolve its page numbers.
     doc.multiBuild(story)
+
+    # Record the digest of everything the guide was rendered from, so CI can
+    # tell a stale PDF from a current one without rebuilding it. Comparing
+    # the PDF bytes instead would be a stronger claim than the toolchain
+    # supports: ReportLab's output differs between its own versions and
+    # between Python versions, so a guide regenerated on another machine is
+    # byte different while being word for word identical.
+    manifest.write_digest()
     print(f"PDF generated: {OUTPUT_PATH}")
+    print(f"Inputs digest: {manifest.read_digest()}")
 
 
 if __name__ == "__main__":

@@ -108,7 +108,7 @@ public class RevocationScopeEnforcementIntegrationTests : IDisposable
         response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
         var body = await BodyAsync(response);
         body.GetProperty("type").GetString().Should().Be(
-            "https://ducksinarow.app/problems/revocation-out-of-scope");
+            "https://ducksinarow.dev/problems/revocation-out-of-scope");
         body.GetProperty("detail").GetString().Should().Contain("ducks-managed");
 
         // The detail response carries the same reason and the frontend keys
@@ -147,7 +147,7 @@ public class RevocationScopeEnforcementIntegrationTests : IDisposable
         var refused = await PostRevokeAsync(unlisted.Id, unlisted.Serial);
         refused.StatusCode.Should().Be(HttpStatusCode.Forbidden);
         (await BodyAsync(refused)).GetProperty("type").GetString().Should().Be(
-            "https://ducksinarow.app/problems/revocation-out-of-scope");
+            "https://ducksinarow.dev/problems/revocation-out-of-scope");
     }
 
     [Fact]
@@ -184,6 +184,6 @@ public class RevocationScopeEnforcementIntegrationTests : IDisposable
 
         response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
         (await BodyAsync(response)).GetProperty("type").GetString().Should().Be(
-            "https://ducksinarow.app/problems/revocation-blocked-by-guardrail");
+            "https://ducksinarow.dev/problems/revocation-blocked-by-guardrail");
     }
 }

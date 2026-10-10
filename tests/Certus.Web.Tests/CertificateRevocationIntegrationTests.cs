@@ -75,7 +75,7 @@ public class CertificateRevocationIntegrationTests
 
         response.StatusCode.Should().Be(HttpStatusCode.Conflict);
         (await ProblemTypeAsync(response)).Should().Be(
-            "https://ducksinarow.app/problems/certificate-already-revoked");
+            "https://ducksinarow.dev/problems/certificate-already-revoked");
         Adcs.RevokedSerials.Should().NotContain(s =>
             SerialNumbers.NormalizedEquals(s, serial));
     }
@@ -90,7 +90,7 @@ public class CertificateRevocationIntegrationTests
 
         response.StatusCode.Should().Be(HttpStatusCode.Conflict);
         (await ProblemTypeAsync(response)).Should().Be(
-            "https://ducksinarow.app/problems/certificate-not-revocable");
+            "https://ducksinarow.dev/problems/certificate-not-revocable");
     }
 
     [Theory]
@@ -106,7 +106,7 @@ public class CertificateRevocationIntegrationTests
 
         response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
         (await ProblemTypeAsync(response)).Should().Be(
-            "https://ducksinarow.app/problems/invalid-revocation-reason");
+            "https://ducksinarow.dev/problems/invalid-revocation-reason");
         Adcs.RevokedSerials.Should().NotContain(s =>
             SerialNumbers.NormalizedEquals(s, target.Serial));
     }
@@ -120,7 +120,7 @@ public class CertificateRevocationIntegrationTests
 
         response.StatusCode.Should().Be(HttpStatusCode.Conflict);
         (await ProblemTypeAsync(response)).Should().Be(
-            "https://ducksinarow.app/problems/revocation-target-mismatch");
+            "https://ducksinarow.dev/problems/revocation-target-mismatch");
         Adcs.RevokedSerials.Should().NotContain(s =>
             SerialNumbers.NormalizedEquals(s, target.Serial));
 
@@ -178,6 +178,7 @@ public class CertificateRevocationIntegrationTests
                         JwkThumbprint = $"revoke-test-thumb-{suffix}",
                     },
                     Status = "valid",
+                    CertificateId = $"revoke-test-{suffix}",
                     TemplateId = "WebServer",
                     ExpiresAt = DateTime.UtcNow.AddDays(1),
                 },
@@ -232,7 +233,7 @@ public class CertificateRevocationIntegrationTests
 
         response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
         (await ProblemTypeAsync(response)).Should().Be(
-            "https://ducksinarow.app/problems/revocation-blocked-by-guardrail");
+            "https://ducksinarow.dev/problems/revocation-blocked-by-guardrail");
         Adcs.RevokedSerials.Should().NotContain(s =>
             SerialNumbers.NormalizedEquals(s, serial));
 
@@ -262,7 +263,7 @@ public class CertificateRevocationIntegrationTests
 
         response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
         (await ProblemTypeAsync(response)).Should().Be(
-            "https://ducksinarow.app/problems/revocation-blocked-by-guardrail");
+            "https://ducksinarow.dev/problems/revocation-blocked-by-guardrail");
         var body = JsonSerializer.Deserialize<JsonElement>(
             await response.Content.ReadAsStringAsync());
         body.GetProperty("detail").GetString().Should().Contain("smart card logon");
@@ -405,7 +406,7 @@ public class CertificateRevocationCaFailureTests
 
         response.StatusCode.Should().Be(HttpStatusCode.ServiceUnavailable);
         (await ProblemTypeAsync(response)).Should().Be(
-            "https://ducksinarow.app/problems/ca-unavailable");
+            "https://ducksinarow.dev/problems/ca-unavailable");
         await AssertStatusAsync(id, "Issued");
     }
 
@@ -421,7 +422,7 @@ public class CertificateRevocationCaFailureTests
 
         response.StatusCode.Should().Be(HttpStatusCode.ServiceUnavailable);
         (await ProblemTypeAsync(response)).Should().Be(
-            "https://ducksinarow.app/problems/ca-access-denied");
+            "https://ducksinarow.dev/problems/ca-access-denied");
         await AssertStatusAsync(id, "Issued");
     }
 
@@ -436,7 +437,7 @@ public class CertificateRevocationCaFailureTests
 
         response.StatusCode.Should().Be(HttpStatusCode.InternalServerError);
         (await ProblemTypeAsync(response)).Should().Be(
-            "https://ducksinarow.app/problems/ca-error");
+            "https://ducksinarow.dev/problems/ca-error");
         await AssertStatusAsync(id, "Issued");
     }
 
@@ -476,7 +477,7 @@ public class CertificateRevocationCaFailureTests
 
         retry.StatusCode.Should().Be(HttpStatusCode.Conflict);
         (await ProblemTypeAsync(retry)).Should().Be(
-            "https://ducksinarow.app/problems/certificate-already-revoked");
+            "https://ducksinarow.dev/problems/certificate-already-revoked");
         _factory.Client.Inner.RevokedSerials.Count(s =>
             SerialNumbers.NormalizedEquals(s, serial)).Should().Be(before + 1);
     }
@@ -597,6 +598,10 @@ public class CertificateRevocationCaFailureTests
                 ? Task.FromException<IReadOnlyList<CertificateInfo>>(QueryFailure())
                 : Inner.QueryCertificatesAsync(query, cancellationToken);
 
+        public Task<CaRequestStatus?> GetRequestStatusAsync(
+            int requestId, CancellationToken cancellationToken = default)
+            => Inner.GetRequestStatusAsync(requestId, cancellationToken);
+
         public Task RevokeCertificateAsync(
             string serialNumber, int reason, CancellationToken cancellationToken = default)
             => RevokeFailure != null
@@ -666,7 +671,7 @@ public class CertificateRevocationRaceTests
 
             loser.StatusCode.Should().Be(HttpStatusCode.Conflict);
             (await ProblemTypeAsync(loser)).Should().Be(
-                "https://ducksinarow.app/problems/certificate-already-revoked");
+                "https://ducksinarow.dev/problems/certificate-already-revoked");
 
             stub.RevokeCalls.Should().Be(1);
             stub.Inner.RevokedSerials.Count(s =>
@@ -723,10 +728,9 @@ public class CertificateRevocationRaceTests
     }
 
     /// <summary>
-    /// Factory whose IAdcsClient delegates to a real MockAdcsClient except for
-    /// revocation, which parks until the test releases it. Lets the test hold
-    /// one request inside the CA call while a second arrives, which is the
-    /// only way to make the race deterministic.
+    /// Factory whose IAdcsClient is the shared <see cref="BlockingRevokeAdcsClient"/>
+    /// parking stub, so the test can hold one request inside the CA call while a
+    /// second arrives. That is the only way to make the race deterministic.
     /// </summary>
     public sealed class RevokeRaceCaFactory : CertusWebApplicationFactory
     {
@@ -745,57 +749,5 @@ public class CertificateRevocationRaceTests
                 services.AddSingleton<IAdcsClient>(Client);
             });
         }
-    }
-
-    public sealed class BlockingRevokeAdcsClient : IAdcsClient
-    {
-        public MockAdcsClient Inner { get; } = new();
-
-        // RunContinuationsAsynchronously, or releasing would run the server's
-        // continuation inline on the test thread.
-        private readonly TaskCompletionSource _firstRevokeEntered =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
-        private readonly TaskCompletionSource _release =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
-        private int _revokeCalls;
-
-        /// <summary>Completes when the first revoke call has entered the CA.</summary>
-        public Task FirstRevokeEntered => _firstRevokeEntered.Task;
-
-        /// <summary>How many revoke calls reached the CA.</summary>
-        public int RevokeCalls => Volatile.Read(ref _revokeCalls);
-
-        /// <summary>Lets every parked revoke call proceed to the mock.</summary>
-        public void ReleaseRevokes() => _release.TrySetResult();
-
-        public async Task RevokeCertificateAsync(
-            string serialNumber, int reason, CancellationToken cancellationToken = default)
-        {
-            Interlocked.Increment(ref _revokeCalls);
-            _firstRevokeEntered.TrySetResult();
-            await _release.Task.WaitAsync(cancellationToken);
-            await Inner.RevokeCertificateAsync(serialNumber, reason, cancellationToken);
-        }
-
-        public Task<CaInfo> GetCaInfoAsync(CancellationToken cancellationToken = default)
-            => Inner.GetCaInfoAsync(cancellationToken);
-
-        public Task<IReadOnlyList<TemplateInfo>> GetTemplatesAsync(CancellationToken cancellationToken = default)
-            => Inner.GetTemplatesAsync(cancellationToken);
-
-        public Task<IReadOnlyList<byte[]>> GetCaCertificateChainAsync(CancellationToken cancellationToken = default)
-            => Inner.GetCaCertificateChainAsync(cancellationToken);
-
-        public Task<SubmitResult> SubmitCertificateRequestAsync(
-            string templateName, byte[] csrDer, CancellationToken cancellationToken = default)
-            => Inner.SubmitCertificateRequestAsync(templateName, csrDer, cancellationToken);
-
-        public Task<CertificateResult> GetCertificateAsync(
-            int requestId, CancellationToken cancellationToken = default)
-            => Inner.GetCertificateAsync(requestId, cancellationToken);
-
-        public Task<IReadOnlyList<CertificateInfo>> QueryCertificatesAsync(
-            CertificateQuery query, CancellationToken cancellationToken = default)
-            => Inner.QueryCertificatesAsync(query, cancellationToken);
     }
 }

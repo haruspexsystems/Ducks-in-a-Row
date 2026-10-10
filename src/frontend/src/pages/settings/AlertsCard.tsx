@@ -233,7 +233,6 @@ export function AlertsCard() {
           host: form.smtpHost.trim(),
           port,
           tlsMode: form.smtpTlsMode,
-          username: form.smtpUsername.trim(),
           fromAddress: form.smtpFromAddress.trim(),
           fromName: form.smtpFromName.trim(),
           recipients: form.smtpRecipients
@@ -243,6 +242,12 @@ export function AlertsCard() {
         };
         if (form.smtpPassword.length > 0) {
           candidate.password = form.smtpPassword;
+        }
+        // Same terms as the password: sent only when typed this session, so an
+        // empty box means "test with the stored account name" rather than
+        // "test anonymously" (issue #261).
+        if (form.smtpUsername.trim().length > 0) {
+          candidate.username = form.smtpUsername.trim();
         }
       }
 
@@ -453,16 +458,37 @@ export function AlertsCard() {
 
               <Field
                 label="Username"
-                hint="Leave blank to contact the relay anonymously."
+                hint={
+                  config.smtp?.hasCredentials
+                    ? 'A username is stored. It is never shown; type to replace it.'
+                    : 'Leave blank to contact the relay anonymously.'
+                }
               >
                 <input
                   type="text"
                   value={form.smtpUsername}
-                  disabled={outranked(ALERT_FIELDS.smtpUsername)}
+                  disabled={
+                    outranked(ALERT_FIELDS.smtpUsername) || form.smtpClearUsername
+                  }
                   onChange={(e) => update({ smtpUsername: e.target.value })}
+                  placeholder={config.smtp?.hasCredentials ? '(unchanged)' : '(not set)'}
                   autoComplete="off"
                   className={inputClass}
                 />
+                {config.smtp?.hasCredentials && !outranked(ALERT_FIELDS.smtpUsername) && (
+                  <label className="flex items-center gap-2 mt-1 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={form.smtpClearUsername}
+                      onChange={(e) =>
+                        update({ smtpClearUsername: e.target.checked, smtpUsername: '' })
+                      }
+                      className="h-3.5 w-3.5 rounded border-hairline-strong text-certus-600
+                                 focus:ring-certus-500"
+                    />
+                    <span className="text-xs text-muted">Remove the saved username</span>
+                  </label>
+                )}
                 <OutrankedNote show={outranked(ALERT_FIELDS.smtpUsername)} />
               </Field>
 
@@ -788,7 +814,9 @@ interface AlertForm {
   smtpHost: string;
   smtpPort: string;
   smtpTlsMode: SmtpTlsModeName;
+  /** Always starts empty: the saved username is never round tripped (#261). */
   smtpUsername: string;
+  smtpClearUsername: boolean;
   /** Always starts empty: the saved password is never round tripped. */
   smtpPassword: string;
   smtpClearPassword: boolean;
@@ -805,7 +833,8 @@ function formFromConfig(config: AlertConfig): AlertForm {
     smtpHost: config.smtp?.host ?? '',
     smtpPort: String(config.smtp?.port ?? 587),
     smtpTlsMode: config.smtp?.tlsMode ?? 'starttls',
-    smtpUsername: config.smtp?.username ?? '',
+    smtpUsername: '',
+    smtpClearUsername: false,
     smtpPassword: '',
     smtpClearPassword: false,
     smtpFromAddress: config.smtp?.fromAddress ?? '',
@@ -865,7 +894,6 @@ function parseForm(form: AlertForm) {
       host: form.smtpHost.trim(),
       port,
       tlsMode: form.smtpTlsMode,
-      username: form.smtpUsername.trim(),
       fromAddress: form.smtpFromAddress.trim(),
       fromName: form.smtpFromName.trim(),
       recipients: form.smtpRecipients
@@ -881,6 +909,17 @@ function parseForm(form: AlertForm) {
     update.smtp.clearPassword = true;
   } else if (form.smtpPassword.length > 0) {
     update.smtp.password = form.smtpPassword;
+  }
+
+  // The username travels on exactly the same terms since issue #261, and the
+  // omission is the load bearing part rather than a saving of bytes. The box is
+  // empty on every load because the endpoint no longer returns the value, so
+  // sending it unconditionally would blank the stored account name every time
+  // an operator edited an unrelated field.
+  if (form.smtpClearUsername) {
+    update.smtp.clearUsername = true;
+  } else if (form.smtpUsername.trim().length > 0) {
+    update.smtp.username = form.smtpUsername.trim();
   }
 
   return { problems, update };

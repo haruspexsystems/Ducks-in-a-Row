@@ -18,6 +18,8 @@ public class CertificateTextSanitizerTests
     private const char Tab = (char)0x09;
     private const char Cr = (char)0x0d;
     private const char Lf = (char)0x0a;
+    private const char LineSep = (char)0x2028;
+    private const char ParaSep = (char)0x2029;
     private const char Ellipsis = (char)0x2026;
 
     // ── SanitizeDispositionMessage ──────────────────────────────────────
@@ -46,13 +48,56 @@ public class CertificateTextSanitizerTests
     }
 
     [Fact]
+    public void SanitizeDispositionMessage_StripsLineSeparatorsEvenThoughItKeepsRealLineBreaks()
+    {
+        // The keepLineBreaks escape hatch above covers tab, CR and LF and stops
+        // there. U+2028 and U+2029 are categories Zl and Zp, so they passed this
+        // strip entirely until issue #234, and they are exactly the characters a
+        // reader cannot agree with the writer about: this file's own reader does
+        // not break on them and a SIEM's splitter does. A CA that means a line
+        // break writes one, so nothing legitimate is lost by dropping these.
+        CertificateTextSanitizer.SanitizeDispositionMessage(
+                "Denied" + LineSep + "FATAL Certificate issued")
+            .Should().Be("DeniedFATAL Certificate issued");
+
+        CertificateTextSanitizer.SanitizeDispositionMessage("Denied" + ParaSep + " by admin")
+            .Should().Be("Denied by admin");
+
+        // And the real breaks still survive alongside them in one value.
+        CertificateTextSanitizer.SanitizeDispositionMessage(
+                "Invalid Request" + Cr + Lf + "code" + LineSep + "forged")
+            .Should().Be("Invalid Request" + Cr + Lf + "codeforged");
+    }
+
+    [Fact]
+    public void SanitizeSubject_StripsLineSeparators()
+    {
+        // The subject is requester authored on an enrollee supplies subject
+        // template, and this runs on the sync write path.
+        CertificateTextSanitizer.SanitizeSubject("CN=host" + LineSep + "evil.example")
+            .Should().Be("CN=hostevil.example");
+    }
+
+    [Fact]
+    public void SanitizeFileNameComponent_StripsLineSeparators()
+    {
+        // The download name reaches Content-Disposition filename* and the file
+        // saved on disk (issue #232).
+        CertificateTextSanitizer.SanitizeFileNameComponent("host" + LineSep + "name")
+            .Should().Be("hostname");
+    }
+
+    [Fact]
     public void SanitizeDispositionMessage_StripsControlCharacters()
     {
         // This value is partly attacker influenced: a denial message frequently
         // quotes the subject name the requester put in the CSR, so an ACME client
         // controls a substring that reaches a log sink and an admin screen. React
-        // escapes the render; the control characters are stripped here so a log
-        // line cannot be forged, nor a terminal driven by the stored value.
+        // escapes the render; the control characters are stripped here so no
+        // terminal can be driven by the stored value. Note which three this does
+        // not strip. Tab, CR and LF stay, so this function alone does not stop a
+        // forged log line; SanitizeDispositionMessageForLog is what closes that
+        // half, and the tests for it below are where that claim lives (issue #362).
         CertificateTextSanitizer.SanitizeDispositionMessage(Esc + "[31mDenied" + Esc + "[0m")
             .Should().Be("[31mDenied[0m");
         CertificateTextSanitizer.SanitizeDispositionMessage("Denied" + Nul + " by" + Bell + " admin")
@@ -210,11 +255,19 @@ public class CertificateTextSanitizerTests
     [Fact]
     public void SanitizeSubject_TruncationKeepsTheCommonNameWhenItComesLast()
     {
-        // The case a plain tail cut gets wrong. ADCS conventionally encodes a
-        // distinguished name general to specific, which puts the CN at the end,
-        // and X509Certificate2.Subject does not reorder it on the way back (see
-        // SanitizeSubject_SubjectRenderingDoesNotReorderRdns). A tail cut would
-        // keep the country and lose the hostname, which is the only part the
+        // The case a plain tail cut gets wrong, and a deliberately adverse shape
+        // rather than the ordinary one. A name encoded general to specific
+        // renders with the common name first, because the rendering reverses the
+        // encoding (issue #297, pinned in X500NameOrderingTests), so this fixture
+        // is not what X509Certificate2.Subject hands back for an ordinary issued
+        // certificate. It is kept exactly as it is because it is the only shape
+        // that reaches the CN leading repair branch: with the common name first
+        // the head cut already carries it and the early return fires, which
+        // SanitizeSubject_TruncationLeavesACommonNameFirstSubjectAlone covers.
+        // The shape is reachable in production all the same, from the certificate
+        // authority's own columns, from a certificate another tool enrolled, and
+        // from a multi valued relative distinguished name. A tail cut would keep
+        // the country and lose the hostname, which is the only part the
         // dashboard, the activity feed, and the supersession linker read.
         var raw = "C=US, S=Washington, L=Seattle, O=" + new string('o', 600)
             + ", CN=leaf.example.com";
@@ -244,8 +297,12 @@ public class CertificateTextSanitizerTests
     [Fact]
     public void SanitizeSubject_TruncationLeavesACommonNameFirstSubjectAlone()
     {
-        // When the tail cut already keeps the CN there is nothing to reorder, so
-        // the value stays the plain prefix it always was.
+        // The ordinary shape, and the one an issued certificate actually renders
+        // as: encoded general to specific, reversed by the rendering, so the
+        // common name comes first (issue #297). The head cut already keeps it, so
+        // the early return fires and the value stays the plain prefix it always
+        // was. The CN last fixtures around this one are the adverse case, chosen
+        // because they are the only way to reach the repair branch.
         var raw = "CN=leaf.example.com, OU=IT, O=" + new string('o', 600);
 
         var cleaned = CertificateTextSanitizer.SanitizeSubject(raw);
@@ -259,8 +316,10 @@ public class CertificateTextSanitizerTests
     [Fact]
     public void SanitizeSubject_OverLongCommonNameIsCutRatherThanDropped()
     {
-        // The pathological shape: the CN comes last, so the tail cut misses it
-        // entirely, and the CN alone still does not fit. Leading with it whole is
+        // The pathological shape, adverse for the reason set out on
+        // SanitizeSubject_TruncationKeepsTheCommonNameWhenItComesLast: the CN
+        // comes last, so the tail cut misses it entirely, and the CN alone still
+        // does not fit. Leading with it whole is
         // impossible, so it is cut like any other value and the name is at least
         // partly readable instead of absent.
         var raw = "C=US, O=" + new string('o', 600) + ", CN=" + new string('x', 900);
@@ -348,6 +407,29 @@ public class CertificateTextSanitizerTests
     }
 
     [Fact]
+    public void SanitizeSubject_TruncatedCommonNameEndingInABackslashStillExtractsCleanly()
+    {
+        // Issue #296. This truncation is what turned a harmless rendering into a
+        // forged name, and it did so without a requester choosing the component
+        // order.
+        //
+        // On the certificate the backslash sits at the very end of the subject,
+        // where there is nothing behind it to swallow. The lead moves the common
+        // name to the front and puts a separator immediately behind the
+        // backslash, which is the exact shape a reader that treats a backslash as
+        // an escape misreads. The result was then written back to the database by
+        // SanitizeStoredSubjects on the next start, so the misread outlived the
+        // sync that produced it.
+        var raw = "C=US, O=" + new string('o', 600) + ", CN=CORP\\";
+
+        var cleaned = CertificateTextSanitizer.SanitizeSubject(raw)!;
+
+        cleaned.Should().Be("CN=CORP\\, " + Ellipsis);
+        DistinguishedNameParser.CommonName(cleaned).Should().Be("CORP\\");
+        CertificateTextSanitizer.SanitizeSubject(cleaned).Should().Be(cleaned);
+    }
+
+    [Fact]
     public void SanitizeSubject_IsIdempotentWithAQuotedCommonName()
     {
         // The round trip the original spelling of the RDN protects. A second
@@ -378,5 +460,477 @@ public class CertificateTextSanitizerTests
         once.Should().NotBeNull();
         once!.Should().HaveLength(CertificateTextSanitizer.MaxSubjectLength);
         twice.Should().Be(once);
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(1)]
+    [InlineData(0)]
+    public void SanitizeSubject_SurvivesACommonNameThatJustFillsTheWidth(int under)
+    {
+        // The CN leading branch spends three characters of the width on the ", …"
+        // separator, so it is entered once the common name is within two
+        // characters of the cap, and it then asks for a cut one character wider
+        // than the name it was handed. Reading that index before checking the
+        // length threw IndexOutOfRangeException on a subject the requester
+        // authored, on the sync write path. Found by code review on issue #232.
+        //
+        // The padding puts the CN last and pushes the whole subject past the cap,
+        // so the tail carries no "CN=" and the early return is skipped.
+        var commonNameValue = new string('b', CertificateTextSanitizer.MaxSubjectLength - 3 - under);
+        var raw = "O=" + new string('a', CertificateTextSanitizer.MaxSubjectLength + 20)
+            + ", CN=" + commonNameValue;
+
+        var cleaned = CertificateTextSanitizer.SanitizeSubject(raw);
+
+        cleaned.Should().NotBeNull();
+        cleaned!.Length.Should().BeLessThanOrEqualTo(CertificateTextSanitizer.MaxSubjectLength);
+        cleaned.Should().StartWith("CN=", "the cut leads with the common name whatever its length");
+    }
+
+    // ── SanitizeFileNameComponent ───────────────────────────────────────
+
+    [Theory]
+    [InlineData(null, null)]
+    [InlineData("", null)]
+    [InlineData("   ", null)]
+    [InlineData("www.contoso.com", "www.contoso.com")]
+    [InlineData("  padded  ", "padded")]
+    public void SanitizeFileNameComponent_NormalizesDegenerateValues(string? input, string? expected)
+    {
+        CertificateTextSanitizer.SanitizeFileNameComponent(input).Should().Be(expected);
+    }
+
+    [Fact]
+    public void SanitizeFileNameComponent_StripsBidirectionalOverrides()
+    {
+        // The finding in issue #232. ASP.NET Core writes the download name into
+        // Content-Disposition twice: filename= with everything outside printable
+        // ASCII replaced by an underscore, and filename*=UTF-8'' carrying the
+        // original percent encoded and intact. Browsers prefer the second, so an
+        // override here reaches the download bar and names the saved file after a
+        // host the operator never asked for.
+        var rlo = (char)0x202e;      // RIGHT-TO-LEFT OVERRIDE
+        var pdf = (char)0x202c;      // POP DIRECTIONAL FORMATTING
+        var isolate = (char)0x2066;  // LEFT-TO-RIGHT ISOLATE
+        var zwsp = (char)0x200b;     // ZERO WIDTH SPACE
+        var shy = (char)0x00ad;      // SOFT HYPHEN
+
+        CertificateTextSanitizer.SanitizeFileNameComponent(rlo + "moc.live" + pdf)
+            .Should().Be("moc.live");
+        CertificateTextSanitizer.SanitizeFileNameComponent(isolate + "host" + zwsp + "name" + shy)
+            .Should().Be("hostname");
+    }
+
+    [Fact]
+    public void SanitizeFileNameComponent_StripsControlCharactersWithoutAskingTheOperatingSystem()
+    {
+        // Path.GetInvalidFileNameChars answers for the running OS, not for the
+        // file system the download lands on: on Unix it returns only the null
+        // character and the forward slash. The control range is covered by the
+        // shared strip rather than by that call, so this holds on every OS the
+        // test suite might run on.
+        CertificateTextSanitizer.SanitizeFileNameComponent("host" + Nul + Bell + Esc + "name")
+            .Should().Be("hostname");
+        CertificateTextSanitizer.SanitizeFileNameComponent("host" + Tab + Cr + Lf + "name")
+            .Should().Be("hostname");
+        CertificateTextSanitizer.SanitizeFileNameComponent("host" + Del + "name")
+            .Should().Be("hostname");
+    }
+
+    [Theory]
+    [InlineData('"')]
+    [InlineData('<')]
+    [InlineData('>')]
+    [InlineData('|')]
+    [InlineData(':')]
+    [InlineData('*')]
+    [InlineData('?')]
+    [InlineData('\\')]
+    [InlineData('/')]
+    public void SanitizeFileNameComponent_StripsEveryCharacterWindowsRejects(char rejected)
+    {
+        // The star is in this set rather than in a clause of its own. It is
+        // legal in a certificate name and not in a Windows file name, and a
+        // wildcard certificate is the ordinary case that reaches it.
+        CertificateTextSanitizer.SanitizeFileNameComponent("host" + rejected + "name")
+            .Should().Be("hostname");
+    }
+
+    [Fact]
+    public void SanitizeFileNameComponent_NamesAWildcardCertificateWithoutTheStar()
+    {
+        CertificateTextSanitizer.SanitizeFileNameComponent("*.contoso.com")
+            .Should().Be(".contoso.com");
+    }
+
+    [Theory]
+    [InlineData(0xE0001)] // language tag
+    [InlineData(0xE0020)] // tag space, the start of the invisible ASCII block
+    [InlineData(0xE007F)] // cancel tag
+    public void SanitizeFileNameComponent_StripsFormatCharactersAboveTheBmp(int codePoint)
+    {
+        // Both halves of the surrogate pair go together, or the name carries a
+        // lone surrogate, which has no UTF-8 encoding and so cannot survive the
+        // percent encoding in the filename* parameter.
+        CertificateTextSanitizer.SanitizeFileNameComponent(
+            "host" + char.ConvertFromUtf32(codePoint) + "name")
+            .Should().Be("hostname");
+    }
+
+    [Fact]
+    public void SanitizeFileNameComponent_ReturnsNull_WhenTheNameIsOnlyFormatCharacters()
+    {
+        // The caller reads this as "try the next candidate", so a certificate
+        // whose common name renders as nothing is named from its SAN or its
+        // serial instead of from a string that looks empty in the download bar.
+        var rlo = (char)0x202e;
+        var zwsp = (char)0x200b;
+
+        CertificateTextSanitizer.SanitizeFileNameComponent(rlo.ToString() + zwsp).Should().BeNull();
+        CertificateTextSanitizer.SanitizeFileNameComponent("***").Should().BeNull();
+    }
+
+    [Fact]
+    public void SanitizeFileNameComponent_CutsToTheCapWithNoEllipsis()
+    {
+        // Nothing capped this before issue #232. A Windows path component stops
+        // at 255 characters and the percent encoding in filename* triples every
+        // non ASCII character, so an uncapped common name produced a download the
+        // browser could not save. The ellipsis StripAndBound appends is itself
+        // non ASCII and would only add percent encoded noise here.
+        var raw = new string('x', CertificateTextSanitizer.MaxFileNameLength + 200);
+
+        var cleaned = CertificateTextSanitizer.SanitizeFileNameComponent(raw);
+
+        cleaned.Should().NotBeNull();
+        cleaned!.Should().HaveLength(CertificateTextSanitizer.MaxFileNameLength);
+        cleaned.Should().NotContain(Ellipsis.ToString());
+    }
+
+    [Fact]
+    public void SanitizeFileNameComponent_CutKeepsSurrogatePairsWhole()
+    {
+        // Pad with an odd length so the cut falls inside a pair rather than
+        // between two of them.
+        var pair = char.ConvertFromUtf32(0x1F600); // two UTF-16 units
+        var raw = new string('x', CertificateTextSanitizer.MaxFileNameLength - 1)
+            + string.Concat(Enumerable.Repeat(pair, 10));
+
+        var cleaned = CertificateTextSanitizer.SanitizeFileNameComponent(raw);
+
+        cleaned.Should().NotBeNull();
+        cleaned!.Length.Should().BeLessThanOrEqualTo(CertificateTextSanitizer.MaxFileNameLength);
+        char.IsHighSurrogate(cleaned[^1]).Should().BeFalse(
+            "a trailing lone surrogate has no UTF-8 encoding and cannot survive filename* encoding");
+    }
+
+    [Theory]
+    [InlineData("CON", "_CON")]
+    [InlineData("con", "_con")]
+    [InlineData("NUL", "_NUL")]
+    [InlineData("aux", "_aux")]
+    [InlineData("PRN", "_PRN")]
+    [InlineData("COM1", "_COM1")]
+    [InlineData("lpt9", "_lpt9")]
+    public void SanitizeFileNameComponent_GuardsReservedDeviceNames(string input, string expected)
+    {
+        // A download named for a device does not fail loudly, it disappears into
+        // the device.
+        CertificateTextSanitizer.SanitizeFileNameComponent(input).Should().Be(expected);
+    }
+
+    [Fact]
+    public void SanitizeFileNameComponent_GuardsAReservedNameCarryingADomainSuffix()
+    {
+        // Windows reads the device name from the segment before the first dot,
+        // so con.contoso.com.cer is the console exactly as CON.cer is. This is a
+        // plausible host name rather than a contrived one, which is what makes
+        // the whole segment comparison worth having.
+        CertificateTextSanitizer.SanitizeFileNameComponent("con.contoso.com")
+            .Should().Be("_con.contoso.com");
+    }
+
+    [Theory]
+    [InlineData("CONSOLE")]
+    [InlineData("NULL")]
+    [InlineData("COM10")]
+    [InlineData("contoso.com")]
+    [InlineData("LPT")]
+    public void SanitizeFileNameComponent_LeavesNamesThatMerelyResembleADevice(string input)
+    {
+        // The reserved set is exact, not a prefix match. A name that starts with
+        // a device name is an ordinary file name.
+        CertificateTextSanitizer.SanitizeFileNameComponent(input).Should().Be(input);
+    }
+
+    [Fact]
+    public void SanitizeFileNameComponent_KeepsAccentedAndNonLatinNamesReadable()
+    {
+        // The policy is a denylist of the classes that deceive, matching
+        // SanitizeSubject, not an ASCII allowlist. An accented or non Latin
+        // common name is a real name that an admin should still recognise on
+        // disk, so it survives whole.
+        CertificateTextSanitizer.SanitizeFileNameComponent("José Müller")
+            .Should().Be("José Müller");
+        CertificateTextSanitizer.SanitizeFileNameComponent("münchen.contoso.de")
+            .Should().Be("münchen.contoso.de");
+    }
+
+    [Fact]
+    public void SanitizeFileNameComponent_IsIdempotent()
+    {
+        // The class documents every function here as idempotent. The reserved
+        // name guard is the one that could break it: the guarded form must no
+        // longer match the reserved set, or a second pass would prefix it again.
+        var rlo = (char)0x202e;
+        string[] inputs =
+        [
+            "CON",
+            "con.contoso.com",
+            rlo + "moc.live",
+            new string('x', CertificateTextSanitizer.MaxFileNameLength + 100),
+            // Reserved stem and over the cap at once, so the guard has to make
+            // room for its underscore rather than push the name past the cap.
+            "COM1." + new string('y', CertificateTextSanitizer.MaxFileNameLength),
+        ];
+
+        foreach (var input in inputs)
+        {
+            var once = CertificateTextSanitizer.SanitizeFileNameComponent(input);
+            var twice = CertificateTextSanitizer.SanitizeFileNameComponent(once);
+
+            once.Should().NotBeNull();
+            once!.Length.Should().BeLessThanOrEqualTo(CertificateTextSanitizer.MaxFileNameLength);
+            twice.Should().Be(once, "sanitizing {0} twice must not differ from once", input);
+        }
+    }
+
+    // ── SanitizeDispositionMessageForLog ────────────────────────────────
+
+    [Theory]
+    [InlineData(null, null)]
+    [InlineData("", null)]
+    [InlineData("   ", null)]
+    public void SanitizeDispositionMessageForLog_NormalizesDegenerateValues(
+        string? input, string? expected)
+    {
+        CertificateTextSanitizer.SanitizeDispositionMessageForLog(input).Should().Be(expected);
+    }
+
+    [Fact]
+    public void SanitizeDispositionMessageForLog_NormalizesAValueThatIsOnlyBreaks()
+    {
+        // Composed rather than inlined, because a theory attribute cannot carry
+        // the cast constants this file uses in place of escape sequences.
+        CertificateTextSanitizer
+            .SanitizeDispositionMessageForLog(Tab.ToString() + Cr + Lf)
+            .Should().BeNull();
+    }
+
+    [Fact]
+    public void SanitizeDispositionMessageForLog_ReplacesEveryBreakWithASpace()
+    {
+        // The whole point of the function. Serilog's file sink writes the rendered
+        // message straight through, so each of these would otherwise open a new
+        // line in ducks-<date>.log that nothing wrote (issue #362).
+        CertificateTextSanitizer
+            .SanitizeDispositionMessageForLog("Denied" + Cr + Lf + "Invalid Request")
+            .Should().Be("Denied Invalid Request");
+
+        CertificateTextSanitizer
+            .SanitizeDispositionMessageForLog("Denied" + Lf + "Invalid Request")
+            .Should().Be("Denied Invalid Request");
+
+        CertificateTextSanitizer
+            .SanitizeDispositionMessageForLog("Denied" + Cr + "Invalid Request")
+            .Should().Be("Denied Invalid Request");
+
+        CertificateTextSanitizer
+            .SanitizeDispositionMessageForLog("Denied" + Tab + "Invalid Request")
+            .Should().Be("Denied Invalid Request");
+    }
+
+    [Fact]
+    public void SanitizeDispositionMessageForLog_CollapsesARunToOneSpace()
+    {
+        // A blank line between two paragraphs is four break characters in a row,
+        // and the log wants one separator, not four.
+        var raw = "Error Constructing or Publishing Certificate"
+            + Cr + Lf + Cr + Lf + Tab + "Invalid Request";
+
+        CertificateTextSanitizer.SanitizeDispositionMessageForLog(raw)
+            .Should().Be("Error Constructing or Publishing Certificate Invalid Request");
+    }
+
+    [Fact]
+    public void SanitizeDispositionMessageForLog_DoesNotFuseTheWordsEitherSide()
+    {
+        // This is why the function substitutes rather than stripping. Passing
+        // keepLineBreaks: false to the shared strip would delete the break and
+        // leave the two words joined, which is a different message from the one
+        // the CA sent.
+        var joined = CertificateTextSanitizer.SanitizeDispositionMessage(
+            "Denied by Policy Module" + Cr + Lf + "Invalid Request");
+        joined.Should().Contain(Cr.ToString());
+
+        CertificateTextSanitizer
+            .SanitizeDispositionMessageForLog("Denied by Policy Module" + Cr + Lf + "Invalid Request")
+            .Should().Be("Denied by Policy Module Invalid Request")
+            .And.NotContain("ModuleInvalid");
+    }
+
+    [Fact]
+    public void SanitizeDispositionMessageForLog_NeverLeadsOrTrailsWithASpace()
+    {
+        // It leans on the sibling's trim for this rather than trimming again, so
+        // the dependency is worth pinning.
+        //
+        // ToString on the first constant, not decoration. Two char constants added
+        // together are an int, so Cr + Lf here would be 23 and the value under test
+        // would open with the characters two and three. Every other case in this
+        // file happens to start with a string literal and so never meets it.
+        CertificateTextSanitizer
+            .SanitizeDispositionMessageForLog(Cr.ToString() + Lf + "Denied" + Lf + Tab)
+            .Should().Be("Denied");
+    }
+
+    [Fact]
+    public void SanitizeDispositionMessageForLog_StillStripsEverythingItsSiblingDoes()
+    {
+        // It delegates, so this is a guard against someone reimplementing the
+        // strip here and missing a class. Escape sequences, C0 and DEL, the two
+        // line separators, and a bidirectional override.
+        var rlo = (char)0x202e;
+        var raw = Esc + "[31mDenied" + Nul + Bell + Del + LineSep + ParaSep + rlo + " by admin";
+
+        CertificateTextSanitizer.SanitizeDispositionMessageForLog(raw)
+            .Should().Be("[31mDenied by admin");
+    }
+
+    [Fact]
+    public void SanitizeDispositionMessageForLog_StillBoundsToTheColumnWidth()
+    {
+        // Collapsing runs can only shorten a value, so the sibling's bound is the
+        // whole bound and no second cut is needed. The CA schema allows 8192.
+        var raw = string.Join(Cr.ToString() + Lf, Enumerable.Repeat(new string('x', 100), 90));
+
+        var flattened = CertificateTextSanitizer.SanitizeDispositionMessageForLog(raw);
+
+        flattened.Should().NotBeNull();
+        flattened!.Length.Should()
+            .BeLessThanOrEqualTo(CertificateTextSanitizer.MaxDispositionMessageLength);
+        flattened.Should().NotContain(Cr.ToString()).And.NotContain(Lf.ToString());
+    }
+
+    [Fact]
+    public void SanitizeDispositionMessageForLog_IsIdempotent()
+    {
+        string[] inputs =
+        [
+            "Denied by Policy Module",
+            "Denied" + Cr + Lf + Cr + Lf + "Invalid Request",
+            Esc + "[31mDenied" + Tab + Del + LineSep + " by admin",
+            new string('x', CertificateTextSanitizer.MaxDispositionMessageLength + 500),
+        ];
+
+        foreach (var input in inputs)
+        {
+            var once = CertificateTextSanitizer.SanitizeDispositionMessageForLog(input);
+            var twice = CertificateTextSanitizer.SanitizeDispositionMessageForLog(once);
+
+            twice.Should().Be(once, "flattening {0} twice must not differ from once", input);
+        }
+    }
+
+    // ---- SanitizeTemplateName (issue #378) --------------------------------
+
+    [Theory]
+    [InlineData(null, null)]
+    [InlineData("", null)]
+    [InlineData("   ", null)]
+    [InlineData("  WebServer  ", "WebServer")]
+    [InlineData("WebServer", "WebServer")]
+    public void SanitizeTemplateName_NormalizesDegenerateValues(string? input, string? expected)
+    {
+        CertificateTextSanitizer.SanitizeTemplateName(input).Should().Be(expected);
+    }
+
+    [Fact]
+    public void SanitizeTemplateName_StripsEveryClassItsSiblingsDo()
+    {
+        // The same scanner, so this is really asserting that the template name
+        // was wired to it at all: before issue #378 the CA's value reached the
+        // database with no scan of any kind.
+        var rlo = (char)0x202e;
+        var zwsp = (char)0x200b;
+        var raw = Esc + "[31mWeb" + rlo + "Ser" + zwsp + "ver" + Tab + Del + LineSep + Cr + Lf;
+
+        CertificateTextSanitizer.SanitizeTemplateName(raw).Should().Be("[31mWebServer");
+    }
+
+    [Fact]
+    public void SanitizeTemplateName_BoundsToTheColumnWidth()
+    {
+        var raw = new string('x', CertificateTextSanitizer.MaxTemplateNameLength + 500);
+
+        var cleaned = CertificateTextSanitizer.SanitizeTemplateName(raw);
+
+        cleaned.Should().NotBeNull();
+        cleaned!.Should().HaveLength(CertificateTextSanitizer.MaxTemplateNameLength);
+    }
+
+    [Fact]
+    public void SanitizeTemplateName_DoesNotLeadTheCutWithACommonName()
+    {
+        // The one place it deliberately differs from SanitizeSubject. A template
+        // name is not a distinguished name, so there is no part to rescue and an
+        // over long value is simply cut from the front. Pinning it because the
+        // two sit next to each other and the flag is easy to copy across.
+        var raw = new string('a', CertificateTextSanitizer.MaxTemplateNameLength) + ", CN=rescue.me";
+
+        var cleaned = CertificateTextSanitizer.SanitizeTemplateName(raw);
+
+        cleaned.Should().NotBeNull();
+        cleaned!.Should().StartWith("aaa");
+        cleaned.Should().NotContain("CN=");
+    }
+
+    [Fact]
+    public void SanitizeTemplateName_ReturnsNull_WhenNothingUsableSurvives()
+    {
+        // The writers coalesce this to the empty string, because the column is
+        // declared required. Null rather than "" here so a caller with a
+        // fallback chain could still tell "nothing" from "something blank".
+        var rlo = (char)0x202e;
+        var zwsp = (char)0x200b;
+
+        CertificateTextSanitizer.SanitizeTemplateName($"{rlo}{zwsp}{LineSep}").Should().BeNull();
+    }
+
+    [Fact]
+    public void SanitizeTemplateName_IsIdempotent()
+    {
+        // Load bearing for the same reason the subject's is: the value is
+        // sanitized in the client that read it and again at both entity writers,
+        // and IsUnchanged compares a stored value against a freshly sanitized
+        // one. A second pass that changed the value would make the sync treat
+        // every row as moved on every cycle.
+        var rlo = (char)0x202e;
+        string[] inputs =
+        [
+            "WebServer",
+            "Web" + rlo + "Server",
+            "1.3.6.1.4.1.311.21.8.1234567.7654321.1.2.3",
+            new string('x', CertificateTextSanitizer.MaxTemplateNameLength + 100),
+        ];
+
+        foreach (var input in inputs)
+        {
+            var once = CertificateTextSanitizer.SanitizeTemplateName(input);
+            var twice = CertificateTextSanitizer.SanitizeTemplateName(once);
+
+            twice.Should().Be(once, "sanitizing {0} twice must not differ from once", input);
+        }
     }
 }

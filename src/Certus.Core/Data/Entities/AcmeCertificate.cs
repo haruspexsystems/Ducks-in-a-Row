@@ -39,8 +39,15 @@ public class AcmeCertificate
     public DateTime IssuedAt { get; set; } = DateTime.UtcNow;
 
     /// <summary>
-    /// When the certificate was revoked, or null while it is still valid. Once it is set, a
+    /// When the certificate was revoked, or null while it is still valid. While it is set, a
     /// second revocation attempt returns <c>alreadyRevoked</c> (RFC 8555 §7.6).
+    ///
+    /// <para>
+    /// Only ever written after the CA has confirmed the revocation, which is what lets
+    /// <c>CertificateSyncService.ClearReleasedRevocationStampsAsync</c> clear it again on the
+    /// one occasion it may be cleared: the CA reporting the certificate released from
+    /// CertificateHold (issue #375). Treat it as the CA's answer, not as a local flag.
+    /// </para>
     /// </summary>
     public DateTime? RevokedAt { get; set; }
 

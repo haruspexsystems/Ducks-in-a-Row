@@ -34,6 +34,10 @@ public sealed class UnconfiguredAdcsClient : IAdcsClient
         CertificateQuery query, CancellationToken cancellationToken = default)
         => throw NotConfigured();
 
+    public Task<CaRequestStatus?> GetRequestStatusAsync(
+        int requestId, CancellationToken cancellationToken = default)
+        => throw NotConfigured();
+
     public Task RevokeCertificateAsync(
         string serialNumber, int reason, CancellationToken cancellationToken = default)
         => throw NotConfigured();

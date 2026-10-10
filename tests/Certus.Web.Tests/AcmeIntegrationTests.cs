@@ -44,6 +44,11 @@ public class AcmeIntegrationTests
         directory.NewAccount.Should().Contain("/acme/WebServer/new-account");
         directory.NewOrder.Should().Contain("/acme/WebServer/new-order");
 
+        // ACME Renewal Information (RFC 9773 §3): a top level member, and the
+        // client appends "/{certID}" to it, so the base URL is advertised.
+        directory.RenewalInfo.Should().NotBeNull("ARI is implemented; the directory must advertise it");
+        directory.RenewalInfo.Should().Contain("/acme/WebServer/renewalInfo");
+
         // Revocation (RFC 8555 §7.6) and key rollover (RFC 8555 §7.3.5) are both implemented, so
         // the directory advertises revokeCert and keyChange, and each URL reaches a live endpoint.
         directory.RevokeCert.Should().NotBeNull("revocation is implemented; the directory must advertise it");
@@ -282,6 +287,7 @@ public class AcmeIntegrationTests
         directory.NewOrder.Should().NotContain("/acme/Web Server/");
         directory.NewAccount.Should().Contain("/acme/Web%20Server/new-account");
         directory.NewNonce.Should().Contain("/acme/Web%20Server/new-nonce");
+        directory.RenewalInfo.Should().Contain("/acme/Web%20Server/renewalInfo");
     }
 
     [Fact]
@@ -360,6 +366,9 @@ public class AcmeIntegrationTests
 
         directory!.NewOrder.Should().Be("https://acme.example.test/acme/WebServer/new-order");
         directory.NewAccount.Should().Be("https://acme.example.test/acme/WebServer/new-account");
+        // The QA "absolute if advertised" row (E6): the ARI base is a full URL
+        // on the configured origin, never a relative path.
+        directory.RenewalInfo.Should().Be("https://acme.example.test/acme/WebServer/renewalInfo");
     }
 
     #endregion

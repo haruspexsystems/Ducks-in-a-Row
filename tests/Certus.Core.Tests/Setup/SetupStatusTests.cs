@@ -1,4 +1,5 @@
 using Certus.Core.Setup;
+using Certus.Core.Tests.Security;
 
 namespace Certus.Core.Tests.Setup;
 
@@ -95,6 +96,34 @@ public class SetupStatusTests : IDisposable
         status.Save(path);
 
         File.Exists(path).Should().BeTrue();
+    }
+
+    [Fact]
+    public void TryLoad_Untrusted_ReadsAsAbsent_SoNoTemplateIsExposed()
+    {
+        // The ACME policy half of #489: a standard user who could write this file could
+        // widen the templates, the allowed domains and the EAB mode, unauthenticated.
+        var path = Path.Combine(_tempDir, SetupStatus.FileName);
+        new SetupStatus { SetupCompleted = true, EnabledTemplates = ["WebServer"] }.Save(path);
+        FileAcl.GrantEveryoneWrite(path);
+
+        var ok = SetupStatus.TryLoad(path, out var status);
+
+        ok.Should().BeTrue("an untrusted file reads as absent, which is not a read failure");
+        status.SetupCompleted.Should().BeFalse();
+        status.EnabledTemplates.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Save_LeavesAPreCreatedTmpAlone()
+    {
+        var path = Path.Combine(_tempDir, SetupStatus.FileName);
+        File.WriteAllText(path + ".tmp", "planted");
+
+        new SetupStatus { SetupCompleted = true }.Save(path);
+
+        File.ReadAllText(path + ".tmp").Should().Be("planted");
+        SetupStatus.Load(path).SetupCompleted.Should().BeTrue();
     }
 
     public void Dispose()

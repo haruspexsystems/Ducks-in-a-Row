@@ -1,5 +1,8 @@
+using Certus.Adcs.Crl;
 using Certus.Core.Adcs;
+using Certus.Core.Alerts;
 using Certus.Core.Configuration;
+using Certus.Core.Crl;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -31,6 +34,38 @@ public static class AdcsServiceExtensions
             }
 
             return new AdcsClient(options.CaConnectionString, logger);
+        });
+
+        return services;
+    }
+
+    /// <summary>
+    /// Registers the real CRL reader and the directory half of the distribution
+    /// point fetcher (issue #447). Separate from AddAdcsClient because the
+    /// reader is a separate interface: IAdcsClient has twelve implementations,
+    /// nine of them test doubles with nothing to do with CRLs.
+    /// </summary>
+    public static IServiceCollection AddAdcsCrlReader(this IServiceCollection services)
+    {
+        services.AddSingleton<ICaCrlReader>(sp =>
+        {
+            var options = sp.GetRequiredService<IOptions<CertusOptions>>().Value;
+            var logger = sp.GetRequiredService<ILogger<AdcsCrlReader>>();
+
+            if (string.IsNullOrEmpty(options.CaConnectionString))
+            {
+                throw new InvalidOperationException(
+                    "CaConnectionString is not configured, so the CRL reader cannot be built.");
+            }
+
+            return new AdcsCrlReader(options.CaConnectionString, logger);
+        });
+
+        services.AddSingleton<ILdapCrlFetcher>(sp =>
+        {
+            var alerts = sp.GetRequiredService<IOptions<AlertOptions>>().Value;
+            return new DirectoryCrlFetcher(
+                TimeSpan.FromSeconds(Math.Max(1, alerts.Crl.FetchTimeoutSeconds)));
         });
 
         return services;

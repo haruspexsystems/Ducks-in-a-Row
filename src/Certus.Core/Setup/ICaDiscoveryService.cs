@@ -36,10 +36,10 @@ public sealed class MockCaDiscoveryService : ICaDiscoveryService
         IReadOnlyList<DiscoveredCa> cas =
         [
             new DiscoveredCa(
-                HostName: "mockca.example.com",
-                CaName: "Mock Certificate Authority",
-                DisplayName: "Mock Certificate Authority (fake certificates)",
-                ConnectionString: "mockca.example.com\\Mock Certificate Authority"),
+                HostName: "ca-server.corp.example.com",
+                CaName: "Example Issuing CA",
+                DisplayName: "Example Issuing CA",
+                ConnectionString: "ca-server.corp.example.com\\Example Issuing CA"),
         ];
         return Task.FromResult(cas);
     }

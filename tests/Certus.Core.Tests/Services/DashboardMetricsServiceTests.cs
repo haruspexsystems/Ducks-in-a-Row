@@ -12,7 +12,12 @@ namespace Certus.Core.Tests.Services;
 /// <summary>
 /// Tests for the fleet health computation: score semantics, the null score
 /// empty state (a fresh install must not read "100% Healthy"), and the
-/// mutually exclusive segment buckets.
+/// mutually exclusive segment buckets. Also the activity feed's sources and
+/// labels, and the registration series window boundaries.
+///
+/// Each instance owns its own in-memory SQLite connection, so a row dated in
+/// the future is safe here in a way it can never be in the shared collection
+/// the Certus.Web.Tests integration classes use.
 /// </summary>
 public class DashboardMetricsServiceTests : IDisposable
 {
@@ -47,9 +52,15 @@ public class DashboardMetricsServiceTests : IDisposable
             _db, NullLogger<DashboardMetricsService>.Instance, Options.Create(alerts));
     }
 
+    /// <summary>
+    /// Adds one certificate row. The default request date is 30 days back,
+    /// which sits exactly one day outside the 30 day registration window, so
+    /// any test of that series has to pass <paramref name="requestDate"/>
+    /// explicitly rather than lean on the default.
+    /// </summary>
     private void Seed(
         int requestId, string status, DateTime notAfter, DateTime? revokedAt = null,
-        string? subject = null)
+        string? subject = null, DateTime? requestDate = null)
     {
         _db.SyncedCertificates.Add(new SyncedCertificate
         {
@@ -60,7 +71,7 @@ public class DashboardMetricsServiceTests : IDisposable
             NotBefore = DateTime.UtcNow.AddDays(-30),
             NotAfter = notAfter,
             Status = status,
-            RequestDate = DateTime.UtcNow.AddDays(-30),
+            RequestDate = requestDate ?? DateTime.UtcNow.AddDays(-30),
             RevokedAt = revokedAt,
         });
     }
@@ -356,6 +367,91 @@ public class DashboardMetricsServiceTests : IDisposable
         activity.Should().HaveCount(3);
         activity.Select(i => i.Id).Should().ContainInOrder("expired-1", "revoked-3", "revoked-4");
         activity.Should().BeInDescendingOrder(i => i.Timestamp);
+    }
+
+    // ── Registration series window boundaries (issue #260) ──
+    // GetRegistrationsAsync fetches with a lower bound alone. The real upper
+    // bound is the fixed length bucket array, which silently drops every date
+    // past the end of the window. Nothing documented that, so a caller that
+    // described the same window with a lower bound alone counted rows the
+    // series had dropped and disagreed with it by exactly one.
+
+    /// <summary>The default window the dashboard asks for, and this service's own default.</summary>
+    private const int WindowDays = 30;
+
+    [Fact]
+    public async Task Registrations_FutureRequestDate_IsExcluded()
+    {
+        // The window ends at the end of today, so a row the CA dated tomorrow
+        // contributes nothing. This is the boundary issue #260 exists for.
+        Seed(1, "Issued", DateTime.UtcNow.AddDays(300),
+            requestDate: DateTime.UtcNow.Date.AddDays(1));
+        await _db.SaveChangesAsync();
+
+        var series = await _sut.GetRegistrationsAsync(WindowDays);
+
+        series.Registrations.Sum().Should().Be(0);
+    }
+
+    [Fact]
+    public async Task Registrations_WindowEdges_LandInFirstAndLastBucket()
+    {
+        // The series runs oldest first: bucket 0 is the first day of the
+        // window and the last bucket is today. The chart plots it in that
+        // order, so the ordering is part of the contract. Asserting only the
+        // sum would let a reversed series through.
+        Seed(1, "Issued", DateTime.UtcNow.AddDays(300),
+            requestDate: DateTime.UtcNow.Date.AddDays(-(WindowDays - 1)));
+        Seed(2, "Issued", DateTime.UtcNow.AddDays(300),
+            requestDate: DateTime.UtcNow);
+        await _db.SaveChangesAsync();
+
+        var series = await _sut.GetRegistrationsAsync(WindowDays);
+
+        series.Registrations[0].Should().Be(1, "the oldest day in the window is the first bucket");
+        series.Registrations[WindowDays - 1].Should().Be(1, "today is the last bucket");
+        series.Registrations.Sum().Should().Be(2);
+    }
+
+    [Fact]
+    public async Task Registrations_DayBeforeTheWindow_IsExcluded()
+    {
+        // One day older than the first bucket, which is the lower edge the
+        // fetch filter draws.
+        Seed(1, "Issued", DateTime.UtcNow.AddDays(300),
+            requestDate: DateTime.UtcNow.Date.AddDays(-WindowDays));
+        await _db.SaveChangesAsync();
+
+        var series = await _sut.GetRegistrationsAsync(WindowDays);
+
+        series.Registrations.Sum().Should().Be(0);
+    }
+
+    [Fact]
+    public async Task Registrations_CountsOnlyIssuedAndRevoked()
+    {
+        // Issue #151. The sync stores pending, denied and failed requests too,
+        // and every one of them carries a request date inside this window by
+        // construction, so without the status filter a denial would read as a
+        // certificate issued that day. Revoked still counts: it was issued on
+        // the day it was issued, and a trend of what the CA produced must not
+        // rewrite its own history every time an operator revokes something.
+        var inWindow = DateTime.UtcNow.AddDays(-2);
+        Seed(1, "Issued", DateTime.UtcNow.AddDays(300), requestDate: inWindow);
+        Seed(2, "Revoked", DateTime.UtcNow.AddDays(300), DateTime.UtcNow.AddHours(-1),
+            requestDate: inWindow);
+        Seed(3, "Pending", DateTime.UtcNow.AddDays(300), requestDate: inWindow);
+        Seed(4, "Denied", DateTime.UtcNow.AddDays(300), requestDate: inWindow);
+        Seed(5, "Failed", DateTime.UtcNow.AddDays(300), requestDate: inWindow);
+        await _db.SaveChangesAsync();
+
+        var series = await _sut.GetRegistrationsAsync(WindowDays);
+
+        series.Registrations.Sum().Should().Be(2);
+
+        // Renewals are not yet distinguishable from new issuance.
+        series.Renewals.Should().HaveCount(WindowDays);
+        series.Renewals.Should().OnlyContain(r => r == 0);
     }
 
     public void Dispose()

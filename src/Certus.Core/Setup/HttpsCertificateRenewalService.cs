@@ -24,10 +24,13 @@ namespace Certus.Core.Setup;
 ///   settings page does that, because an administrator asked for it.</item>
 /// </list>
 ///
-/// <see cref="System.Text.Json.JsonException"/> (a torn or hand broken overlay)
-/// and <see cref="Adcs.CaUnavailableException"/> propagate to the caller
-/// unchanged: both callers already handle them, and papering over an unreadable
-/// overlay here would risk rewriting it from an empty record.
+/// <see cref="System.Text.Json.JsonException"/> (a torn or hand broken overlay),
+/// <see cref="Adcs.CaUnavailableException"/> and
+/// <see cref="Adcs.CaAccessDeniedException"/> propagate to the caller unchanged:
+/// both callers already handle them, and papering over an unreadable overlay here
+/// would risk rewriting it from an empty record. The two CA exceptions travel
+/// together and any caller added later must handle both, or a permissions failure
+/// faults where an outage would have been answered (issue #336).
 /// </summary>
 public sealed class HttpsCertificateRenewalService
 {
@@ -166,6 +169,15 @@ public sealed class HttpsCertificateRenewalService
         var result = await _enroller.EnrollAsync(
             context.CaConnectionString!, template, context.ExternalUrl!, currentHost, cancellationToken);
 
+        // What reached the CA, which is its own programmatic name whenever the
+        // enroller could read the published list. Report and record that rather
+        // than the configured value: an overlay holding a display name issues
+        // fine here but would deny on every path that submits it verbatim, so
+        // recording the resolved name is what makes the install converge
+        // (issue #194). Falls back to the configured value on the refusals that
+        // never submitted, where there is nothing better to say.
+        var enrolledTemplate = result.TemplateName ?? template;
+
         if (result.Status != TlsEnrollmentStatus.Installed)
         {
             return new HttpsCertificateRenewalResult(
@@ -176,7 +188,7 @@ public sealed class HttpsCertificateRenewalService
                     _ => HttpsCertificateRenewalOutcome.Failed,
                 },
                 PreviousThumbprint: context.OverlayThumbprint,
-                Template: template,
+                Template: enrolledTemplate,
                 RequestId: result.RequestId,
                 Message: result.Message);
         }
@@ -191,29 +203,29 @@ public sealed class HttpsCertificateRenewalService
             _logger.LogWarning(
                 "Certificate renewal with template {Template} issued names ({Names}) that do not " +
                 "cover the external URL host; the certificate was removed again",
-                template, string.Join(", ", result.IssuedNames ?? []));
+                enrolledTemplate, string.Join(", ", result.IssuedNames ?? []));
 
             return new HttpsCertificateRenewalResult(
                 HttpsCertificateRenewalOutcome.SanMismatch,
                 PreviousThumbprint: context.OverlayThumbprint,
-                Template: template,
+                Template: enrolledTemplate,
                 RequestId: result.RequestId,
                 IssuedNames: result.IssuedNames,
                 Message: "The CA issued a certificate that does not cover the external URL host, " +
                          "so it was not applied. Check the Subject Name tab of the " +
-                         $"{template} template (\"Supply in the request\").");
+                         $"{enrolledTemplate} template (\"Supply in the request\").");
         }
 
         // SetHttpsCertificateThumbprint writes through SettingsOverlay.Save,
         // which is a temp file then move, so a crash mid write cannot leave a
         // torn overlay that stops the next start.
-        _setupService.SetHttpsCertificateThumbprint(result.Thumbprint!, template);
+        _setupService.SetHttpsCertificateThumbprint(result.Thumbprint!, enrolledTemplate);
 
         return new HttpsCertificateRenewalResult(
             HttpsCertificateRenewalOutcome.Installed,
             Thumbprint: result.Thumbprint,
             PreviousThumbprint: context.OverlayThumbprint,
-            Template: template,
+            Template: enrolledTemplate,
             RequestId: result.RequestId,
             IssuedNames: result.IssuedNames,
             CurrentHostCovered: result.CurrentHostCovered);

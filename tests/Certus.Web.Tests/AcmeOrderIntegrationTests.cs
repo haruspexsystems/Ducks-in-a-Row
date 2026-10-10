@@ -211,6 +211,134 @@ public class AcmeOrderIntegrationTests : IDisposable
         error!.Type.Should().Be(AcmeErrorType.UnsupportedIdentifier);
     }
 
+    // ---- issue #345: the dns identifier grammar, on the wire ----
+
+    [Theory]
+    // The security report's corpus, reproduced against the live deployment.
+    // Every one of these answered 201 Created and became an authorization with
+    // an http-01 challenge pointed at it.
+    [InlineData("localhost#")]
+    [InlineData("a b")]
+    [InlineData("foo|bar")]
+    [InlineData("http://x/")]
+    [InlineData("../../etc")]
+    // Bypasses of the old blocked literal screen, which matched only the exact
+    // string "localhost" or a bare parseable address.
+    [InlineData("LOCALHOST.")]
+    [InlineData("example.com.")]
+    // The identifier that handed the validator a port of the client's choosing.
+    [InlineData("10.0.0.5:22")]
+    [InlineData("user@internal.host")]
+    public async Task NewOrder_MalformedDnsIdentifier_Returns400Malformed(string value)
+    {
+        var (account, rsa) = await CreateAccountAsync();
+
+        var response = await PostNewOrderIdentifierAsync(rsa, account.Kid, value);
+
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        var error = JsonSerializer.Deserialize<AcmeError>(
+            await response.Content.ReadAsStringAsync());
+        // A grammar refusal is not a policy refusal, the same line the device
+        // branch draws for a permanent-identifier that fails its own grammar.
+        error!.Type.Should().Be(AcmeErrorType.Malformed);
+        // And it never carries the value back out.
+        error.Detail.Should().NotContain(value);
+    }
+
+    [Theory]
+    // The value the report reproduced. RFC1918 is not fenced at validation time
+    // by default, so order time is the only place a default install refuses it.
+    [InlineData("192.168.2.1")]
+    [InlineData("10.0.0.5")]
+    [InlineData("172.16.4.9")]
+    [InlineData("::1")]
+    // The report observed 400 rejectedIdentifier for this one already. It still
+    // answers that, by a different route: the grammar refuses every address, so
+    // the blocked literal screen no longer has to.
+    [InlineData("127.0.0.1")]
+    public async Task NewOrder_IpLiteral_Returns400RejectedIdentifier(string value)
+    {
+        var (account, rsa) = await CreateAccountAsync();
+
+        var response = await PostNewOrderIdentifierAsync(rsa, account.Kid, value);
+
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        var error = JsonSerializer.Deserialize<AcmeError>(
+            await response.Content.ReadAsStringAsync());
+        error!.Type.Should().Be(AcmeErrorType.RejectedIdentifier);
+        error.Detail.Should().Contain("IP address");
+    }
+
+    [Theory]
+    [InlineData("localhost")]
+    [InlineData("*.localhost")]
+    public async Task NewOrder_Localhost_StillHitsTheBlockedLiteralScreen(string value)
+    {
+        // "localhost" is perfectly good letter-digit-hyphen text, so the grammar
+        // passes it and the blocked literal screen is what refuses it. That
+        // screen is now the only thing standing between this name and an order,
+        // which is why it stays even though its IP arm is unreachable.
+        var (account, rsa) = await CreateAccountAsync();
+
+        var response = await PostNewOrderIdentifierAsync(rsa, account.Kid, value);
+
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        var error = JsonSerializer.Deserialize<AcmeError>(
+            await response.Content.ReadAsStringAsync());
+        error!.Type.Should().Be(AcmeErrorType.RejectedIdentifier);
+        error.Detail.Should().Contain("not permitted");
+    }
+
+    [Fact]
+    public async Task NewOrder_NullIdentifierElement_Returns400NotAServerError()
+    {
+        // A JSON "identifiers": [null] used to dereference null on the type
+        // check and come back as a 500.
+        var (account, rsa) = await CreateAccountAsync();
+
+        var nonce = await GetFreshNonce();
+        var jws = CreateKidJws(rsa, account.Kid, "/acme/WebServer/new-order", nonce,
+            new NewOrderRequest { Identifiers = new AcmeIdentifier[] { null! } });
+
+        var response = await PostJws("/acme/WebServer/new-order", jws);
+
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        var error = JsonSerializer.Deserialize<AcmeError>(
+            await response.Content.ReadAsStringAsync());
+        error!.Type.Should().Be(AcmeErrorType.Malformed);
+    }
+
+    [Theory]
+    // A name with an underscore. Windows DNS accepts it, ADCS issues for it,
+    // and an administrator can already put it in the allowed domain list, so
+    // the grammar has to be able to take an order for it.
+    [InlineData("my_server.corp.local")]
+    // A single label, ordinary on an internal network.
+    [InlineData("myserver")]
+    [InlineData("xn--mnchen-3ya.corp.local")]
+    [InlineData("*.example.com")]
+    public async Task NewOrder_GoodInternalName_StillReturns201(string value)
+    {
+        var (account, rsa) = await CreateAccountAsync();
+
+        var response = await PostNewOrderIdentifierAsync(rsa, account.Kid, value);
+
+        response.StatusCode.Should().Be(HttpStatusCode.Created);
+    }
+
+    private async Task<HttpResponseMessage> PostNewOrderIdentifierAsync(
+        RSA rsa, string kid, string value)
+    {
+        var nonce = await GetFreshNonce();
+        var jws = CreateKidJws(rsa, kid, "/acme/WebServer/new-order", nonce,
+            new NewOrderRequest
+            {
+                Identifiers = new[] { new AcmeIdentifier { Type = "dns", Value = value } }
+            });
+
+        return await PostJws("/acme/WebServer/new-order", jws);
+    }
+
     #endregion
 
     #region Order Query Tests

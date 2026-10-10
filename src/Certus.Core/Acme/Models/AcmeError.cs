@@ -55,6 +55,9 @@ public static class AcmeErrorType
     private const string Prefix = "urn:ietf:params:acme:error:";
 
     public const string AccountDoesNotExist = Prefix + "accountDoesNotExist";
+    // From RFC 9773 §5, not RFC 8555: the certificate a new-order's "replaces"
+    // names has already been marked as replaced by another live order.
+    public const string AlreadyReplaced = Prefix + "alreadyReplaced";
     public const string AlreadyRevoked = Prefix + "alreadyRevoked";
     // From draft-ietf-acme-device-attest-08, not RFC 8555: the attestation
     // object of a device-attest-01 challenge did not verify.

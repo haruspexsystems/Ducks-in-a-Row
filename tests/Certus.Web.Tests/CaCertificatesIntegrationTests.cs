@@ -42,7 +42,7 @@ public class CaCertificatesIntegrationTests
         body.ValueKind.Should().Be(JsonValueKind.Array);
         body.GetArrayLength().Should().Be(1);
         body[0].GetProperty("role").GetString().Should().Be("root");
-        body[0].GetProperty("subject").GetString().Should().Contain("Mock");
+        body[0].GetProperty("subject").GetString().Should().Contain("Example Issuing CA");
         body[0].GetProperty("thumbprint").GetString().Should().NotBeNullOrEmpty();
     }
 

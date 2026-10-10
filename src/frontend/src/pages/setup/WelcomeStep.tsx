@@ -16,7 +16,7 @@ export function WelcomeStep() {
         </p>
         <ul className="text-sm text-certus-700 dark:text-certus-300 mt-2 space-y-1 list-disc list-inside">
           <li>This server must be <strong>domain-joined</strong> (DCOM requires AD authentication)</li>
-          <li>The CA hostname and name (e.g., <code className="bg-certus-100 dark:bg-certus-500/15 px-1 rounded">ca-server\Contoso-CA</code>)</li>
+          <li>The CA hostname and name (e.g., <code className="bg-certus-100 dark:bg-certus-500/15 px-1 rounded">ca-server\Example-CA</code>)</li>
           <li>Network access from this server to the CA (RPC/DCOM ports)</li>
           <li>The URL that ACME clients will use to reach this server</li>
         </ul>
@@ -46,7 +46,9 @@ export function WelcomeStep() {
       </div>
 
       <p className="text-xs text-faint mt-4">
-        Setup typically takes less than 5 minutes. Click <strong>Next</strong> to begin.
+        Setup takes about five minutes of clicking once the approvals are in place. The approvals
+        are the rights this server's computer account needs on the CA and its templates, and they
+        are usually the lead time, so ask for them first. Click <strong>Next</strong> to begin.
       </p>
     </div>
   );

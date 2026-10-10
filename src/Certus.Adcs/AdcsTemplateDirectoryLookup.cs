@@ -40,9 +40,18 @@ internal static class AdcsTemplateDirectoryLookup
     /// <param name="RaSignatureCount">Raw <c>msPKI-RA-Signature</c>, or null when absent.</param>
     /// <param name="CertificateNameFlags">Raw <c>msPKI-Certificate-Name-Flag</c>, or null when absent.</param>
     /// <param name="MinimalKeySize">Raw <c>msPKI-Minimal-Key-Size</c>, or null when absent.</param>
-    /// <param name="AsymmetricAlgorithm">
-    /// Raw <c>msPKI-Asymmetric-Algorithm</c>. Only schema v3+ templates carry it;
-    /// null on v1/v2 templates, whose algorithm is inferred from <paramref name="DefaultCsps"/>.
+    /// <param name="SchemaVersion">
+    /// Raw <c>msPKI-Template-Schema-Version</c>, or null when absent. Absent is
+    /// the normal shape of a version 1 template rather than a failed read: the
+    /// whole <c>msPKI-</c> attribute set postdates that schema.
+    /// </param>
+    /// <param name="PrivateKeyFlags">Raw <c>msPKI-Private-Key-Flag</c>, or null when absent.</param>
+    /// <param name="RaApplicationPolicies">
+    /// Raw <c>msPKI-RA-Application-Policies</c> values. On the schemas that use
+    /// the CNG syntax this carries the key algorithm; on the others it is a list
+    /// of registration authority OIDs and carries nothing we want. Handed across
+    /// unparsed so the interpretation stays in Certus.Core where it can be unit
+    /// tested: see <see cref="Certus.Core.Adcs.RaApplicationPolicies"/>.
     /// </param>
     /// <param name="DefaultCsps">The legacy <c>pKIDefaultCSPs</c> provider list. Empty when absent.</param>
     internal sealed record TemplateAdInfo(
@@ -52,8 +61,21 @@ internal static class AdcsTemplateDirectoryLookup
         int? RaSignatureCount = null,
         int? CertificateNameFlags = null,
         int? MinimalKeySize = null,
-        string? AsymmetricAlgorithm = null,
+        int? SchemaVersion = null,
+        int? PrivateKeyFlags = null,
+        IReadOnlyList<string>? RaApplicationPolicies = null,
         IReadOnlyList<string>? DefaultCsps = null);
+
+    /// <summary>
+    /// Deadlines for the template search, so a domain controller that stops
+    /// answering cannot pin a thread pool thread for the OS level TCP timeout.
+    /// The same pair <see cref="AdPrincipalLookup"/> carries, and required by
+    /// the project notes for every <see cref="DirectorySearcher"/>. This search
+    /// runs behind a five minute cache rather than per keystroke, so it can
+    /// afford to be more patient than the principal picker.
+    /// </summary>
+    private static readonly TimeSpan SearchClientTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan SearchServerTimeLimit = TimeSpan.FromSeconds(20);
 
     /// <summary>
     /// Returns a case insensitive dictionary mapping each programmatic name (the
@@ -84,7 +106,10 @@ internal static class AdcsTemplateDirectoryLookup
             {
                 Filter = "(objectClass=pKICertificateTemplate)",
                 SearchScope = SearchScope.OneLevel,
-                PageSize = 1000
+                PageSize = 1000,
+                ClientTimeout = SearchClientTimeout,
+                ServerTimeLimit = SearchServerTimeLimit,
+                ServerPageTimeLimit = SearchServerTimeLimit
             };
             searcher.PropertiesToLoad.Add("cn");
             searcher.PropertiesToLoad.Add("displayName");
@@ -93,7 +118,9 @@ internal static class AdcsTemplateDirectoryLookup
             searcher.PropertiesToLoad.Add("msPKI-RA-Signature");
             searcher.PropertiesToLoad.Add("msPKI-Certificate-Name-Flag");
             searcher.PropertiesToLoad.Add("msPKI-Minimal-Key-Size");
-            searcher.PropertiesToLoad.Add("msPKI-Asymmetric-Algorithm");
+            searcher.PropertiesToLoad.Add("msPKI-Template-Schema-Version");
+            searcher.PropertiesToLoad.Add("msPKI-Private-Key-Flag");
+            searcher.PropertiesToLoad.Add("msPKI-RA-Application-Policies");
             searcher.PropertiesToLoad.Add("pKIDefaultCSPs");
 
             using var found = searcher.FindAll();
@@ -112,7 +139,9 @@ internal static class AdcsTemplateDirectoryLookup
                     RaSignatureCount: GetInt(sr, "msPKI-RA-Signature"),
                     CertificateNameFlags: GetInt(sr, "msPKI-Certificate-Name-Flag"),
                     MinimalKeySize: GetInt(sr, "msPKI-Minimal-Key-Size"),
-                    AsymmetricAlgorithm: GetSingle(sr, "msPKI-Asymmetric-Algorithm"),
+                    SchemaVersion: GetInt(sr, "msPKI-Template-Schema-Version"),
+                    PrivateKeyFlags: GetInt(sr, "msPKI-Private-Key-Flag"),
+                    RaApplicationPolicies: GetMulti(sr, "msPKI-RA-Application-Policies"),
                     DefaultCsps: GetMulti(sr, "pKIDefaultCSPs"));
             }
 

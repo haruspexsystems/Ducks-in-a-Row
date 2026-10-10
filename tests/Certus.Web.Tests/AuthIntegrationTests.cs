@@ -148,6 +148,62 @@ public class AuthIntegrationTests : IClassFixture<AuthWebApplicationFactory>
         body.TryGetProperty("externalUrl", out _).Should().BeTrue();
     }
 
+    // ── The service rights check (issue #440) ────────────────────────────
+
+    public static TheoryData<string, string> ServiceRightsRoutes => new()
+    {
+        { "POST", "/api/setup/service-rights" },
+        { "GET", "/api/settings/service-rights" },
+        { "POST", "/api/settings/service-rights/check" },
+    };
+
+    private static HttpRequestMessage ServiceRightsRequest(string method, string path) =>
+        new(new HttpMethod(method), path)
+        {
+            Content = method == "POST"
+                ? JsonContent(new { caConnectionString = @"mockca.example.com\Mock Certificate Authority" })
+                : null,
+        };
+
+    [Theory]
+    [MemberData(nameof(ServiceRightsRoutes))]
+    public async Task ServiceRights_Anonymous_Returns401(string method, string path)
+    {
+        var response = await CreateClient(csrf: true).SendAsync(ServiceRightsRequest(method, path));
+
+        response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
+    }
+
+    [Theory]
+    [MemberData(nameof(ServiceRightsRoutes))]
+    public async Task ServiceRights_AuthenticatedNonAdmin_Returns403(string method, string path)
+    {
+        // The report maps the CA's permissions and the service's groups, which
+        // is administrator information like the rest of the setup surface.
+        var response = await CreateClient("alice", csrf: true).SendAsync(ServiceRightsRequest(method, path));
+
+        response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+    }
+
+    [Theory]
+    [MemberData(nameof(ServiceRightsRoutes))]
+    public async Task ServiceRights_AdminWithTheCsrfHeader_Returns200(string method, string path)
+    {
+        var response = await CreateClient(TestAuthHandler.AdminUser, csrf: true).SendAsync(ServiceRightsRequest(method, path));
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+    }
+
+    [Theory]
+    [InlineData("/api/setup/service-rights")]
+    [InlineData("/api/settings/service-rights/check")]
+    public async Task ServiceRights_AdminWithoutTheCsrfHeader_Returns403(string path)
+    {
+        var response = await CreateClient(TestAuthHandler.AdminUser).SendAsync(ServiceRightsRequest("POST", path));
+
+        response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+    }
+
     // ── CSRF guard and setup completion lock ────────────────────────────
 
     [Fact]

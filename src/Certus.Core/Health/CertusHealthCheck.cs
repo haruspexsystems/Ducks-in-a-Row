@@ -83,6 +83,23 @@ public sealed class CertusHealthCheck : IHealthCheck
                 {
                     throw; // do not cache a cancelled probe
                 }
+                catch (CaUnavailableException)
+                {
+                    // An unreachable CA, or none configured yet. GetCaInfoAsync
+                    // throws this since issue #440 rather than answering "not
+                    // accessible", and it must still read exactly as it did:
+                    // degraded, with no warning every 30 seconds.
+                    return new CaHealthSnapshot(false, null, null);
+                }
+                catch (CaAccessDeniedException ex)
+                {
+                    // A CA that refuses the service's account. Unlike an outage
+                    // it will not pass on its own, so the reason stays in the
+                    // data, naming the right to grant. AdcsClient has already
+                    // logged it at Error, so there is no second warning here on
+                    // every probe.
+                    return new CaHealthSnapshot(false, null, ex.Message);
+                }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "Health check: CA connectivity check failed");

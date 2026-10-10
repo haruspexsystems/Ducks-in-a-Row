@@ -25,7 +25,9 @@ Integration testing against a real ADCS CA requires a lab environment. You don't
 
 ### Option 1: Windows Server VM with ADCS Role
 
-1. **Create a Windows Server 2019/2022 VM** (Hyper-V, VMware, or cloud)
+1. **Create a Windows Server 2019 or 2025 VM** (Hyper-V, VMware, or cloud).
+   Server 2022 works too, but needs current Windows updates first; see
+   [system requirements](system-requirements.md)
 2. **Promote to Domain Controller** (or join an existing test domain):
    ```powershell
    Install-WindowsFeature AD-Domain-Services -IncludeManagementTools
@@ -56,16 +58,50 @@ The `MockAdcsClient` in `Certus.Core` generates real X.509 certificates using Bo
 - Supports pending/approval workflow simulation
 - Works on any OS (no Windows/ADCS dependency)
 
-To use mock mode, do NOT configure `Certus:CaConnectionString` in appsettings.json. The Web host will be updated in later phases to fall back to the mock client when no CA is configured.
+To use mock mode, set `Certus:UseMockCa` to `true` and leave
+`Certus:CaConnectionString` unset. The service refuses to start if you set both,
+because a configured CA next to a mock one is almost always a mistake.
+
+The host does **not** fall back to the mock client on its own when no CA is
+configured. An unconfigured install serves the setup wizard and answers 503 to
+every CA operation until setup completes. Falling back silently would mean a
+misconfigured production server quietly issuing certificates nobody trusts.
 
 ## COM Interop Notes
 
 ### Threading
 
-ADCS COM objects (ICertRequest2, ICertAdmin2, ICertView2) support **free-threading (MTA)**. This means:
-- They work with ASP.NET Core's default thread pool (MTA threads) ✅
-- No STA thread required ✅
-- Individual COM instances are NOT thread-safe — create per-operation and release
+ADCS COM objects support **free threading (MTA)**. This means:
+
+- They work with ASP.NET Core's default thread pool, which is MTA.
+- No STA thread is required.
+- An individual COM instance is **not** thread safe. Create one per
+  operation and release it.
+
+### Late binding, and why there are no typed interfaces
+
+Every ADCS call in this codebase goes through `IDispatch` late binding. The
+coclass is created with `new CertRequestClass()`, assigned to `dynamic`, and
+every method is invoked by name. There are no `[ComImport]` interface
+declarations with methods on them, and there must not be.
+
+Two reasons, both load bearing:
+
+- On the target Windows builds, `QueryInterface` for `ICertRequest2` returns
+  `E_NOINTERFACE`. The v2 request surface is simply not there to cast to.
+- The v1 interfaces are dual: they inherit `IDispatch`, so the real vtable is
+  `IUnknown` then `IDispatch` then the custom methods. A managed interface
+  declared `InterfaceIsIUnknown` lays its methods out four slots short of that,
+  and calls land inside the `IDispatch` range. The symptom is not a clean
+  failure: an argument gets dereferenced as a pointer, so you get an
+  `AccessViolationException` or a `NullReferenceException` depending on the
+  value you passed.
+
+A repository hook blocks reintroducing a typed ADCS interface or an
+`[InterfaceType(...)]` attribute. If you are tempted, run
+`tools/AdcsQiProbe` against a real CA first and read what it reports.
+`certutil -ping` is not evidence either way, because certutil and this client
+take different routes to the CA.
 
 ### Testing COM Interop
 
@@ -81,12 +117,12 @@ dotnet test --filter "Category=Integration"
 
 ### DCOM Configuration
 
-For the Certus server to communicate with a remote CA via DCOM:
+For the Ducks in a Row server to communicate with a remote CA via DCOM:
 
-1. The Certus service account must have DCOM launch/access permissions on the CA server
-2. The CA server's firewall must allow DCOM/RPC traffic (TCP 135 + dynamic ports)
-3. The Certus server must be domain-joined to the same forest as the CA
-4. The Certus service account must have the "Read" permission on the CA itself, granted
+1. The service account must have DCOM launch and access permissions on the CA server
+2. The CA server's firewall must allow DCOM and RPC traffic (TCP 135 + dynamic ports)
+3. The server must be domain-joined to the same forest as the CA
+4. The service account must have the "Read" permission on the CA itself, granted
    via the Certificate Authority console (CA Properties -> Security). This is required for
    the dashboard certificate sync, which reads the CA database through the certificate view
    interface (ICertView). It is a separate permission from certificate request/submission:

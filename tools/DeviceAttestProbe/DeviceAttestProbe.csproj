@@ -20,7 +20,15 @@
          in Program.cs. Those are five fixed integers from the ADCS headers. This
          is a security invariant: the guard that keeps a template name from
          smuggling a second ADCS request attribute (issue #175, CVE-2026-54121).
-         A copy of it would be free to drift out of step with the product's. -->
+         A copy of it would be free to drift out of step with the product's.
+
+         DeceptiveCharacters is the character scanner the guard delegates to
+         since issue #234, so it has to come along or the probe stops compiling.
+         Nothing but the compiler enforces that: the probe is outside the test
+         suite, so only `dotnet build tools/DeviceAttestProbe` catches a missed
+         link here. Any further dependency the guard grows needs the same line. -->
+    <Compile Include="../../src/Certus.Core/Security/DeceptiveCharacters.cs"
+             Link="DeceptiveCharacters.cs" />
     <Compile Include="../../src/Certus.Core/Adcs/AdcsRequestAttributes.cs"
              Link="AdcsRequestAttributes.cs" />
   </ItemGroup>

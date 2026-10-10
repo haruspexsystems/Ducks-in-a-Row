@@ -241,8 +241,9 @@ public class CertificateRevocationService
             // alreadyRevoked from that row's RevokedAt without calling the CA
             // (RFC 8555 §7.6). Stamp it, or an ACME client revoking after a
             // dashboard revoke would trigger a second CA call and get a
-            // server error instead of alreadyRevoked. Nothing else ever
-            // repairs this row; the certificate sync does not touch it.
+            // server error instead of alreadyRevoked. The sync clears this
+            // stamp again only if the CA later reports the certificate
+            // released from hold (issue #375); nothing else touches it.
             await _db.AcmeCertificates
                 .Where(a => a.AdcsRequestId == entity.RequestId && a.RevokedAt == null)
                 .ExecuteUpdateAsync(setters => setters

@@ -3,6 +3,9 @@
 Ducks in a Row implements RFC 8555, so any standard ACME client works. No agent
 or proprietary software is needed on your endpoints.
 
+Running Kubernetes or OpenShift? cert-manager has a page of its own:
+[Kubernetes and OpenShift](kubernetes.md).
+
 ## The directory URL
 
 Every certificate template is its own ACME endpoint:
@@ -12,7 +15,11 @@ https://your-server:5001/acme/<template>/directory
 ```
 
 - `<template>` is the template's programmatic name (its AD `cn`) or its display
-  name. Display names with spaces are accepted; the client URL encodes them.
+  name. Display names with spaces are accepted; the client URL encodes them. A
+  display name carrying an invisible character, such as a soft hyphen left
+  behind by a paste from a word processor, is refused with a 400 `malformed`
+  problem document; use the programmatic name and see
+  [Troubleshooting](troubleshooting.md).
 - Use the HTTPS endpoint (5001) in production. Plain HTTP (5000) is for lab use
   only.
 - Whether registration needs an external account binding credential depends on
@@ -70,7 +77,7 @@ listed here for its field names only. The flags per client:
 | win-acme | `--baseuri` | `--eab-key-identifier` | `--eab-key` |
 | acme.sh | `--server`, once with `--register-account` | `--eab-kid` | `--eab-hmac-key` |
 | Posh-ACME | `Set-PAServer -DirectoryUrl` | `New-PAAccount -ExtAcctKID` | `New-PAAccount -ExtAcctHMACKey` |
-| cert-manager | `spec.acme.server` | `externalAccountBinding.keyID` | `externalAccountBinding.keySecretRef`, a secret holding the base64url key |
+| cert-manager | `spec.acme.server` | `externalAccountBinding.keyID` | `externalAccountBinding.keySecretRef`, a secret holding the base64url key; see [the EAB secret](kubernetes.md#the-eab-secret) |
 | Caddy | `acme_ca` | `acme_eab` block, `key_id` | `acme_eab` block, `mac_key` |
 | Traefik | `caServer` | `eab.kid` | `eab.hmacEncoded` |
 
@@ -88,6 +95,35 @@ credential may be revoked, expired, or rotated; see
 
 The Ducks in a Row server is the party that performs validation, so the server
 needs outbound reachability to the domain or DNS being validated.
+
+## Key type
+
+| Template records | Ask for | Notes |
+|---|---|---|
+| An RSA provider | RSA, 2048 bits or more | The stock `Web Server ACME` template. Most clients default to an elliptic curve key, so this is the case that needs a flag |
+| `ECDSA_P256`, `ECDSA_P384`, `ECDSA_P521` | An ECDSA key on the named curve | |
+| `ECDH_P256`, `ECDH_P384`, `ECDH_P521` | An ECDSA key on the same curve | See below |
+
+An `ECDH_*` template is more common than it looks. The Certificate Templates
+console records ECDH when **Request Handling** has its purpose set to
+"Signature and encryption", which is a default rather than an unusual choice. A
+PKCS#10 certificate request cannot carry an encryption only key, so the answer is
+the signature key on the same curve, and the dashboard says as much when it
+generates the snippet.
+
+Forcing RSA where the template is RSA:
+
+| Client | Flag |
+|---|---|
+| certbot | `--key-type rsa --rsa-key-size 2048` |
+| lego | `--key-type rsa2048` |
+| acme.sh | `--keylength 2048` |
+| dehydrated | `KEY_ALGO="rsa"` |
+| win-acme | `--csr rsa` |
+
+cert-manager asks for RSA 2048 unless told otherwise, so an RSA template needs
+nothing, and an ECDSA template needs `privateKey` on every Certificate. See
+[key type](kubernetes.md#key-type) on the Kubernetes page.
 
 ## CSR requirements
 
@@ -108,6 +144,70 @@ submitted to the CA:
 A CSR that breaks these rules is refused with `badCSR`, and the order stays
 in the ready state so the client can retry with a corrected CSR.
 
+`badCSR` means the CSR itself, and only the CSR. A finalize on an order that is
+no longer ready is refused with `orderNotReady` instead, including the case where
+another request finalized the same order first. Rebuilding the key and the CSR
+cannot help there; re-read the order and act on the status it reports.
+
+A CA that refuses the request is a different answer again. The finalize returns
+500 with `serverInternal`, the detail carries the CA's own disposition message,
+and the order becomes invalid: the CA has decided, and no CSR will change its
+mind. Read the detail, fix the template or the key type, and start a new order.
+
+That same problem document is also on the order itself, in the `error` member RFC
+8555 section 7.1.3 defines, so a client that lost the finalize response or that
+polls rather than reads it can fetch the order and find the reason there. It
+reads word for word the same either way.
+
+One case leaves the order's `error` empty on purpose: an order that went invalid
+because a challenge failed. The reason for that failure belongs to the
+authorization, so follow the order's `authorizations` URLs and read the `error`
+on the failed challenge, which is what section 7.1.6 asks a client to do.
+
+If the CA cannot be reached at all, the finalize returns 503 with
+`serviceUnavailable` and the order is left alone. Retry the same finalize once
+the CA is back. Nothing is lost, and the authorizations you already completed
+still stand.
+
+## Renewal timing (ARI)
+
+The directory advertises `renewalInfo`, the ACME Renewal Information extension
+(RFC 9773). A client that understands it asks the server when to renew each
+certificate instead of guessing from the expiry date, with a plain
+unauthenticated GET of `{renewalInfo}/{certID}`, where the identifier is built
+from the certificate's Authority Key Identifier and serial number exactly as
+the RFC describes. No account or signature is needed.
+
+The response is a `suggestedWindow` sitting at roughly two thirds of the
+certificate's lifetime, about 2% of that lifetime wide, with a per certificate
+offset derived from the serial number. The offset is what keeps a fleet issued
+in one batch from renewing in one batch, and it is deterministic, so the window
+a client sees never moves between polls. The `Retry-After` header says how
+often to ask again (six hours).
+
+Two behaviors are worth knowing about:
+
+- A **revoked** certificate answers with a window entirely in the past, which
+  an ARI aware client reads as "renew immediately". This is how a revocation
+  reaches your fleet without anyone touching the clients, and it works however
+  the certificate was revoked: through ACME, from the dashboard, or directly at
+  the CA with certutil or certsrv.msc.
+- When renewing, a conforming client adds a `replaces` member to its new-order
+  request naming the certificate it is replacing. The server verifies it (same
+  account, at least one shared identifier) and reflects it on the order. A
+  second live order naming the same certificate is refused with HTTP 409 and
+  `urn:ietf:params:acme:error:alreadyReplaced`, which stops duplicate renewal
+  loops; if that happens, the earlier order is the one to complete. An earlier
+  order that was abandoned stops blocking once it passes its own expiry, so a
+  crashed renewal attempt never locks a certificate out.
+
+Clients that read ARI include certbot from 4.1.0, lego (checked by default since
+4.20.2), Caddy from 2.8.0, and simple-acme, which follows it unless
+`ScheduledTask.RenewalDisableServerSchedule` is set. cert-manager reads it only
+from 1.21, and only with its alpha `ACMEUseARI` feature gate switched on; see
+[renewal and ARI](kubernetes.md#renewal-and-ari). Clients that do not simply
+ignore the directory member and renew on their own schedule, as before.
+
 ## certbot
 
 ```bash
@@ -119,12 +219,16 @@ certbot certonly --standalone \
   --key-type rsa --rsa-key-size 2048
 ```
 
-> **Key type.** If your ADCS template uses an RSA CSP (the default
-> `Web Server ACME` template does), your ACME client must request an RSA key.
-> Most modern clients default to elliptic curve keys, which the CA policy
-> module rejects at finalize with `Denied by Policy Module`. The last line
-> above forces RSA for certbot. Other clients: lego `--key-type rsa2048`,
-> acme.sh `--keylength 2048`, dehydrated `KEY_ALGO="rsa"`.
+> [!WARNING]
+> **Match the key type to the template.** Your client must ask for the key type
+> the template wants, and templates differ. Ask for the wrong one and the CA
+> policy module refuses at finalize with `Denied by Policy Module`, which reads
+> like a permissions problem and is not one.
+>
+> The wizard's template step reports the key algorithm it read from the
+> template, and the **Client setup** snippets on the dashboard's ACME page come
+> with the right flags already filled in for that template. That is the reliable
+> answer for your CA; the table under [key type](#key-type) is the general shape.
 
 For a lab server with an untrusted TLS certificate, set
 `REQUESTS_CA_BUNDLE` to your CA root PEM so certbot trusts the endpoint, or
@@ -188,6 +292,32 @@ New-PAAccount -Contact you@example.com -AcceptTOS
 New-PACertificate -Domain host.corp.example.com -Plugin WebRoot `
   -PluginArgs @{ WebRootPath = 'C:\inetpub\wwwroot' }
 ```
+
+## cert-manager (Kubernetes)
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ducks-in-a-row
+spec:
+  acme:
+    server: https://your-server:5001/acme/WebServer/directory
+    caBundle: <base64 of your CA root, PEM>
+    email: you@example.com
+    privateKeySecretRef:
+      name: ducks-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx
+```
+
+cert-manager trusts only public roots unless `caBundle` names yours, and it asks
+for an RSA 2048 key unless a Certificate says otherwise. Issuer or
+ClusterIssuer, the EAB secret, the path an HTTP-01 check takes through your
+ingress, and what is known about OpenShift are on the
+[Kubernetes and OpenShift](kubernetes.md) page.
 
 ## Picking a template
 

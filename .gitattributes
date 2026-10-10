@@ -17,9 +17,13 @@
 *.gitignore text eol=lf
 *.gitattributes text eol=lf
 
+*.py text eol=lf
+
+*.pdf binary
 *.png binary
 *.jpg binary
 *.gif binary
 *.ico binary
+*.bmp binary
 *.pfx binary
 *.p12 binary

@@ -84,6 +84,13 @@ A **disabled** profile behaves exactly like no profile: the template stops
 offering `device-attest-01` and device orders are refused invisibly. Disabling
 is the clean way to pause a template without deleting its allowlist.
 
+Invisibly means the refusal names no device concept and reads exactly like the
+refusal for an identifier type the server does not know, whatever the client
+sends: a well formed serial, an empty value, an oversize one, and a device
+order mixed with a `dns` one all get the same answer. What that hides is
+whether **this template** takes device orders. It does not hide that the
+product implements the draft, which the version and this page already say.
+
 ## CSR identifier binding
 
 The Apple ACME payload cannot put the device identifier where the draft's strict
@@ -159,8 +166,11 @@ MDM cannot present an HMAC key id.
 This has a concrete consequence: if EAB enforcement is set to **Required**, Apple
 devices cannot register an account and cannot enrol at all. That is expected, not
 a bug. The device attestation allowlist, not EAB, is the gate for device orders.
-If you run both EAB Required and device attestation, keep them on separate
-templates.
+The mode applies to the whole server rather than to one template, so putting
+devices on a template of their own does not help: keep EAB at Off or Optional
+wherever device attestation is in use. An account a device registered before
+the mode was raised keeps working, but any new registration is refused, a device
+enrolling again included.
 
 ## Renewal and Apple rate limits
 

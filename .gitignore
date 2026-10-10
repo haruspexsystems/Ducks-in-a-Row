@@ -10,6 +10,11 @@ obj/
 node_modules/
 dist/
 build/
+# build/ above is meant for frontend output, but it matches any directory of
+# that name at any depth, which silently swallowed tests/build (the self test
+# for build.ps1, issue #396). Re-include the directory itself; a file cannot be
+# re-included while its parent directory is excluded.
+!tests/build/
 .next/
 .cache/
 src/Certus.Web/wwwroot/
@@ -37,6 +42,12 @@ installer/redist/
 # Code review reports (local only)
 reviews/
 
+# Automated lab run records (local only). One file per lab session, carrying
+# every command and its full output. Not committed: they name lab hosts and
+# accumulate fast, and what matters from a run is quoted into the PR or issue
+# that needed it.
+lab-runs/
+
 # OS
 Thumbs.db
 Desktop.ini
@@ -61,3 +72,7 @@ ds-bundle/
 
 # Claude worktrees
 .claude/worktrees/
+
+# Python bytecode from docs/generate_guide.py
+__pycache__/
+*.pyc

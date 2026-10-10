@@ -120,6 +120,7 @@ public class RevocationEligibilityServiceTests : IDisposable
             {
                 OrderId = "elig-test-order",
                 Status = "valid",
+                CertificateId = "elig-test-cert",
                 TemplateId = "SomethingElse",
                 ExpiresAt = DateTime.UtcNow.AddDays(1),
                 Account = new AcmeAccount

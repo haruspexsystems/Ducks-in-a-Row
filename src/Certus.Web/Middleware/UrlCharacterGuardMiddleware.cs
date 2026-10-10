@@ -1,10 +1,13 @@
-using System.Globalization;
+using Certus.Core.Acme.Models;
+using Certus.Core.Adcs;
+using Certus.Core.Security;
+using Certus.Web.Routing;
 
 namespace Certus.Web.Middleware;
 
 /// <summary>
-/// Refuses any request whose URL path carries a control character or a Unicode
-/// format character, before request logging runs.
+/// Refuses any request whose URL path carries a control character, a line
+/// separator, or a Unicode format character, before request logging runs.
 ///
 /// A URL path arrives percent encoded and ASP.NET decodes it before anything
 /// reads <c>Request.Path</c>, so <c>%0A</c> on the wire is a real line feed by
@@ -16,9 +19,12 @@ namespace Certus.Web.Middleware;
 ///   GET /acme/WebServer%0A2026-01-01 00:00:00.000 +00:00 [INF] Certificate issued%0A/directory
 /// </code>
 ///
-/// Format characters cannot split a line, but a right to left override makes
-/// the line render as a different line in a terminal or a log viewer, and a
-/// zero width space hides a difference between two paths that read alike.
+/// Line separators (U+2028 and U+2029) split a line only for a reader that
+/// honours them, which the .NET line reader behind this log file does not and a
+/// SIEM's own splitter may (issue #234). Format characters cannot split a line at
+/// all, but a right to left override makes the line render as a different line in
+/// a terminal or a log viewer, and a zero width space hides a difference between
+/// two paths that read alike.
 ///
 /// Nothing is smuggled to the CA either way. The ACME template segment only
 /// selects a template, and a name like these matches nothing the CA publishes
@@ -27,21 +33,44 @@ namespace Certus.Web.Middleware;
 /// <c>docs/hardening.md</c> tells a deployer to read after a suspected
 /// enrollment attack.
 ///
-/// The two refused classes are deliberately the same two AdcsRequestAttributes
-/// refuses in a template name, for the same reasons. Every template name that
-/// reaches this product legitimately came from the CA, so a URL carrying what a
-/// template name may not carry is not a URL this product serves.
+/// The refused classes are deliberately the same ones AdcsRequestAttributes
+/// refuses in a template name, for the same reasons, and since issue #234 that
+/// parity is held by sharing one scanner rather than by two comments agreeing.
+/// Every template name that reaches this product legitimately came from the CA,
+/// so a URL carrying what a template name may not carry is not a URL this
+/// product serves.
 ///
 /// Refusing the request rather than escaping the log line fixes it once for
 /// every logger and every echo, instead of once per call site: a refused
-/// request never reaches a controller, so it also cannot be reflected back in a
-/// problem document.
+/// request never reaches a controller, so no controller can reflect the path
+/// back into its own answer.
 ///
 /// This runs before <c>UseSerilogRequestLogging</c>, so a refused request is
 /// reported by the warning below rather than by the request logger. Like
 /// AdcsRequestAttributes, that warning names the code point and its position
 /// and never echoes the value, or the refusal would write the very line it
 /// exists to prevent.
+///
+/// On the /acme surface the refusal answers a problem document rather than the
+/// plain body, because a bare shape no ACME client understands reads to that
+/// client as "unexpected response" and tells its operator nothing. That is the
+/// same defect issue #147 fixed for the routing and rate limit refusals, and
+/// <see cref="Certus.Web.Routing.AcmeProblemResults"/> is the same envelope
+/// those use. The detail carries the code point and the position and nothing
+/// else, on exactly the discipline the warning keeps: the caller already knows
+/// which bytes it sent, so naming them back discloses nothing, while the path
+/// itself never appears. This matters because of issue #235. A certificate
+/// template's display name is free text out of Active Directory and may carry
+/// an invisible character such as a soft hyphen, issue #17 lets an ACME client
+/// address a template by that display name, and the operator on the other end
+/// of the 400 can see nothing wrong with the name in any screen that renders
+/// it.
+///
+/// The response carries no Replay-Nonce, because this sits ahead of
+/// AcmeNonceMiddleware and has to: the guard's whole job is to run before the
+/// request logger. That is unchanged from the bodiless refusal it replaces, and
+/// moving the guard later to gain a nonce would put a hostile path back through
+/// the logger.
 /// </summary>
 public sealed class UrlCharacterGuardMiddleware
 {
@@ -64,18 +93,49 @@ public sealed class UrlCharacterGuardMiddleware
         // anywhere in the request target. Decoding the query here to look for
         // something that cannot arrive would cost every request and find
         // nothing.
-        if (FindUnsafeCharacter(context.Request.Path.Value, out var position, out var codePoint))
+        // Control covers the C0 range, DEL, and the C1 range rather than
+        // stopping at carriage return and line feed: C1 holds its own line
+        // terminator (U+0085 NEL), and a log reader or a terminal may act on
+        // more of the range than the file writer does. That reasoning is what
+        // reaches U+2028 and U+2029 as well, which the scanner now covers. It
+        // also resolves a surrogate pair before reading its category, so the
+        // tag block U+E0020 to U+E007F cannot slip past (issue #228).
+        if (DeceptiveCharacters.Find(context.Request.Path.Value) is { } found)
         {
             _logger.LogWarning(
-                "Refused a request whose URL carries a control or formatting character " +
-                "(U+{CodePoint:X4}) at position {Position}. Those characters can forge or " +
-                "disguise a log line, so the request is refused rather than logged",
-                codePoint, position);
+                "Refused a request whose URL carries a control, line separator, or " +
+                "formatting character (U+{CodePoint:X4}) at position {Position}. Those " +
+                "characters can forge or disguise a log line, so the request is refused " +
+                "rather than logged",
+                found.CodePoint, found.Position);
+
+            if (ProtocolPaths.IsAcmeProtocolPath(context.Request.Path))
+            {
+                // The template guidance is conditional because the guard does
+                // not parse the path and the character can sit in any segment,
+                // so telling a client to use the programmatic name would be
+                // wrong for a fault in, say, the finalize segment. The position
+                // is already here for a reader who needs to locate it.
+                return AcmeProblemResults.WriteProblemAsync(
+                    context,
+                    StatusCodes.Status400BadRequest,
+                    AcmeErrorType.Malformed,
+                    $"The request URL contains a {ClassNoun(found.Class)} character " +
+                    $"(U+{found.CodePoint:X4}) at position {found.Position}, so it was " +
+                    "refused before routing. If this URL was built from a certificate " +
+                    "template's display name, that name carries an invisible character " +
+                    "such as a soft hyphen. Address the template by its programmatic " +
+                    "name (its Active Directory cn) instead, or ask an administrator to " +
+                    "correct the display name.",
+                    context.RequestAborted);
+            }
 
             context.Response.StatusCode = StatusCodes.Status400BadRequest;
             return context.Response.WriteAsJsonAsync(new
             {
-                error = "The request URL contains a control or formatting character.",
+                error =
+                    "The request URL contains a control, line separator, or " +
+                    "formatting character.",
             });
         }
 
@@ -83,50 +143,17 @@ public sealed class UrlCharacterGuardMiddleware
     }
 
     /// <summary>
-    /// The first control or Unicode format character in <paramref name="value"/>.
-    /// Control covers the C0 range, DEL, and the C1 range rather than stopping at
-    /// carriage return and line feed: C1 holds its own line terminator (U+0085
-    /// NEL), and a log reader or a terminal may act on more of the range than the
-    /// file writer does. Format covers the bidirectional overrides U+202A to
-    /// U+202E, the isolates U+2066 to U+2069, the zero width space, the soft
-    /// hyphen, and the tag block U+E0020 to U+E007F.
-    ///
-    /// The category is read from the string rather than the char so a format
-    /// character above the BMP is caught. Those arrive as a surrogate pair, and
-    /// the category of a lone surrogate is Surrogate and never Format, so a per
-    /// char lookup misses the whole class. The tag block is the one that matters:
-    /// it encodes arbitrary ASCII invisibly, so a path could carry hidden text
-    /// through every screen and log that shows it. This is the same defect and
-    /// the same fix as issue #228 in AdcsRequestAttributes; a scanner written the
-    /// obvious way reintroduces it.
-    ///
-    /// The control half was never affected, because every control character is
-    /// inside the BMP.
+    /// The noun that goes in front of "character". The three spellings are the
+    /// ones every other guard in the product already uses, and
+    /// <see cref="TemplateNameFault.ClassNoun"/> is the shared copy; this one
+    /// stays local so a middleware does not take a dependency on an ADCS type
+    /// for a single word.
     /// </summary>
-    private static bool FindUnsafeCharacter(string? value, out int position, out int codePoint)
-    {
-        position = 0;
-        codePoint = 0;
-
-        if (string.IsNullOrEmpty(value))
-            return false;
-
-        for (var i = 0; i < value.Length; i++)
+    private static string ClassNoun(DeceptiveCharacterClass characterClass) =>
+        characterClass switch
         {
-            var c = value[i];
-            if (!char.IsControl(c) &&
-                CharUnicodeInfo.GetUnicodeCategory(value, i) != UnicodeCategory.Format)
-            {
-                continue;
-            }
-
-            position = i;
-            // The rune, not a surrogate half, so the warning names the character
-            // an operator can look up.
-            codePoint = char.IsHighSurrogate(c) ? char.ConvertToUtf32(value, i) : c;
-            return true;
-        }
-
-        return false;
-    }
+            DeceptiveCharacterClass.Control => "control",
+            DeceptiveCharacterClass.LineSeparator => "line separator",
+            _ => "formatting",
+        };
 }

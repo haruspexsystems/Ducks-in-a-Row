@@ -97,6 +97,7 @@ public class AcmeProtocolErrorIntegrationTests
     [Theory]
     [InlineData("/acme/WebServer/directory")]
     [InlineData("/acme/WebServer/new-nonce")]
+    [InlineData("/acme/WebServer/renewalInfo/some-cert-id")]
     public async Task Post_OnReadOnlyAcmeResource_Returns405(string path)
     {
         var content = new StringContent("{}", Encoding.UTF8, "application/jose+json");

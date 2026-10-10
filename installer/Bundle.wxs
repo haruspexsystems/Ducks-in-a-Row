@@ -17,7 +17,7 @@
   Build (normally via build.ps1, which supplies every define and downloads
   the pinned Hosting Bundle exe into installer/redist first):
     wix build installer/Bundle.wxs
-      -d ProductVersion=0.10.0.0
+      -d ProductVersion=1.0.0.0
       -d HostingBundleVersion=10.0.10
       -d HostingBundleMajor=10
       -d HostingBundleExe=installer/redist/dotnet-hosting-10.0.10-win.exe
@@ -32,7 +32,7 @@
 
   <!-- Fallback for direct wix invocations; build.ps1 always defines it. -->
   <?ifndef ProductVersion ?>
-  <?define ProductVersion = "0.10.0.0" ?>
+  <?define ProductVersion = "1.0.0.0" ?>
   <?endif ?>
 
   <!--
@@ -41,10 +41,20 @@
     either one. A newer bundle version upgrades the older bundle; the MSI
     inside handles its own major upgrade through the MSI UpgradeCode.
   -->
+  <!--
+    IconSourceFile is the half of issue #339 the MSI cannot reach. The chained
+    MSI below carries ARPSYSTEMCOMPONENT=1, so Apps and Features shows only the
+    bundle's row and the MSI's own ARPPRODUCTICON is never seen by anyone who
+    installs the normal way. This attribute is that row's icon, and it is also
+    the icon Explorer, the download and the UAC prompt put on
+    Ducks-in-a-Row-Setup.exe itself. Resolved through the -bindpath build.ps1
+    passes, the same as the MSI's branding.
+  -->
   <Bundle Name="Ducks in a Row"
           Manufacturer="Haruspex Systems B.V."
           Version="$(var.ProductVersion)"
           UpgradeCode="C50043FC-FFD1-4EE2-9417-A5F4E77C0864"
+          IconSourceFile="ducks.ico"
           Compressed="yes">
 
     <!-- Burn writes a log per run; the prefix makes it findable in %TEMP%. -->
@@ -60,10 +70,15 @@
         all, matching the MSI wizard, which also omits the license screen.
         SuppressOptionsUI hides the bundle's own install folder option;
         folder choices belong to the MSI wizard (InstallDirDlg, DataDirDlg).
+        LogoFile is the 64x64 image the hyperlinkLicense theme draws at 11,11;
+        without it the frame carries the stock WiX logo. This frame is what a
+        user sees while the runtime installs and on every repair, modify and
+        uninstall, where the MSI runs quietly.
       -->
       <bal:WixStandardBootstrapperApplication
           Theme="hyperlinkLicense"
           LicenseUrl=""
+          LogoFile="logo.png"
           SuppressOptionsUI="yes" />
     </BootstrapperApplication>
 

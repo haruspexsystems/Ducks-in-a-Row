@@ -11,11 +11,32 @@
  * Posh-ACME (-ExtAcctKID, -ExtAcctHMACKey), cert-manager
  * (externalAccountBinding.keyID + keySecretRef), Caddy (acme_eab with
  * key_id and mac_key). All default to HS256, which is what this server
- * issues secrets for.
+ * issues secrets for. cert-manager's caBundle and privateKey fields were
+ * checked against its documentation for releases 1.20 and 1.21 on
+ * 2026-09-27 (issue #439).
  */
+
+import {
+  acmeShKeyLength,
+  caddyKeyType,
+  certbotKeyFlags,
+  certManagerPrivateKey,
+  describeKeyRequirement,
+  resolveTemplateKey,
+  type TemplateKeyRequirement,
+} from '@/lib/templateKey';
 
 /** Shown in place of the secret once it can no longer be displayed. */
 export const SECRET_PLACEHOLDER = '<PASTE-SAVED-SECRET>';
+
+/**
+ * Stands in for the CA root in the cert-manager manifest. The dashboard cannot
+ * know which root the operator's cluster should trust, and it must not guess:
+ * a value that is not base64 makes `kubectl apply` refuse the manifest, so a
+ * placeholder left in place fails loudly instead of producing an issuer that
+ * cannot reach this server.
+ */
+export const CA_BUNDLE_PLACEHOLDER = '<BASE64-OF-YOUR-CA-ROOT-PEM>';
 
 /** One client's setup snippet. */
 export interface EabSnippet {
@@ -46,27 +67,46 @@ export function buildDirectoryUrl(externalUrl: string, template: string): string
  * caller passes the real secret while it is on screen (the show once
  * panel) and SECRET_PLACEHOLDER afterwards, because the server never
  * returns a stored secret again.
+ *
+ * The key flags follow the selected template's own requirements rather than
+ * assuming RSA. They used to be hardcoded to RSA 2048 with a comment saying
+ * "the default Web Server ACME template issues RSA", which is a wrong command
+ * on an EC template even when the server knows better (issue #213). Omitting
+ * `key` keeps the RSA 2048 output, which is the right hedge when the template's
+ * algorithm could not be read.
  */
 export function buildEabSnippets(
   directoryUrl: string,
   kid: string,
   secret: string,
+  key: TemplateKeyRequirement = resolveTemplateKey(null, null),
 ): EabSnippet[] {
+  const keyNote = `# ${describeKeyRequirement(key)}`;
+  const certbotFlags = certbotKeyFlags(key);
+  const acmeShLength = acmeShKeyLength(key);
+  const caddyType = caddyKeyType(key);
+  const certManagerKey = certManagerPrivateKey(key);
+
   return [
     {
       id: 'certbot',
       client: 'certbot',
       filename: 'certbot-eab.sh',
       text: `# certbot: the EAB flags are needed once, when the account is created.
-# HTTP-01 with certbot answering on port 80 itself. The default Web
-# Server ACME template issues RSA, so request an RSA key.
+# HTTP-01 with certbot answering on port 80 itself.
+${keyNote}
 certbot certonly --standalone \\
   --server ${directoryUrl} \\
   --eab-kid ${kid} \\
   --eab-hmac-key '${secret}' \\
   --email you@example.com \\
-  -d host.corp.example.com \\
-  --key-type rsa --rsa-key-size 2048
+${
+  certbotFlags === null
+    ? `  -d host.corp.example.com
+# certbot cannot produce this key. Use acme.sh, which can.`
+    : `  -d host.corp.example.com \\
+  ${certbotFlags}`
+}
 `,
     },
     {
@@ -92,12 +132,16 @@ acme.sh --register-account \\
   --eab-kid ${kid} \\
   --eab-hmac-key '${secret}'
 
-# acme.sh defaults to an EC key; the default Web Server ACME template
-# issues RSA, so pass --keylength 2048.
+${keyNote}
 acme.sh --issue --standalone \\
   --server ${directoryUrl} \\
-  -d host.corp.example.com \\
-  --keylength 2048
+${
+  acmeShLength === null
+    ? `  -d host.corp.example.com
+# acme.sh cannot produce this key; change the template's algorithm.`
+    : `  -d host.corp.example.com \\
+  --keylength ${acmeShLength}`
+}
 `,
     },
     {
@@ -121,7 +165,7 @@ New-PACertificate -Domain host.corp.example.com -Plugin WebRoot \`
       id: 'cert-manager',
       client: 'cert-manager',
       filename: 'cert-manager-issuer.yaml',
-      text: `# cert-manager: store the MAC key as a secret, then apply this issuer.
+      text: `# cert-manager: store the MAC key as a secret, then apply this file.
 # The key is already base64url encoded, store it as it is. Run the
 # kubectl line, then delete it from this file before committing the
 # manifest anywhere; the whole point of keySecretRef is that the
@@ -129,6 +173,20 @@ New-PACertificate -Domain host.corp.example.com -Plugin WebRoot \`
 #
 #   kubectl create secret generic ducks-eab --from-literal=secret='${secret}'
 #
+# An Issuer reads its secrets from its own namespace, so give that line
+# and kubectl apply the same -n <namespace>. For a ClusterIssuer, change
+# the Issuer's kind and the Certificate's issuerRef kind to ClusterIssuer,
+# and create the secret in the cert-manager namespace instead.
+#
+# caBundle is the root certificate your ADCS chain ends in, as PEM,
+# base64 encoded on one line, because cert-manager trusts only public
+# roots unless told otherwise. That root is the right one once this
+# server has enrolled its own certificate from your CA; while it still
+# serves its self signed certificate, enrol one in the setup wizard.
+#   Linux:      base64 -w0 corp-root.pem
+#   PowerShell: [Convert]::ToBase64String([IO.File]::ReadAllBytes('corp-root.pem'))
+# Remove the line only if this server's certificate is publicly trusted,
+# and never set skipTLSVerify in its place.
 apiVersion: cert-manager.io/v1
 kind: Issuer
 metadata:
@@ -136,6 +194,7 @@ metadata:
 spec:
   acme:
     server: ${directoryUrl}
+    caBundle: ${CA_BUNDLE_PLACEHOLDER}
     email: you@example.com
     privateKeySecretRef:
       name: ducks-account-key
@@ -148,6 +207,31 @@ spec:
       - http01:
           ingress:
             ingressClassName: nginx
+---
+${keyNote}
+# A certificate from this issuer. On an Ingress, the annotations
+# cert-manager.io/issuer, cert-manager.io/private-key-algorithm and
+# cert-manager.io/private-key-size do the same job.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: host-corp-example-com
+spec:
+  secretName: host-corp-example-com-tls
+  dnsNames:
+    - host.corp.example.com
+  issuerRef:
+    name: ducks-in-a-row
+    kind: Issuer
+${
+  certManagerKey !== null
+    ? `  privateKey:
+    algorithm: ${certManagerKey.algorithm}
+    size: ${certManagerKey.size}`
+    : key.kind === 'unsupported'
+      ? "  # cert-manager cannot produce this key; change the template's algorithm."
+      : "  # cert-manager cannot produce an RSA key above 8192 bits; lower the template's minimum key size."
+}
 `,
     },
     {
@@ -160,9 +244,12 @@ spec:
 		key_id ${kid}
 		mac_key ${secret}
 	}
-	# The default Web Server ACME template issues RSA; Caddy defaults
-	# to an EC key, so pick RSA here.
-	key_type rsa2048
+	${keyNote}
+${
+  caddyType === null
+    ? '\t# Caddy cannot produce this key; change the template\'s algorithm.'
+    : `\tkey_type ${caddyType}`
+}
 	email you@example.com
 }
 

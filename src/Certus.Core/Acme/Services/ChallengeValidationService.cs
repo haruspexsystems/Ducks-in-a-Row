@@ -103,7 +103,13 @@ public sealed class ChallengeValidationService : BackgroundService
         }
     }
 
-    private async Task ValidateSingleChallengeAsync(
+    /// <summary>
+    /// Validates one swept challenge. Internal rather than private so
+    /// Certus.Core.Tests can drive a single challenge through it: the guards here
+    /// are about what must NOT happen (never call the validator, never overwrite a
+    /// deactivated authorization), and neither is observable from the outside.
+    /// </summary>
+    internal async Task ValidateSingleChallengeAsync(
         CertusDbContext db,
         IEnumerable<IChallengeValidator> validators,
         OrderService orderService,
@@ -113,6 +119,36 @@ public sealed class ChallengeValidationService : BackgroundService
     {
         var authz = challenge.Authorization;
         var order = authz.Order;
+
+        // RFC 8555 §7.5.2: the client has said it no longer holds this authorization,
+        // so nothing may validate under it. The sweep selects on the challenge's own
+        // status, so a challenge that was already "processing" when the deactivation
+        // landed still arrives here, and the success path below would set the
+        // authorization back to "valid", undoing a deactivation nobody asked to undo.
+        //
+        // The authorization's own status is deliberately left alone. "deactivated" is
+        // terminal and is what the client asked for; overwriting it with "invalid"
+        // would lose that and disguise why the order died. This block is first in the
+        // method for that reason, ahead of the expiry guard, which does write it.
+        //
+        // The challenge goes "invalid" because §7.1.6 gives challenges no
+        // "deactivated" status, and invalid is the truthful terminal one: it can
+        // never validate now. Leaving it "processing" would make it immortal, swept
+        // and skipped on every pass for ever.
+        if (string.Equals(authz.Status, "deactivated", StringComparison.Ordinal))
+        {
+            challenge.Status = "invalid";
+            challenge.ErrorJson = JsonSerializer.Serialize(new AcmeError
+            {
+                Type = AcmeErrorType.Unauthorized,
+                Detail = "The authorization has been deactivated."
+            });
+            await db.SaveChangesAsync(cancellationToken);
+            _logger.LogInformation(
+                "Challenge {ChallengeId} ({Type}) abandoned: its authorization is deactivated",
+                challenge.ChallengeId, challenge.Type);
+            return;
+        }
 
         // RFC 8555 §7.1.4: never validate a challenge whose authorization or order has
         // expired. Mark the authorization invalid and stop.

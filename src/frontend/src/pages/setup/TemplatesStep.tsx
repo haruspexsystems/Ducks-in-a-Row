@@ -19,6 +19,7 @@ interface TemplatesStepProps {
 export function TemplatesStep({ state, onUpdate }: TemplatesStepProps) {
   const [templates, setTemplates] = useState<SetupTemplate[]>([]);
   const [excludedCount, setExcludedCount] = useState(0);
+  const [unusableNameCount, setUnusableNameCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -29,6 +30,7 @@ export function TemplatesStep({ state, onUpdate }: TemplatesStepProps) {
         if (data && Array.isArray(data.templates)) {
           setTemplates(data.templates);
           setExcludedCount(data.excludedCount ?? 0);
+          setUnusableNameCount(data.unusableNameCount ?? 0);
         } else {
           setError('Failed to load templates');
         }
@@ -118,11 +120,29 @@ export function TemplatesStep({ state, onUpdate }: TemplatesStepProps) {
                     className="h-4 w-4 text-certus-600 border-hairline-strong focus:ring-certus-500"
                   />
                   <FileCheck2 className={`h-4 w-4 ${isSelected ? 'text-certus-600' : 'text-faint'}`} />
+                  {/* Every value on this row is text the CA authored, and a
+                      bidirectional override in one of them reorders the text
+                      around it, which is a row that names a different template
+                      than the one it selects. <bdi> isolates each without
+                      changing a character of it. The programmatic name cannot
+                      carry one today, because a template whose programmatic
+                      name does is never listed, and it is wrapped anyway so the
+                      rule here is about where the text came from rather than
+                      about which field it landed in. */}
                   <div className="flex-1 min-w-0">
-                    <div className="text-sm font-medium text-ink">{template.displayName || template.name}</div>
+                    <div className="text-sm font-medium text-ink">
+                      <bdi>{template.displayName || template.name}</bdi>
+                    </div>
                     <div className="text-xs text-muted">
-                      Name: <code className="bg-sunken-strong px-1 rounded">{template.name}</code>
-                      {template.oid && <span className="ml-2">OID: {template.oid}</span>}
+                      Name:{' '}
+                      <code className="bg-sunken-strong px-1 rounded">
+                        <bdi>{template.name}</bdi>
+                      </code>
+                      {template.oid && (
+                        <span className="ml-2">
+                          OID: <bdi>{template.oid}</bdi>
+                        </span>
+                      )}
                     </div>
                   </div>
                   {isSelected && (
@@ -141,13 +161,17 @@ export function TemplatesStep({ state, onUpdate }: TemplatesStepProps) {
       {!loading && !error && templates.length > 0 && excludedCount > 0 && (
         <div className="flex items-start gap-2 text-xs text-muted">
           <Info className="h-4 w-4 text-faint mt-0.5 shrink-0" />
-          <p>
-            {excludedCount} {excludedCount === 1 ? 'template' : 'templates'} on this CA{' '}
-            {excludedCount === 1 ? 'was' : 'were'} hidden. Each either lacks the Server
-            Authentication usage, has a subject built from Active Directory instead of
-            the request, or could not be checked (its AD object could not be read, even
-            though other templates on this CA resolved fine).
-          </p>
+          <div className="space-y-1">
+            <p>
+              {excludedCount} {excludedCount === 1 ? 'template' : 'templates'} on this CA{' '}
+              {excludedCount === 1 ? 'was' : 'were'} hidden. Each either lacks the Server
+              Authentication usage, has a subject built from Active Directory instead of
+              the request, carries a control or formatting character in its template name,
+              or could not be checked (its AD object could not be read, even though other
+              templates on this CA resolved fine).
+            </p>
+            <UnusableNameNote count={unusableNameCount} />
+          </div>
         </div>
       )}
 
@@ -155,12 +179,18 @@ export function TemplatesStep({ state, onUpdate }: TemplatesStepProps) {
         <div className="text-center py-12 text-faint">
           <FileCheck2 className="h-8 w-8 mx-auto mb-2" />
           {excludedCount > 0 ? (
-            <p className="text-sm">
-              All {excludedCount} published templates were hidden: none could be confirmed
-              to issue ACME server certificates. A usable template needs the Server
-              Authentication usage and "Supply in the request" on its Subject Name tab;
-              a template could also be hidden because its AD object could not be read.
-            </p>
+            <div className="space-y-2">
+              <p className="text-sm">
+                All {excludedCount} published templates were hidden: none could be confirmed
+                to issue ACME server certificates. A usable template needs the Server
+                Authentication usage and "Supply in the request" on its Subject Name tab;
+                a template could also be hidden because its template name cannot reach ADCS,
+                or because its AD object could not be read.
+              </p>
+              <div className="text-xs text-left max-w-xl mx-auto">
+                <UnusableNameNote count={unusableNameCount} />
+              </div>
+            </div>
           ) : (
             <p className="text-sm">No server authentication templates found on the CA.</p>
           )}
@@ -168,6 +198,33 @@ export function TemplatesStep({ state, onUpdate }: TemplatesStepProps) {
       )}
     </div>
   );
+}
+
+/**
+ * The one hiding reason whose fix is not a setting. A programmatic name is
+ * fixed when a template is created, so there is nothing to uncheck: the
+ * template has to be duplicated under a clean name. Rendered wherever the
+ * hidden count is explained, and silent when nothing was hidden for it.
+ */
+function UnusableNameNote({ count }: { count: number }) {
+  if (count < 1) return null;
+
+  return (
+    <p>
+      {count === 1 ? 'One of those was' : `${count} of those were`} hidden for a reason
+      you cannot fix on the template: the template name itself carries a control, line
+      separator, or formatting character. ADCS separates request attributes with
+      newlines, so Ducks in a Row will not send such a name and no certificate can be
+      requested against the template on any path. A template's name is fixed when it is
+      created, so the fix is to duplicate the template with a clean name and publish the
+      copy.
+    </p>
+  );
+}
+
+/** The U+XXXX form an operator can look up, matching what the service log prints. */
+function formatCodePoint(codePoint: number): string {
+  return `U+${codePoint.toString(16).toUpperCase().padStart(4, '0')}`;
 }
 
 type CheckStatus = 'pass' | 'warn' | 'unverified' | 'info';
@@ -248,13 +305,61 @@ function AcmeViabilityChecklist({ template }: { template: SetupTemplate }) {
           label: `Requires ${v.keyAlgorithm} keys${
             v.minimalKeySize ? `, minimum ${v.minimalKeySize} bits` : ''
           }`,
-          detail: 'ACME clients must request a matching key type or the CA denies the request.',
+          // An ECDH template still works, because a certificate request is
+          // signed and so can only carry the signing key on that curve, but it
+          // is recording an encryption only algorithm and that is worth
+          // saying here rather than only on the Review step (issue #277).
+          detail: v.keyAlgorithm.trim().toUpperCase().startsWith('ECDH')
+            ? 'ACME clients must request an ECDSA key on this curve, which is what they produce ' +
+              'anyway. This template records an encryption only algorithm because its Purpose is ' +
+              '"Signature and encryption" on the Request Handling tab; set it to "Signature" to ' +
+              'record ECDSA instead.'
+            : 'ACME clients must request a matching key type or the CA denies the request.',
         }
       : {
           status: 'unverified',
           label: 'Key algorithm and size',
           detail: 'The key requirements could not be read from AD.',
         },
+    // Last, next to the key requirements, because both are about what a client
+    // has to be configured with rather than about what the CA will issue.
+    template.displayNameWarning
+      ? {
+          status: 'warn',
+          label: 'The display name cannot be used in the directory URL',
+          detail:
+            `The display name carries a ${template.displayNameWarning.kind} character ` +
+            `(${formatCodePoint(template.displayNameWarning.codePoint)}) at position ` +
+            `${template.displayNameWarning.position}. The server refuses a URL carrying ` +
+            `one, so a client configured with the display name gets a 400. Point ACME ` +
+            `clients at the programmatic name ${template.name} instead, or retype the ` +
+            `Template display name on the General tab of this template. Characters like ` +
+            `a soft hyphen are invisible, so the name looks correct everywhere it is shown.`,
+        }
+      : { status: 'pass', label: 'The display name can be used in the directory URL' },
+    // Info, not warn, and only when there is something to say. The footer below
+    // tells the reader that a warning means issuance will fail or stall until a
+    // setting is changed, and for the OID that is false: nothing is refused and
+    // no client is affected. There is no passing counterpart either, because a
+    // clean OID is not a question anyone has, unlike the addressing form above.
+    ...(template.oidWarning
+      ? [
+          {
+            status: 'info' as const,
+            label: 'The template OID carries a hidden character',
+            detail:
+              `The OID carries a ${template.oidWarning.kind} character ` +
+              `(${formatCodePoint(template.oidWarning.codePoint)}) at position ` +
+              `${template.oidWarning.position}. Nothing is refused: this template ` +
+              `issues and is addressed exactly as any other, and the OID is shown ` +
+              `here only to identify it. Such a character is invisible, so the OID ` +
+              `looks correct in the Certificate Templates console too. A template ` +
+              `OID is fixed when the template is created, so there is nothing to ` +
+              `retype: leave it, or duplicate the template if you would rather ` +
+              `the row read as it is stored.`,
+          },
+        ]
+      : []),
   ];
 
   const hasWarnings = items.some((i) => i.status === 'warn');

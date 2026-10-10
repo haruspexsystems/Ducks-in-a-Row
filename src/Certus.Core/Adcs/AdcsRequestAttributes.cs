@@ -1,4 +1,4 @@
-using System.Globalization;
+using Certus.Core.Security;
 
 namespace Certus.Core.Adcs;
 
@@ -42,22 +42,34 @@ public static class AdcsRequestAttributes
 
     /// <summary>
     /// Whether a template name is safe to interpolate into the attribute string
-    /// and to record. Two categories are refused.
+    /// and to record. Three categories are refused, and
+    /// <see cref="DeceptiveCharacters"/> is the shared scanner that names them.
     ///
     /// Control characters, all of them rather than only carriage return and
     /// line feed. ADCS is documented as separating pairs with a newline but not
     /// as to which other characters its parser honours, so the guard covers the
     /// C0 range, DEL, and the C1 range rather than betting on the parser.
     ///
+    /// Line separators (U+2028 and U+2029, categories Zl and Zp). These cannot
+    /// smuggle an attribute, because ADCS does not treat either as a pair
+    /// separator, and .NET's own line reader does not treat them as line breaks
+    /// either. Other readers do, including anything that ships the log to a
+    /// SIEM with its own splitter, so a name carrying one reads as two lines
+    /// there and as one line here (issue #234).
+    ///
     /// Unicode format characters (category Cf), which include the bidirectional
     /// overrides U+202A to U+202E, the isolates U+2066 to U+2069, and the tag
-    /// block U+E0020 to U+E007F. These cannot smuggle an attribute, but a
+    /// block U+E0020 to U+E007F. These cannot smuggle an attribute either, but a
     /// template name is written to the log and shown on the wizard and settings
     /// screens, where an embedded right to left override makes a name render as
     /// a different name entirely and a tag sequence hides text outright. This
     /// matches the call
     /// <see cref="CertificateTextSanitizer.SanitizeDispositionMessage"/> already
-    /// makes for CA authored text. No template name needs a format character.
+    /// makes for CA authored text, tab and the two line break characters excepted:
+    /// a CA legitimately composes a multi line message and the detail page renders
+    /// one, so that function keeps those three and
+    /// <see cref="CertificateTextSanitizer.SanitizeDispositionMessageForLog"/>
+    /// flattens them for the log instead. No template name needs any of them.
     ///
     /// Names are refused, never stripped. A name that needs sanitizing did not
     /// come from the CA's published template list, and quietly rewriting it
@@ -75,43 +87,30 @@ public static class AdcsRequestAttributes
             return false;
         }
 
-        for (var i = 0; i < templateName.Length; i++)
+        if (DeceptiveCharacters.Find(templateName) is { } found)
         {
-            var c = templateName[i];
-
-            if (char.IsControl(c))
+            error = found.Class switch
             {
-                error =
+                DeceptiveCharacterClass.Control =>
                     $"The certificate template name contains a control character " +
-                    $"(U+{(int)c:X4}) at position {i}. ADCS separates request " +
+                    $"(U+{found.CodePoint:X4}) at position {found.Position}. ADCS separates request " +
                     $"attributes with newlines, so a name like that could add " +
-                    $"attributes to the request. Use a template name the CA publishes.";
-                return false;
-            }
+                    $"attributes to the request. Use a template name the CA publishes.",
 
-            // Read the category from the string rather than the char, so a
-            // format character above the BMP is caught. Those arrive as a
-            // surrogate pair, and the category of a lone surrogate is Surrogate
-            // and never Format, so a per char lookup misses the whole class.
-            // The tag block U+E0020 to U+E007F is the one that matters: it
-            // encodes arbitrary ASCII invisibly, so a name could carry hidden
-            // text through every screen that shows it. The string overload
-            // resolves the pair; at the trailing half it answers Surrogate,
-            // which is correct because the pair was already judged at its
-            // leading half (issue #228).
-            if (CharUnicodeInfo.GetUnicodeCategory(templateName, i) == UnicodeCategory.Format)
-            {
-                var codePoint = char.IsHighSurrogate(c)
-                    ? char.ConvertToUtf32(templateName, i)
-                    : c;
+                DeceptiveCharacterClass.LineSeparator =>
+                    $"The certificate template name contains a line separator character " +
+                    $"(U+{found.CodePoint:X4}) at position {found.Position}. Some log readers " +
+                    $"treat it as a line break, so a name like that reads as two entries " +
+                    $"in the record of what the CA was asked to do. Use a template name " +
+                    $"the CA publishes.",
 
-                error =
+                _ =>
                     $"The certificate template name contains a formatting character " +
-                    $"(U+{codePoint:X4}) at position {i}. Those characters can make the " +
+                    $"(U+{found.CodePoint:X4}) at position {found.Position}. Those characters can make the " +
                     $"name display as a different name. Use a template name the CA " +
-                    $"publishes.";
-                return false;
-            }
+                    $"publishes.",
+            };
+            return false;
         }
 
         error = null;

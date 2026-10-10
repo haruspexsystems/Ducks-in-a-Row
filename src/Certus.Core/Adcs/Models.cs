@@ -54,9 +54,16 @@ public sealed record TemplateInfo(
 /// order — and every client's requested names are ignored.
 /// </param>
 /// <param name="KeyAlgorithm">
-/// From <c>msPKI-Asymmetric-Algorithm</c> (schema v3+ templates), or
-/// inferred from the legacy <c>pKIDefaultCSPs</c> list on v1/v2 templates.
-/// Informational: it drives the "your client must request an RSA key" note.
+/// The algorithm the template requires, read out of
+/// <c>msPKI-RA-Application-Policies</c> on templates that carry the CNG
+/// triples, or inferred from the legacy <c>pKIDefaultCSPs</c> list on the
+/// older schemas that have no algorithm field at all. See
+/// <see cref="RaApplicationPolicies"/> for which is which, and note that
+/// <c>msPKI-Asymmetric-Algorithm</c> is a property inside that attribute and
+/// not an attribute of its own: reading it as one is what made every ECDSA
+/// template report RSA (issue #213).
+/// <c>null</c> means the algorithm could not be determined and no guess was
+/// substituted. Callers must not read that as RSA.
 /// </param>
 /// <param name="MinimalKeySize">From <c>msPKI-Minimal-Key-Size</c>.</param>
 public sealed record TemplateAcmeViability(
@@ -81,7 +88,9 @@ public sealed record TemplateAcmeViability(
         int? enrollmentFlags,
         int? raSignatureCount,
         int? certificateNameFlags,
-        string? asymmetricAlgorithm,
+        int? schemaVersion,
+        int? privateKeyFlags,
+        IReadOnlyList<string> raApplicationPolicies,
         IReadOnlyList<string> defaultCsps,
         int? minimalKeySize)
     {
@@ -89,19 +98,43 @@ public sealed record TemplateAcmeViability(
             RequiresManagerApproval: enrollmentFlags is { } ef ? (ef & PendAllRequestsFlag) != 0 : null,
             RequiresRaSignatures: raSignatureCount is { } ra ? ra > 0 : null,
             SubjectSuppliedInRequest: certificateNameFlags is { } nf ? (nf & EnrolleeSuppliesSubjectFlag) != 0 : null,
-            KeyAlgorithm: ResolveKeyAlgorithm(asymmetricAlgorithm, defaultCsps),
+            KeyAlgorithm: ResolveKeyAlgorithm(schemaVersion, privateKeyFlags, raApplicationPolicies, defaultCsps),
             MinimalKeySize: minimalKeySize);
     }
 
     /// <summary>
-    /// v3+ templates name the algorithm directly. v1/v2 templates carry only
-    /// legacy CSP names, all of which are RSA providers except the DSS ones,
-    /// so the presence of any non DSS provider reads as RSA.
+    /// Resolve the algorithm from whichever of the two sources this template's
+    /// schema actually uses.
     /// </summary>
-    internal static string? ResolveKeyAlgorithm(string? asymmetricAlgorithm, IReadOnlyList<string> defaultCsps)
+    /// <remarks>
+    /// <para>
+    /// A template carrying the CNG triples is answered from those alone. When
+    /// they hold no algorithm the answer is <c>null</c>, deliberately: the
+    /// legacy CSP inference below cannot see an elliptic curve, so falling
+    /// through to it would answer "RSA" for a template we simply failed to
+    /// read. That substitution is the whole of issue #213, and an honest
+    /// "could not determine" is what the wizard and the enroller are built to
+    /// handle.
+    /// </para>
+    /// <para>
+    /// The older schemas have no algorithm field at all, so their CSP names
+    /// are the only signal there has ever been. Every CryptoAPI provider of
+    /// that era is RSA except the DSS ones, and none of them is elliptic
+    /// curve, so the inference is sound there in a way it is not above.
+    /// </para>
+    /// </remarks>
+    internal static string? ResolveKeyAlgorithm(
+        int? schemaVersion,
+        int? privateKeyFlags,
+        IReadOnlyList<string> raApplicationPolicies,
+        IReadOnlyList<string> defaultCsps)
     {
-        if (!string.IsNullOrWhiteSpace(asymmetricAlgorithm))
-            return asymmetricAlgorithm.Trim();
+        if (RaApplicationPolicies.UsesCngTripleSyntax(schemaVersion, privateKeyFlags))
+        {
+            return RaApplicationPolicies.TryGetAsymmetricAlgorithm(raApplicationPolicies, out var algorithm)
+                ? algorithm
+                : null;
+        }
 
         if (defaultCsps.Count == 0)
             return null;
@@ -115,10 +148,35 @@ public sealed record TemplateAcmeViability(
 /// <summary>
 /// Result of submitting a certificate request to the CA.
 /// </summary>
+/// <param name="Message">
+/// The CA's own account of what it decided, verbatim. Do not assume it explains
+/// anything: the lab CA answers a template Enroll denial with the bare string
+/// "Denied by Policy Module" and no reason after it, which is the whole of issue
+/// #356. <paramref name="StatusCode"/> is where the reason actually lives.
+/// </param>
+/// <param name="StatusCode">
+/// The HRESULT the CA recorded against the request, from
+/// <c>ICertRequest::GetLastStatus</c>. The same value
+/// <c>certutil -view -restrict "RequestId=N" -out "Request.StatusCode"</c>
+/// reports and the same one <see cref="CertificateInfo.StatusCode"/> carries out
+/// of the CA view, so one refusal reads the same whichever way it is read back.
+/// Interpret it through <see cref="CaStatusCode"/>.
+///
+/// Null in three cases, and no caller may distinguish them: the request was not
+/// refused, so nothing was asked for; the CA recorded zero, which means success
+/// and never carries information; or the read failed. The third is deliberate.
+/// Reading this is a diagnostic, and a diagnostic that could turn a decided
+/// request into a failed one would cost more than it buys.
+///
+/// "Not refused" covers pending as well as issued. A pending request is waiting
+/// on a person rather than failing, so there is no reason behind it to report,
+/// and both pending arms say so in their own words instead.
+/// </param>
 public sealed record SubmitResult(
     int RequestId,
     SubmitStatus Status,
-    string? Message = null);
+    string? Message = null,
+    int? StatusCode = null);
 
 /// <summary>
 /// Status of a certificate request submission.
@@ -158,6 +216,35 @@ public enum CertificateStatus
     Revoked,
     Failed
 }
+
+/// <summary>
+/// What the CA recorded against one request, read back from the CA view by
+/// request id (issue #365).
+///
+/// The read side counterpart to the pair <see cref="SubmitResult"/> carries. A
+/// submit learns why a request was refused from
+/// <c>ICertRequest::GetLastStatus</c>, which reflects only that call; a refusal
+/// discovered later, by the pending issuance sweep, has to read the same two
+/// values out of the request row instead. They are the same values
+/// <c>certutil -view -restrict "RequestId=N"
+/// -out "Request.DispositionMessage,Request.StatusCode"</c> reports, so one
+/// refusal reads the same whichever way it is discovered.
+/// </summary>
+/// <param name="DispositionMessage">
+/// The CA's own account of what happened to the request, verbatim and
+/// sanitized. Null on issued and revoked rows, where the CA supplies no
+/// explanation worth showing, and null when it recorded none.
+/// </param>
+/// <param name="StatusCode">
+/// The HRESULT the CA recorded against the request. Null on issued and revoked
+/// rows, and null when the CA recorded zero, which means success and never
+/// carries information. Interpret it through <see cref="CaStatusCode"/>.
+/// </param>
+public sealed record CaRequestStatus(
+    int RequestId,
+    CertificateStatus Status,
+    string? DispositionMessage = null,
+    int? StatusCode = null);
 
 /// <summary>
 /// Cryptographic detail read out of a certificate's DER encoding by
@@ -250,6 +337,27 @@ public sealed record CertificateInfo(
 /// no ResolvedWhen yet, so this bound must never be applied to the pending
 /// pass or it returns nothing.
 /// </param>
+/// <param name="AlreadyDetailed">
+/// CA request IDs for which the caller already holds everything the
+/// certificate's own DER would yield, so the client may skip decoding and
+/// parsing that row's RawCertificate blob (issue #184). A row named here comes
+/// back with null SubjectAlternativeNames, null CryptoDetail and null
+/// RawCertificate, which is the same "this pass had nothing to say" shape a row
+/// whose blob was absent has always produced, and which every writer in
+/// <c>CertificateSyncService.UpdateEntity</c> already guards against.
+///
+/// It is the caller's job to be sure of that claim. The sync derives the set
+/// from the columns the parse feeds rather than from a single sentinel, because
+/// those columns arrived in separate migrations and a row can legitimately hold
+/// some but not others; see <c>CertificateSyncService.ReadAlreadyDetailedAsync</c>.
+///
+/// Ignored when <paramref name="SubjectContains"/> is set. That filter runs on
+/// the mapped subject, and the parse is the last link in the subject fallback
+/// chain, so honouring both would let a search see a different subject for a
+/// skipped row than for an unskipped one.
+///
+/// Null, the default, means parse every row.
+/// </param>
 public sealed record CertificateQuery(
     string? TemplateName = null,
     string? SubjectContains = null,
@@ -258,4 +366,5 @@ public sealed record CertificateQuery(
     int Skip = 0,
     int Take = 50,
     DateTime? SubmittedAfter = null,
-    DateTime? ResolvedAfter = null);
+    DateTime? ResolvedAfter = null,
+    IReadOnlySet<int>? AlreadyDetailed = null);

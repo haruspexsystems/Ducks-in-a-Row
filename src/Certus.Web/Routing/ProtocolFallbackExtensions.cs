@@ -28,6 +28,59 @@ public static class ProtocolPaths
         return path.StartsWithSegments("/" + AcmeSegment, out var remaining) &&
                remaining.HasValue && remaining.Value!.Length > 1;
     }
+
+    /// <summary>
+    /// True for /acme/{template}/issuer-cert, the one ACME protocol path that has
+    /// to stay cacheable. It is the "up" link target RFC 8555 §7.4.2 requires on a
+    /// certificate download, and §7.4.2 describes it as an indefinitely cacheable
+    /// resource. The no-store rule in §6.1 is about responses carrying a
+    /// Replay-Nonce and the anonymous fetch carries none: it is a GET returning a
+    /// public CA certificate. Both middlewares that stamp no-store on the ACME
+    /// surface consult this so the response does not contradict itself.
+    ///
+    /// This answers on the path alone, so both callers gate it on GET and HEAD
+    /// themselves (issue #373). The same path also answers an authenticated
+    /// POST-as-GET, and that arm is an ordinary ACME response: it takes a fresh
+    /// Replay-Nonce under §6.5 and the no-store that rides with it, so neither
+    /// middleware may exempt it.
+    ///
+    /// Matched on the exact route shape rather than a suffix test, so a certificate
+    /// whose id happened to be "issuer-cert" cannot slip a download response past
+    /// the no-store rule.
+    /// </summary>
+    public static bool IsAcmeIssuerCertificatePath(PathString path)
+    {
+        return MatchesAcmeRoute(path, segmentCount: 3, thirdSegment: "issuer-cert");
+    }
+
+    /// <summary>
+    /// True for /acme/{template}/renewalInfo/{certID}, the ARI resource
+    /// (RFC 9773 §4.1) and the other anonymous GET on the protocol surface.
+    /// Only the nonce middleware consults this, and only for GET and HEAD: an
+    /// unauthenticated poll must not burn a stored nonce per request that no
+    /// client will ever consume. Unlike the issuer certificate the response
+    /// deliberately stays under no-store (the security headers middleware
+    /// does not consult this), so a revocation driven window change reaches
+    /// clients with no cache latency.
+    /// </summary>
+    public static bool IsAcmeRenewalInfoPath(PathString path)
+    {
+        return MatchesAcmeRoute(path, segmentCount: 4, thirdSegment: "renewalInfo");
+    }
+
+    /// <summary>
+    /// Matches on the exact route shape rather than a suffix test, so a
+    /// certificate or template whose name happens to equal a special
+    /// segment cannot slip a response past the rules keyed on these
+    /// predicates.
+    /// </summary>
+    private static bool MatchesAcmeRoute(PathString path, int segmentCount, string thirdSegment)
+    {
+        var segments = path.Value?.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        return segments?.Length == segmentCount
+            && segments[0].Equals(AcmeSegment, StringComparison.OrdinalIgnoreCase)
+            && segments[2].Equals(thirdSegment, StringComparison.OrdinalIgnoreCase);
+    }
 }
 
 /// <summary>

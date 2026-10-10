@@ -335,10 +335,49 @@ public class StartupValidatorTests
             NewAccountLimit = 0,
             NewOrderLimit = -5,
             GeneralLimit = 0,
+            PollLimit = 0,
             WindowSeconds = 0,
+            SegmentsPerWindow = 0,
         };
 
         var warnings = CreateValidator(FullyConfigured(), rateLimitOptions: rateLimit).Validate();
+
+        warnings.Should().Be(0);
+    }
+
+    [Fact]
+    public void Validate_RateLimitZeroPollLimit_ReturnsWarning()
+    {
+        var rateLimit = new AcmeRateLimitOptions { PollLimit = 0 };
+
+        var warnings = CreateValidator(FullyConfigured(), rateLimitOptions: rateLimit).Validate();
+
+        warnings.Should().Be(1);
+    }
+
+    [Fact]
+    public void Validate_RateLimitZeroSegmentsPerWindow_ReturnsWarning()
+    {
+        // SlidingWindowRateLimiterOptions throws on a segment count below 1, and it
+        // throws when the first request reaches the policy rather than at startup,
+        // so this warning is the only notice before ACME starts faulting.
+        var rateLimit = new AcmeRateLimitOptions { SegmentsPerWindow = 0 };
+
+        var warnings = CreateValidator(FullyConfigured(), rateLimitOptions: rateLimit).Validate();
+
+        warnings.Should().Be(1);
+    }
+
+    [Fact]
+    public void Validate_RateLimitingOnWithNoTrustedProxies_IsNotCountedAsAWarning()
+    {
+        // Partitioning per source address is correct for a direct deployment, so
+        // the startup notice about proxies must not put a permanent warning on
+        // every healthy install (issue #263). The defaults are the direct case.
+        var warnings = CreateValidator(
+            FullyConfigured(),
+            authOptions: new AuthOptions { TrustedProxies = [] },
+            rateLimitOptions: new AcmeRateLimitOptions { Enabled = true }).Validate();
 
         warnings.Should().Be(0);
     }

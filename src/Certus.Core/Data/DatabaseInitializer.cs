@@ -28,6 +28,12 @@ namespace Certus.Core.Data;
 /// The comparison deliberately ignores indexes and foreign key names: they are
 /// not visible through PRAGMA table_info and EF generated names are brittle to
 /// compare. Tables and columns are what the queries need.
+///
+/// Two data steps follow the schema, in order: the stored subject sweep
+/// (<see cref="SanitizeStoredSubjects"/>, issue #224) and the journal mode
+/// (<see cref="ApplyJournalMode"/>, issue #283). The journal mode step is the
+/// only one here that reports a failure and carries on rather than throwing;
+/// its doc comment says why.
 /// </summary>
 public static class DatabaseInitializer
 {
@@ -36,10 +42,34 @@ public static class DatabaseInitializer
     // as SupersessionLinker.UpdateChunkSize.
     private const int SubjectUpdateChunkSize = 500;
 
+    // SQLite reports a journal mode in lower case whatever case the pragma was
+    // written in, so these double as the values the results are compared
+    // against and the values that reach the log. DELETE is the rollback target
+    // because it is SQLite's own compiled default: a database created with
+    // EnableWalMode already off is in DELETE mode, so converting an existing one
+    // lands it in exactly the same state rather than in a third mode nothing
+    // else in the product expects. TRUNCATE and PERSIST would both leave a
+    // permanent -journal sidecar, which is the question SqliteShutdownCheckpoint
+    // exists to stop an operator having to ask about -wal.
+    private const string WalJournalMode = "wal";
+    private const string RollbackJournalMode = "delete";
+
+    // What PRAGMA journal_mode reports for an in memory database, whatever is
+    // asked of it. ":memory:" is a supported configuration, one StartupValidator
+    // already warns loses everything on restart, and it has no journal to
+    // configure, so it is neither a success nor a refusal.
+    private const string InMemoryJournalMode = "memory";
+
+    // Stands in for the mode when the pragma could not be read at all, so the
+    // failure warning still has something honest to say.
+    private const string UnknownJournalMode = "unknown";
+
     /// <summary>
-    /// Ensure the database exists and its schema is current. Throws
+    /// Ensure the database exists, its schema is current, and its journal mode
+    /// matches <paramref name="enableWalMode"/>. Throws
     /// <see cref="InvalidOperationException"/> with operator instructions when
     /// the database predates migrations and does not match the current model.
+    /// A journal mode that cannot be applied is logged and does not throw.
     /// </summary>
     public static void Initialize(CertusDbContext db, bool enableWalMode, ILogger logger)
     {
@@ -73,13 +103,150 @@ public static class DatabaseInitializer
 
         SanitizeStoredSubjects(db, logger);
 
-        if (enableWalMode)
+        // Last on purpose. The schema is the thing that can fail startup and it
+        // should fail before the file is reconfigured, and leaving WAL
+        // checkpoints this boot's own writes into the database on the way out,
+        // so a converted database is fully consolidated on disk by the time this
+        // method returns.
+        ApplyJournalMode(db, enableWalMode, logger);
+    }
+
+    /// <summary>
+    /// Bring the database's journal mode into line with
+    /// <c>Certus:EnableWalMode</c>, in both directions (issue #283).
+    ///
+    /// The mode lives in the database file rather than in configuration, so the
+    /// option is a request made once per start against a file that already has
+    /// an answer. Before this method the request only ever went one way: with
+    /// the option on the pragma ran, and with the option off nothing ran at all,
+    /// so an existing database stayed in write ahead logging mode however the
+    /// option was later set. The one case the option is documented for, a data
+    /// directory whose filesystem cannot support WAL, was reachable only by
+    /// deleting the database and starting again.
+    ///
+    /// The half that did run was unverified. <c>PRAGMA journal_mode=&lt;mode&gt;</c>
+    /// answers with one row holding the mode the database ended up in, and that
+    /// row is the only way to tell a switch that happened from one that was
+    /// refused; <c>ExecuteSqlRaw</c> discards it. So "SQLite WAL mode enabled"
+    /// was logged on a filesystem that had silently refused WAL exactly as
+    /// confidently as on one that had taken it. Every branch below reports the
+    /// mode the database itself reports, and says whether anything changed.
+    ///
+    /// A refusal is never fatal, and that is deliberate rather than lazy.
+    /// Changing journal mode needs the database file exclusively, and startup is
+    /// the only moment that can be true: both hosts call
+    /// <see cref="Initialize"/> from a dedicated scope before the host runs, so
+    /// no worker and no request has opened a connection yet. Anything else on
+    /// the machine holding the file open still refuses it. Unlike the schema
+    /// mismatch above, which throws because every later query would fail on it,
+    /// a journal mode the operator did not ask for costs concurrency and
+    /// portability and nothing else: every query works in either mode and the
+    /// database is exactly as usable as it was a moment earlier. Refusing to
+    /// start would take a working install down to enforce a preference, and
+    /// would do it in a loop, because restarting does not close whatever handle
+    /// refused the switch. It is retried on the next start instead, which needs
+    /// no stored state and heals itself the moment the obstacle goes away.
+    /// </summary>
+    private static void ApplyJournalMode(CertusDbContext db, bool enableWalMode, ILogger logger)
+    {
+        var requested = enableWalMode ? WalJournalMode : RollbackJournalMode;
+
+        // Hoisted out of the lambda so the catch below can still say where the
+        // database stands. A SQLITE_BUSY arrives from the switch, after the read
+        // has already succeeded, and "it is still in wal" is the fact an
+        // operator chasing a refusal needs.
+        var current = UnknownJournalMode;
+
+        try
         {
-            // WAL improves concurrent read/write performance. The mode is
-            // persisted in the database file, so running this every start is a
-            // cheap no op after the first time.
-            db.Database.ExecuteSqlRaw("PRAGMA journal_mode=WAL;");
-            logger.LogInformation("SQLite WAL mode enabled");
+            RunOnConnection(db, command =>
+            {
+                // Both statements share one command on one connection, on
+                // purpose. The read decides whether the write is needed at all,
+                // and a pooled handle taken twice is not guaranteed to be the
+                // same handle. ExecuteScalar rather than a reader held across
+                // the two, because SQLite refuses a journal mode change while
+                // another statement is still live on the connection.
+                command.CommandText = "PRAGMA journal_mode;";
+                current = command.ExecuteScalar() as string ?? UnknownJournalMode;
+
+                if (string.Equals(current, InMemoryJournalMode, StringComparison.OrdinalIgnoreCase))
+                {
+                    // An in memory database keeps its pages in memory and has no
+                    // journal file to configure; it answers "memory" to any
+                    // request and ignores it. That is neither a success nor a
+                    // refusal, so it is not worth a warning: StartupValidator
+                    // already warns that this configuration loses everything on
+                    // restart, which is the larger fact about it.
+                    logger.LogDebug(
+                        "SQLite journal mode is {Mode}; an in memory database has no journal to configure",
+                        current);
+                    return;
+                }
+
+                if (string.Equals(current, requested, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Already where the option asks for, said out loud rather
+                    // than passed over in silence. This is the line that shows a
+                    // start after the option changed did nothing because there
+                    // was nothing to do, as opposed to nothing because the code
+                    // never looked, which is what issue #283 could not tell
+                    // apart.
+                    logger.LogInformation("SQLite journal mode is {Mode}", current);
+                    return;
+                }
+
+                // Two literals rather than an interpolated mode, so the SQL that
+                // runs is readable here and nothing about this looks like a
+                // statement built out of a value.
+                command.CommandText = enableWalMode
+                    ? "PRAGMA journal_mode=WAL;"
+                    : "PRAGMA journal_mode=DELETE;";
+                var applied = command.ExecuteScalar() as string ?? UnknownJournalMode;
+
+                if (string.Equals(applied, requested, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Leaving WAL checkpoints the log into the database file and
+                    // removes the -wal and -shm sidecars on the way out, so the
+                    // data directory an operator looks at afterwards matches
+                    // what the option now says.
+                    logger.LogInformation(
+                        "SQLite journal mode changed from {PreviousMode} to {Mode}", current, applied);
+                }
+                else
+                {
+                    logger.LogWarning(
+                        "SQLite journal mode is {Mode} after a request for {RequestedMode}; the change was " +
+                        "refused and Ducks in a Row starts on the mode the database is in. Changing journal " +
+                        "mode needs the database file exclusively, and write ahead logging additionally needs " +
+                        "a filesystem that supports shared memory, which some network shares do not. It is " +
+                        "retried on every start",
+                        applied, requested);
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            // Deliberately broad and deliberately not a throw. The refusal this
+            // is most likely to catch is SQLITE_BUSY raised by the switch itself
+            // rather than reported in its result row: leaving WAL mode takes an
+            // exclusive lock with no busy handler behind it, so another handle
+            // on the file aborts the statement. That is an ordinary outcome
+            // here, not an exceptional one. Enumerating the rest of what the
+            // driver can raise would be guesswork against a guarantee that has
+            // to hold for all of it, and the schema is already current by the
+            // time this runs, so there is nothing left for a swallowed exception
+            // to hide.
+            //
+            // No retry loop and no busy timeout: the lock this waits on does not
+            // consult SQLite's busy handler, so a wait would be a sleep with no
+            // mechanism behind it. The retry is the next start.
+            logger.LogWarning(ex,
+                "SQLite journal mode could not be changed from {Mode} to {RequestedMode}; the database is " +
+                "left as it is and Ducks in a Row starts normally. Journal mode is a concurrency and " +
+                "filesystem compatibility choice, not a correctness one, so it is never a reason to refuse " +
+                "to start",
+                current, requested);
         }
     }
 
@@ -268,8 +435,12 @@ public static class DatabaseInitializer
     /// Run a command on the context's connection, preserving its open state.
     /// A shared in memory test connection must stay open; a file connection is
     /// opened and closed around the call.
+    ///
+    /// Internal rather than private so <see cref="SqliteShutdownCheckpoint"/>
+    /// can run its checkpoint pragma the same way, instead of keeping a second
+    /// copy of this in the same namespace.
     /// </summary>
-    private static void RunOnConnection(CertusDbContext db, Action<IDbCommand> action)
+    internal static void RunOnConnection(CertusDbContext db, Action<IDbCommand> action)
     {
         var connection = db.Database.GetDbConnection();
         var wasOpen = connection.State == ConnectionState.Open;

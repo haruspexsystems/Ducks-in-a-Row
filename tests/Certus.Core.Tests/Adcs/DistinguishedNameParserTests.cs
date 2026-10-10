@@ -55,8 +55,24 @@ public class DistinguishedNameParserTests
 
     // Values chosen because Windows treats them differently from one another:
     // some it quotes, some it leaves bare, two carry a common name inside another
-    // value, and two carry a backslash. The last pair is what the hex escape
-    // defect hid in, and no single hand written case had covered them.
+    // value, and several carry a backslash. The backslash group is what the hex
+    // escape defect hid in, and no single hand written case had covered them.
+    //
+    // The six that end in a backslash were added for issue #296 and cover a
+    // position the earlier group did not. A backslash in the middle of a value is
+    // followed by a character of the name; a backslash at the end of one is
+    // followed by the separator that starts the next component, which is where a
+    // reader that treats it as an escape steps over the boundary and swallows the
+    // rest of the subject.
+    //
+    // Three of them also carry a character Windows quotes for, which puts the
+    // backslash immediately in front of the closing quote rather than in front of
+    // the separator: "a,b\" renders as CN="a,b\". That is the one place the
+    // quoting mechanism and a literal backslash meet, and a reader that treated
+    // the pair as an escaped quote would run past the end of the value and into
+    // the rest of the subject. "a\\" is the other shape the earlier group missed:
+    // it used to read back as "a\", one backslash short, because the first was
+    // taken as escaping the second.
     private static readonly string[] AwkwardValues =
     {
         "plain.example.com",
@@ -66,6 +82,12 @@ public class DistinguishedNameParserTests
         "has\"quote",
         "has\\backslash",
         "CORP\\ab-server",
+        "CORP\\",
+        "\\",
+        "CORP\\svc\\",
+        "a,b\\",
+        "a\"b\\",
+        "a\\\\",
         "\\74\\72\\75\\73\\74\\65\\64.example.com",
         "  leading and trailing  ",
         "semi;colon",
@@ -85,8 +107,11 @@ public class DistinguishedNameParserTests
             yield return new object[] { asCommonName.Build(), value };
 
             // And as a value rendered before the common name, which is where a
-            // planted "CN=" would sit. ADCS encodes general to specific, so every
-            // requester authored part comes ahead of the common name in practice.
+            // planted "CN=" would sit. Not the ordinary rendering, whatever this
+            // said before issue #297: a name encoded general to specific renders
+            // common name first (X500NameOrderingTests). The position is covered
+            // because it is where the grammar is hardest, not because it is
+            // common.
             var beforeCommonName = new X500DistinguishedNameBuilder();
             beforeCommonName.AddOrganizationName(value);
             beforeCommonName.AddCommonName("leaf.example.com");
@@ -143,6 +168,35 @@ public class DistinguishedNameParserTests
     }
 
     [Fact]
+    public void SubjectRenderingLeavesAValueEndingInABackslashBare()
+    {
+        // The measurement issue #296 rests on, recorded so it is a fact in the
+        // repository rather than a claim in an issue.
+        //
+        // Issue #238 established that a backslash is not on the list of
+        // characters CertNameToStr quotes for, but it measured one in the middle
+        // of a value. The end of a value is exactly where a renderer is most
+        // likely to have a special case, because that is where the character sits
+        // against the separator, so it is measured separately rather than
+        // inferred. It does not: the value is rendered bare and the backslash
+        // lands immediately in front of the ", " that starts the next component.
+        //
+        // The name is built by relative distinguished name rather than parsed
+        // from a string, so no string parser sits in the loop and the encoded
+        // value is exactly what was asked for.
+        var builder = new X500DistinguishedNameBuilder();
+        builder.AddCommonName("CORP\\");
+        builder.AddOrganizationName("Example");
+
+        using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var request = new CertificateRequest(builder.Build(), key, HashAlgorithmName.SHA256);
+        using var certificate = request.CreateSelfSigned(
+            DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+
+        certificate.Subject.Should().Be("CN=CORP\\, O=Example");
+    }
+
+    [Fact]
     public void CommonName_RealCertificateWithAnOrdinaryNameIsUnaffected()
     {
         // The overwhelmingly common shape, kept alongside the adversarial one so
@@ -196,14 +250,91 @@ public class DistinguishedNameParserTests
     }
 
     [Fact]
-    public void CommonName_BackslashEscapedCommaIsPartOfTheName()
+    public void CommonName_BackslashIsAlwaysLiteralAndNeverAnEscape()
     {
-        // The RFC 4514 spelling of the same name. Handled alongside the quoted
-        // form rather than instead of it, so the parser does not depend on which
-        // encoder produced the string it was handed.
+        // The deliberate behaviour change of issue #296, and the inverse of what
+        // this test asserted before it.
+        //
+        // This is the RFC 4514 spelling, which the parser used to read alongside
+        // the Windows one so it did not depend on which encoder produced the
+        // string. PR #293 moved MockAdcsClient onto X509Certificate2, which
+        // retired the only producer of that spelling, and reading it was not free:
+        // the same rule that decodes an escaped comma here swallows a component
+        // boundary whenever a Windows rendered value ends in a backslash. One
+        // dialect can be read correctly, two cannot.
+        //
+        // So this string now reads as a common name of "evil\" followed by two
+        // more components, which is what a certificate carrying that name would
+        // actually render as.
         var subject = "CN=evil\\, O=Trusted Corp, O=Real Org";
 
-        DistinguishedNameParser.CommonName(subject).Should().Be("evil, O=Trusted Corp");
+        DistinguishedNameParser.CommonName(subject).Should().Be("evil\\");
+    }
+
+    [Fact]
+    public void CommonName_TrailingBackslashDoesNotSwallowTheNextComponent()
+    {
+        // Issue #296 off a real certificate, so the rendering is measured rather
+        // than assumed. A backslash read as an escape steps over the separator
+        // behind it, the scan never finds a component boundary, and the whole
+        // subject decodes into the common name.
+        var builder = new X500DistinguishedNameBuilder();
+        builder.AddCommonName("CORP\\");
+        builder.AddOrganizationName("Example");
+
+        using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var request = new CertificateRequest(builder.Build(), key, HashAlgorithmName.SHA256);
+        using var certificate = request.CreateSelfSigned(
+            DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+
+        DistinguishedNameParser.CommonName(certificate.Subject).Should().Be("CORP\\");
+        DistinguishedNameParser.CommonName(certificate.Subject)
+            .Should().NotBe("CORP, O=Example");
+    }
+
+    [Fact]
+    public void CommonName_TrailingBackslashAheadOfTheCommonNameDoesNotHideIt()
+    {
+        // The same defect with a component ahead of the common name, which is
+        // where it stops being a misread and becomes a disappearance. Called the
+        // ordinary certificate authority ordering here until issue #297 corrected
+        // that: general to specific encoding renders common name first, so this
+        // is the adverse shape. Reachable all the same, and a trailing backslash
+        // in the organisation name swallowed the common name outright rather than
+        // forging one: the reader returned null and every caller fell back to
+        // showing the whole subject.
+        //
+        // This half needs no requester chosen component order, only a requester
+        // chosen value, which is what enrollee supplies subject hands over.
+        var builder = new X500DistinguishedNameBuilder();
+        builder.AddOrganizationName("CORP\\");
+        builder.AddCommonName("leaf.example.com");
+
+        using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var request = new CertificateRequest(builder.Build(), key, HashAlgorithmName.SHA256);
+        using var certificate = request.CreateSelfSigned(
+            DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+
+        certificate.Subject.Should().Be("O=CORP\\, CN=leaf.example.com");
+        DistinguishedNameParser.CommonName(certificate.Subject)
+            .Should().Be("leaf.example.com");
+    }
+
+    [Fact]
+    public void CommonNameRdn_TrailingBackslashRoundTripsThroughTheSanitizerShape()
+    {
+        // The amplifier, asserted directly. CertificateTextSanitizer re-emits the
+        // slice this returns as "<rdn>, …" when a subject is over the column
+        // width, which moves the common name to the front and puts a separator
+        // right behind it. So a trailing backslash that was harmless at the end
+        // of a rendering became the forged shape once the sanitizer had run, and
+        // the rewrite is persisted by SanitizeStoredSubjects on every start.
+        var subject = "O=Example, CN=CORP\\";
+
+        var rdn = DistinguishedNameParser.CommonNameRdn(subject)!;
+
+        rdn.Should().Be("CN=CORP\\");
+        DistinguishedNameParser.CommonName(rdn + ", " + Ellipsis).Should().Be("CORP\\");
     }
 
     [Fact]

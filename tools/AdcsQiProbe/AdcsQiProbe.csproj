@@ -2,18 +2,68 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <!-- Dual target for the issue #169 net10 upgrade gate: the net8 and net10
-         probe builds must come from the same commit so the lab comparison has
-         one instrument and one variable (the runtime). The net8.0-windows
-         target is temporary and comes out in a follow up once the gate has
-         passed and the upgrade has merged. The empty TargetFramework clears
-         the singular default from Directory.Build.props, which would
-         otherwise override the plural and force a plain net10.0 build. -->
+    <!-- The dual target began as the issue #169 net10 upgrade gate, so that the
+         net8 and net10 probe builds came from one commit and the lab comparison
+         had one instrument and one variable. That gate passed when #216 merged,
+         but the net8 leg is now LOAD BEARING for a different reason and must not
+         be removed. Lab 2022 is build 20348.587 and lacks CET, which the .NET 10
+         runtime requires on Server 2022 (Certus-QA #189), so a net10 apphost
+         cannot start there at all. scripts/lab/Publish-ProbeToLab.ps1 selects
+         this net8 build for any lab whose readiness record disproves
+         ProbeNet10, which is what lets a probe on that lab report on COM rather
+         than die about CET. DeviceAttestProbe is net10 only and is refused there
+         by name instead. If issue #217 still asks for this target to be dropped,
+         that item was written before the lab automation existed and is no longer
+         correct. The ref/in conditional block in Program.cs stays for the same
+         reason.
+
+         The empty TargetFramework clears the singular default from
+         Directory.Build.props, which would otherwise override the plural and
+         force a plain net10.0 build. -->
     <TargetFramework></TargetFramework>
     <TargetFrameworks>net8.0-windows;net10.0-windows</TargetFrameworks>
     <AssemblyName>AdcsQiProbe</AssemblyName>
     <RootNamespace>AdcsQiProbe</RootNamespace>
-    <Description>Diagnostic for Certus issues #14, #15, and #169. Activates the CertRequest, CertView, and CertAdmin coclasses through the Activator and CoCreateInstance paths, queries their IIDs to see which interfaces the objects expose (CertAdmin is QI only, no method calls), and exercises four managed dispatch models (IUnknown, Dual, IDispatch, dynamic) against a live CA to find which one invokes a v1 method without crashing.</Description>
+    <Description>Diagnostic for Certus issues #14, #15, and #169. Activates the CertRequest, CertView, and CertAdmin coclasses through the Activator and CoCreateInstance paths, queries their IIDs to see which interfaces the objects expose, exercises four managed dispatch models (IUnknown, Dual, IDispatch, dynamic) against a live CA to find which one invokes a v1 method without crashing, and (issue #440) measures what the CA and the directory let the running account do. The only CertAdmin methods it calls are the two that read, GetMyRoles and GetCAProperty; nothing that changes a CA is ever called.</Description>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The LDAP distribution point reader needs it, and the package supports
+         net8.0 as well as net10.0, so both probe targets keep building. -->
+    <PackageReference Include="System.DirectoryServices" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Source links, not a ProjectReference, following tools/DeviceAttestProbe:
+         a probe stands alone with no assembly dependency on the product, and
+         Certus.Core would drag EF Core, BouncyCastle, MailKit and Serilog behind
+         it for a self contained publish.
+
+         The point of linking rather than reimplementing is that the CRL run on a
+         lab CA then exercises the readers that will ship. A copy would answer a
+         question about a copy. Every linked file is deliberately free of any
+         dependency beyond the base class library and System.DirectoryServices,
+         and compiles as C# 12 for the net8 target, and they have to stay that
+         way or this project stops building; only `dotnet build tools/AdcsQiProbe`
+         catches a break, since the probe is outside the solution and the test
+         suite. -->
+    <Compile Include="../../src/Certus.Core/Crl/CrlHeaderReader.cs" Link="CrlHeaderReader.cs" />
+    <Compile Include="../../src/Certus.Core/Crl/CdpExtensionReader.cs" Link="CdpExtensionReader.cs" />
+    <Compile Include="../../src/Certus.Core/Crl/CrlSignatureVerifier.cs" Link="CrlSignatureVerifier.cs" />
+    <Compile Include="../../src/Certus.Core/Crl/CrlFetchResult.cs" Link="CrlFetchResult.cs" />
+    <Compile Include="../../src/Certus.Core/Crl/LdapCdpUrl.cs" Link="LdapCdpUrl.cs" />
+    <Compile Include="../../src/Certus.Core/Crl/HttpCrlFetcher.cs" Link="HttpCrlFetcher.cs" />
+    <Compile Include="../../src/Certus.Adcs/Crl/LdapCrlFetcher.cs" Link="LdapCrlFetcher.cs" />
+    <!-- Issue #440: the service rights readers and the Enroll test, so the lab
+         run as the computer account exercises the code the wizard's check
+         ships with. CaRoleReader needs the CertAdmin coclass declaration. -->
+    <Compile Include="../../src/Certus.Core/ServiceRights/RightsReadings.cs" Link="RightsReadings.cs" />
+    <Compile Include="../../src/Certus.Core/ServiceRights/TemplateEnrollEvaluator.cs" Link="TemplateEnrollEvaluator.cs" />
+    <Compile Include="../../src/Certus.Core/ServiceRights/CaAccessRoles.cs" Link="CaAccessRoles.cs" />
+    <Compile Include="../../src/Certus.Adcs/LdapFilterValue.cs" Link="LdapFilterValue.cs" />
+    <Compile Include="../../src/Certus.Adcs/ServiceRights/DirectoryRightsReader.cs" Link="DirectoryRightsReader.cs" />
+    <Compile Include="../../src/Certus.Adcs/ServiceRights/CaRoleReader.cs" Link="CaRoleReader.cs" />
+    <Compile Include="../../src/Certus.Adcs/ComInterop/ICertAdmin2.cs" Link="ICertAdmin2.cs" />
+  </ItemGroup>
 
 </Project>

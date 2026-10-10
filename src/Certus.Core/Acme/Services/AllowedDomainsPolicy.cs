@@ -17,9 +17,10 @@ namespace Certus.Core.Acme.Services;
 /// settings page edit applies to the next order without a service restart.
 ///
 /// An entry covers the domain itself and every subdomain beneath it, on
-/// label boundaries: home.local matches web.home.local and a.b.home.local,
-/// never myhome.local. A wildcard identifier *.D is allowed exactly when D
-/// would be, because every name such a certificate can cover sits under D.
+/// label boundaries: corp.example.com matches web.corp.example.com and
+/// a.b.corp.example.com, never mycorp.example.com. A wildcard identifier
+/// *.D is allowed exactly when D would be, because every name such a
+/// certificate can cover sits under D.
 /// Names and entries are compared after normalization to lowercase punycode
 /// A labels, so a Unicode name and its A label form are the same name here.
 ///
@@ -141,7 +142,7 @@ public sealed class AllowedDomainsPolicy
         if (value.Contains('*'))
             return "Do not use wildcards here. Subdomains of an allowed domain are included automatically.";
         if (value.Contains("://", StringComparison.Ordinal))
-            return "Enter a bare domain name without a scheme, for example home.local.";
+            return "Enter a bare domain name without a scheme, for example corp.example.com.";
         if (value.Contains('/'))
             return "Enter a domain name without a path.";
         if (value.Any(char.IsWhiteSpace))
@@ -162,8 +163,8 @@ public sealed class AllowedDomainsPolicy
     /// <summary>
     /// Whether a normalized name is covered by a normalized entry: the name
     /// is the entry itself or any subdomain of it. The mandatory dot before
-    /// the entry is the label boundary guard that keeps home.local from
-    /// matching myhome.local.
+    /// the entry is the label boundary guard that keeps corp.example.com
+    /// from matching mycorp.example.com.
     /// </summary>
     public static bool MatchesEntry(string normalizedName, string normalizedEntry)
     {

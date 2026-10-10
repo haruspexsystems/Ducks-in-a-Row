@@ -1,6 +1,7 @@
 using Certus.Core.Acme.Services;
 using Certus.Core.Adcs;
 using Certus.Core.Configuration;
+using Certus.Core.ServiceRights;
 using Certus.Core.Setup;
 using Certus.Web.Authentication;
 using Microsoft.AspNetCore.Authorization;
@@ -28,6 +29,7 @@ public sealed class SetupController : ControllerBase
     private readonly IServiceRestarter _serviceRestarter;
     private readonly TlsCertificateEnroller _tlsEnroller;
     private readonly IHttpsCertificateStore _certificateStore;
+    private readonly ServiceRightsCheck _serviceRightsCheck;
     private readonly IConfiguration _configuration;
     private readonly ILogger<SetupController> _logger;
 
@@ -36,6 +38,7 @@ public sealed class SetupController : ControllerBase
         IServiceRestarter serviceRestarter,
         TlsCertificateEnroller tlsEnroller,
         IHttpsCertificateStore certificateStore,
+        ServiceRightsCheck serviceRightsCheck,
         IConfiguration configuration,
         ILogger<SetupController> logger)
     {
@@ -43,6 +46,7 @@ public sealed class SetupController : ControllerBase
         _serviceRestarter = serviceRestarter;
         _tlsEnroller = tlsEnroller;
         _certificateStore = certificateStore;
+        _serviceRightsCheck = serviceRightsCheck;
         _configuration = configuration;
         _logger = logger;
     }
@@ -202,6 +206,35 @@ public sealed class SetupController : ControllerBase
 
         var result = await _setupService.TestConnectivityAsync(request.CaConnectionString, ct);
         return Ok(result);
+    }
+
+    /// <summary>
+    /// POST /api/setup/service-rights: what the service's own account may do on
+    /// a candidate CA and on the given templates (issue #440). Read only, so like
+    /// test-connection it stays open after setup completes. The wizard calls it
+    /// with no templates after Test Connection passes, and with the chosen ones
+    /// on the Review step.
+    /// </summary>
+    [HttpPost("service-rights")]
+    public async Task<IActionResult> CheckServiceRights(
+        [FromBody] ServiceRightsRequest request, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(request.CaConnectionString))
+            return BadRequest(new { error = "CA connection string is required" });
+        if (!AdcsCaConnectionString.TryValidate(request.CaConnectionString, out var caError))
+            return BadRequest(new { error = caError });
+
+        var templates = request.Templates ?? [];
+        if (templates.Count > ServiceRightsCheck.MaxTemplates)
+            return BadRequest(new { error = $"At most {ServiceRightsCheck.MaxTemplates} templates can be checked at once." });
+        foreach (var template in templates)
+        {
+            if (!AdcsRequestAttributes.TryValidateTemplateName(template, out var templateError))
+                return BadRequest(new { error = templateError });
+        }
+
+        var report = await _serviceRightsCheck.RunAsync(request.CaConnectionString, templates, ct);
+        return Ok(report.ToWire());
     }
 
     /// <summary>
@@ -469,6 +502,18 @@ public sealed class SetupController : ControllerBase
             _logger.LogWarning(ex, "TLS certificate enrollment: the CA is unavailable");
             return StatusCode(503, new { error = true, message = "The certificate authority is unavailable. Try again shortly." });
         }
+        catch (CaAccessDeniedException ex)
+        {
+            // The second CA exception the enroller propagates (issue #336). Without
+            // this arm it faults to a bare 500 with no body, on the surface most
+            // likely to meet it: a freshly built CA, where the wizard is the first
+            // thing to submit anything and the service account's rights are the
+            // likeliest thing to be wrong. The message is carried in full, as the
+            // dashboard already does for this exception; this is an administrator
+            // authenticated surface, and the remediation is the entire value.
+            _logger.LogError(ex, "TLS certificate enrollment: the CA denied access");
+            return StatusCode(503, new { error = true, message = ex.Message });
+        }
     }
 
     /// <summary>
@@ -625,6 +670,12 @@ public sealed class SetupController : ControllerBase
 
 /// <summary>Request body carrying a candidate CA connection string.</summary>
 public sealed record TestConnectionRequest(string CaConnectionString);
+
+/// <summary>
+/// Request body for the service rights check: a candidate CA and the templates to
+/// weigh, by either name form. No templates checks the CA alone.
+/// </summary>
+public sealed record ServiceRightsRequest(string CaConnectionString, List<string>? Templates = null);
 
 /// <summary>
 /// Request body for URL validation. The optional template name points the

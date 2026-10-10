@@ -1,4 +1,5 @@
 using Certus.Core.Configuration;
+using Certus.Core.Tests.Security;
 using Microsoft.Extensions.Configuration;
 
 namespace Certus.Core.Tests.Configuration;
@@ -463,5 +464,85 @@ public class SettingsOverlayTests : IDisposable
         loaded.HttpsCertificateThumbprint.Should().Be("ABCDEF0123456789");
         loaded.Alerts!.CheckIntervalMinutes.Should().Be(90);
         loaded.CaConnectionString.Should().Be("ca\\CA");
+    }
+
+    // ── An overlay the service cannot trust (issue #489) ──
+
+    [Fact]
+    public void Overlay_Untrusted_IsNotAdded_AndTheVerdictSaysWhy()
+    {
+        // The escalation #489 reproduced: a standard user who can write settings.json
+        // names their own group as the dashboard's administrators.
+        var overlayPath = Path.Combine(_dataDir, "settings.json");
+        File.WriteAllText(overlayPath,
+            """{ "Certus": { "CaConnectionString": "from-overlay" }, "Auth": { "AdminGroup": "planted" } }""");
+        FileAcl.GrantEveryoneWrite(overlayPath);
+
+        var manager = new ConfigurationManager();
+        var verdict = ((IConfigurationBuilder)manager).AddSettingsOverlay(_dataDir);
+
+        verdict.IsTrusted.Should().BeFalse();
+        verdict.Reason.Should().Contain(FileAcl.EveryoneSid);
+        manager["Auth:AdminGroup"].Should().BeNull();
+        manager["Certus:CaConnectionString"].Should().BeNull();
+    }
+
+    [Fact]
+    public void Overlay_Trusted_HonoursEveryKey_AuthIncluded()
+    {
+        // No key filter, by decision on #489: the overlay is the administrator's
+        // configuration file, and what protects it is who may write it.
+        File.WriteAllText(Path.Combine(_dataDir, "settings.json"),
+            """{ "Auth": { "AdminGroup": "CORP\\Ducks Admins" } }""");
+
+        var manager = new ConfigurationManager();
+        var verdict = ((IConfigurationBuilder)manager).AddSettingsOverlay(_dataDir);
+
+        verdict.IsTrusted.Should().BeTrue();
+        manager["Auth:AdminGroup"].Should().Be("CORP\\Ducks Admins");
+    }
+
+    [Fact]
+    public void Load_Untrusted_ReadsAsAbsent()
+    {
+        var overlayPath = Path.Combine(_dataDir, "settings.json");
+        SettingsOverlay.Save(new SettingsOverlay.OverlaySettings("planted\\CA", "https://planted.example"), overlayPath);
+        FileAcl.GrantEveryoneWrite(overlayPath);
+
+        var loaded = SettingsOverlay.Load(overlayPath);
+
+        loaded.CaConnectionString.Should().BeNull();
+        loaded.ExternalUrl.Should().BeNull();
+    }
+
+    [Fact]
+    public void Mutate_Untrusted_WritesAFreshTrustedFile_WithOnlyTheChange()
+    {
+        // How an administrator recovers: saving from the wizard or the settings page
+        // replaces the untrusted file, and nothing an attacker put in it survives.
+        var overlayPath = Path.Combine(_dataDir, "settings.json");
+        SettingsOverlay.Save(new SettingsOverlay.OverlaySettings("planted\\CA", "https://planted.example"), overlayPath);
+        FileAcl.GrantEveryoneWrite(overlayPath);
+
+        SettingsOverlay.Mutate(overlayPath, c => c with { ExternalUrl = "https://certus.example.com" });
+
+        Certus.Core.Security.TrustedFile.Check(overlayPath).IsTrusted.Should().BeTrue();
+        var loaded = SettingsOverlay.Load(overlayPath);
+        loaded.ExternalUrl.Should().Be("https://certus.example.com");
+        loaded.CaConnectionString.Should().BeNull();
+    }
+
+    [Fact]
+    public void Save_LeavesAPreCreatedTmpAlone()
+    {
+        // The staging #489 abused: "settings.json.tmp" was the only name the writer
+        // used, so whoever created it first had their file renamed over the target.
+        var overlayPath = Path.Combine(_dataDir, "settings.json");
+        File.WriteAllText(overlayPath + ".tmp", "planted");
+
+        SettingsOverlay.Save(new SettingsOverlay.OverlaySettings("ca\\CA", null), overlayPath);
+
+        File.ReadAllText(overlayPath + ".tmp").Should().Be("planted");
+        SettingsOverlay.Load(overlayPath).CaConnectionString.Should().Be("ca\\CA");
     }
 }

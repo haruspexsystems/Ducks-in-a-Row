@@ -51,6 +51,14 @@ public class HttpsCertificateAutoRenewalServiceTests : IDisposable
         };
 
         _clientFactory.Create(Arg.Any<string>()).Returns(_client);
+
+        // The enroller resolves the recorded template against the CA's own
+        // published list before it submits, so the CA has to publish the
+        // template these cases renew with. Distinct programmatic and display
+        // names, as a real CA has them.
+        _client.GetTemplatesAsync(Arg.Any<CancellationToken>())
+            .Returns(new List<TemplateInfo> { new("WebServer", "Web Server", "oid1") });
+
         _client.SubmitCertificateRequestAsync(
                 Arg.Any<string>(),
                 Arg.Do<byte[]>(csr => _submittedCsr = csr),
@@ -411,6 +419,15 @@ public class HttpsCertificateAutoRenewalServiceTests : IDisposable
         SeedOverlay();
         using var expiring = MakeCertificate(daysToExpiry: 10);
         StoreHolds(InstalledThumbprint, expiring);
+
+        // A CA that cannot answer a submission cannot answer a template listing
+        // either, so refuse both. That order matters: the template resolution
+        // runs first, and a list it could not read must leave the enrollment on
+        // the recorded name rather than refuse it as unpublished, or a CA
+        // outage would be reported as a configuration error (issue #194).
+        _client.GetTemplatesAsync(Arg.Any<CancellationToken>())
+            .Returns<IReadOnlyList<TemplateInfo>>(
+                _ => throw new CaUnavailableException("The RPC server is unavailable"));
         _client.SubmitCertificateRequestAsync(
                 Arg.Any<string>(), Arg.Any<byte[]>(), Arg.Any<CancellationToken>())
             .Returns<SubmitResult>(_ => throw new CaUnavailableException("The RPC server is unavailable"));
@@ -423,6 +440,69 @@ public class HttpsCertificateAutoRenewalServiceTests : IDisposable
         ReadOverlay().HttpsCertificateThumbprint.Should().Be(InstalledThumbprint);
         await _notifier.Received(1).SendServerCertificateAlertAsync(
             Arg.Any<ServerCertificateAlert>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task CheckAsync_CaDeniesAccess_KeepsTheCurrentCertificateAndAlerts()
+    {
+        // Issue #336. Its own arm rather than the worker loop's general catch, which
+        // kept the service alive but recorded no attempt and sent no alert. This is
+        // the one CA failure that does not clear on its own, so silence here means a
+        // renewal blocked by a withdrawn permission goes unnoticed until the
+        // certificate expires, which is the failure this service exists to prevent.
+        SeedCompletedSetup();
+        SeedOverlay();
+        using var expiring = MakeCertificate(daysToExpiry: 10);
+        StoreHolds(InstalledThumbprint, expiring);
+
+        _client.SubmitCertificateRequestAsync(
+                Arg.Any<string>(), Arg.Any<byte[]>(), Arg.Any<CancellationToken>())
+            .Returns<SubmitResult>(_ => throw new CaAccessDeniedException(
+                CaAccessDeniedException.EnrollPermissionMessage,
+                new UnauthorizedAccessException("simulated E_ACCESSDENIED")));
+
+        var sut = CreateService();
+        await sut.CheckAsync(CancellationToken.None);
+
+        sut.LastAttempt!.Outcome.Should().Be(HttpsCertificateRenewalOutcome.Failed);
+        sut.LastAttempt.Message.Should().Contain("denied");
+        sut.LastAttempt.Message.Should().Contain("Request Certificates",
+            "the alert is read by an administrator and the remediation is its whole value");
+        ReadOverlay().HttpsCertificateThumbprint.Should().Be(InstalledThumbprint);
+        await _notifier.Received(1).SendServerCertificateAlertAsync(
+            Arg.Any<ServerCertificateAlert>(), Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// The issue #194 defect end to end. An overlay recording the display name
+    /// is legal (EnabledTemplatesPolicy documents the both forms contract and
+    /// the ACME path issues against it happily), but ADCS matches
+    /// CertificateTemplate: against the programmatic name alone, so every
+    /// renewal denied with 0x80094800 while ACME kept issuing. The renewal now
+    /// resolves before submitting, and records what it submitted, so the
+    /// install converges on the name ADCS actually matches.
+    /// </summary>
+    [Fact]
+    public async Task CheckAsync_OverlayRecordsTheDisplayName_SubmitsAndRecordsTheProgrammaticName()
+    {
+        SeedCompletedSetup(template: "Web Server");
+        SeedOverlay(template: "Web Server");
+        using var expiring = MakeCertificate(daysToExpiry: 10);
+        StoreHolds(InstalledThumbprint, expiring);
+
+        var sut = CreateService();
+        await sut.CheckAsync(CancellationToken.None);
+
+        sut.LastAttempt!.Outcome.Should().Be(HttpsCertificateRenewalOutcome.Installed);
+        sut.LastAttempt.Template.Should().Be("WebServer");
+
+        await _client.Received(1).SubmitCertificateRequestAsync(
+            "WebServer", Arg.Any<byte[]>(), Arg.Any<CancellationToken>());
+        await _client.DidNotReceive().SubmitCertificateRequestAsync(
+            "Web Server", Arg.Any<byte[]>(), Arg.Any<CancellationToken>());
+
+        ReadOverlay().HttpsCertificateTemplate.Should().Be("WebServer",
+            "the next renewal must not have to resolve the same display name again");
     }
 
     [Fact]

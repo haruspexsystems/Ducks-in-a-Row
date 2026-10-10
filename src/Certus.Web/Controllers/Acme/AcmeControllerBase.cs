@@ -371,8 +371,15 @@ public abstract class AcmeControllerBase : ControllerBase
         if (account == null)
             return (null, AcmeError(401, AcmeErrorType.AccountDoesNotExist, "Account not found."));
 
+        // RFC 8555 §7.3.6 names this status exactly: "If a server receives a POST or
+        // POST-as-GET from a deactivated account, it MUST return an error response with
+        // status code 401 (Unauthorized)". 401, not the 403 the signature failure below
+        // returns: that one is §6.2 territory, a key that does not match the account,
+        // and the two must stay distinguishable to a client reading the status alone.
         if (account.Status != "valid")
-            return (null, AcmeError(403, AcmeErrorType.Unauthorized, "Account is deactivated."));
+            return (null, AcmeError(401, AcmeErrorType.Unauthorized,
+                $"The account is {account.Status} and can no longer be used. " +
+                "Deactivation is permanent; register a new account to continue."));
 
         // Verify signature against stored key. Mandatory for kid requests and must fail closed:
         // JwsService.Validate returns a kid result WITHOUT checking the signature (it cannot — the

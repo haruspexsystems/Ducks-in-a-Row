@@ -974,14 +974,20 @@ public class CertificateQueryServiceTests : IDisposable
             JwkThumbprint = $"thumb-{adcsRequestId}",
             ContactJson = contactJson
         };
+        // "valid" with a matching CertificateId is the only shape a stored certificate
+        // can have in production: the row and the status flip commit together. Left at
+        // the entity default this seeded a certificate under a pending order, which no
+        // path can produce (issue #318).
         var order = new AcmeOrder
         {
             OrderId = $"order-{adcsRequestId}",
             Account = account,
+            Status = "valid",
             TemplateId = "WebServer",
             IdentifiersJson = "[]",
             ExpiresAt = DateTime.UtcNow.AddDays(7),
-            AdcsRequestId = adcsRequestId
+            AdcsRequestId = adcsRequestId,
+            CertificateId = $"cert-{adcsRequestId}"
         };
         _db.AcmeCertificates.Add(new AcmeCertificate
         {

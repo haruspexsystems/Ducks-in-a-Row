@@ -82,10 +82,20 @@ public sealed class AlertConfigStore
     /// without the resolver, because a whole block save that never considered
     /// the stored password is exactly how it gets wiped.
     /// </para>
+    ///
+    /// <para>
+    /// <paramref name="resolveUsername"/> is the same contract for the other
+    /// half of the credential, added by issue #261 when the config endpoint
+    /// stopped returning the username. It is not a convenience: with the value
+    /// no longer readable, the form cannot post it back, so the only copy that
+    /// survives an ordinary save of an unrelated field is the one this callback
+    /// reads off the file under the lock.
+    /// </para>
     /// </summary>
     public void Save(
         SettingsOverlay.AlertOverlaySettings alerts,
-        Func<string?, string?> resolvePasswordBlob) =>
+        Func<string?, string?> resolvePasswordBlob,
+        Func<string?, string?> resolveUsername) =>
         SettingsOverlay.Mutate(OverlayPath, current => current with
         {
             Alerts = alerts with
@@ -93,6 +103,7 @@ public sealed class AlertConfigStore
                 Smtp = (alerts.Smtp ?? new SettingsOverlay.AlertSmtpOverlaySettings()) with
                 {
                     PasswordProtected = resolvePasswordBlob(current.Alerts?.Smtp?.PasswordProtected),
+                    Username = resolveUsername(current.Alerts?.Smtp?.Username),
                 },
             },
         });

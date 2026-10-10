@@ -99,6 +99,24 @@ public class TemplateServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task ResolveAsync_DisplayNameCarryingASoftHyphen_StillResolves()
+    {
+        // Issue #235 is answered upstream of here, by refusing the URL and by
+        // telling an administrator which template carries the character. It is
+        // deliberately not answered by narrowing what resolves: doing that
+        // would break issue #17's promise for every template, to fix a name
+        // that never reaches this method anyway. Pinned so a later reading of
+        // #235 cannot quietly take the dual form contract away.
+        var displayName = "Web" + char.ConvertFromUtf32(0x00AD) + " Server ACME";
+        var sut = BuildService(new TemplateInfo("WebServerACME", displayName, "1.2.3"));
+
+        var resolution = await sut.ResolveAsync(displayName);
+
+        resolution.Access.Should().Be(TemplateAccess.Enabled);
+        resolution.Template!.Name.Should().Be("WebServerACME");
+    }
+
+    [Fact]
     public async Task ResolveAsync_CaseInsensitive_Matches()
     {
         var sut = BuildService(new TemplateInfo("WebServerACME", "Web Server ACME", "1.2.3"));

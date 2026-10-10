@@ -447,14 +447,31 @@ public sealed class AccountService
     }
 
     /// <summary>
-    /// Deactivates an account from the dashboard and invalidates its open
-    /// (pending, ready, or processing) orders in the same SaveChanges, so
-    /// the two cannot diverge. The ACME surface needs no extra check: every
-    /// kid authenticated request already rejects a non valid account with
-    /// 403. Deactivation is terminal (RFC 8555 §7.3.6).
+    /// Deactivates an account and invalidates its open (pending or ready) orders
+    /// in the same transaction, so the two cannot diverge. Invalidating the open
+    /// orders is RFC 8555 §7.3.6's "the server SHOULD cancel any pending
+    /// operations authorized by the account's key".
+    ///
+    /// An order already in "processing" is left alone (issue #312). It has been
+    /// claimed by a finalize and its CSR is at the CA, so it is not a pending
+    /// operation this server can still cancel, and writing to it would collide
+    /// with the completion. It completes and its certificate is stored, but no
+    /// client can fetch it, because the check below applies.
+    ///
+    /// Shared by the two ways an account dies: an administrator clicking
+    /// Deactivate on the dashboard, and the account's own client posting
+    /// {"status":"deactivated"} to its account URL (§7.3.6). The origin reaches
+    /// the log line and, since issue #320, the error written onto each order
+    /// this cancels. It has to be told either way: a record that says an
+    /// administrator did this when a client did is worse than no record.
+    ///
+    /// The ACME surface needs no extra check afterwards: every kid
+    /// authenticated request already rejects a non valid account. Deactivation
+    /// is terminal.
     /// </summary>
     public async Task<AccountDeactivationResult> DeactivateAsync(
         int id,
+        AccountDeactivationOrigin origin,
         CancellationToken cancellationToken = default)
     {
         var account = await _db.AcmeAccounts
@@ -467,24 +484,188 @@ public sealed class AccountService
             return new AccountDeactivationResult(
                 AccountDeactivationOutcome.NotValid, account, 0);
 
-        var openOrders = await _db.AcmeOrders
+        // The orders and the account in one transaction, the way the single
+        // SaveChanges this replaced covered them together. ExecuteUpdate cannot be
+        // batched into SaveChanges, so an explicit transaction is what keeps a
+        // crash in between from leaving open orders under a deactivated account.
+        // No retrying execution strategy is configured, so no strategy wrapper is
+        // needed here.
+        await using var tx = await _db.Database.BeginTransactionAsync(cancellationToken);
+
+        // One conditional UPDATE naming the statuses it is legal to cancel from,
+        // rather than a select and a loop, so nothing can move between the read and
+        // the write. "processing" is deliberately absent (issue #312): that order
+        // has been claimed by a finalize and its CSR is at the CA, and the CA has
+        // no idea this account just died. Writing "invalid" over it either loses to
+        // the completion, which puts the row back to "valid" after the client was
+        // told otherwise, or wins and leaves an "invalid" order still holding a
+        // live certificate. This is not only an account racing itself: one of the
+        // two call sites is the dashboard, so the ordinary shape is an
+        // administrator deactivating an account while a client finalizes.
+        //
+        // The certificate such an order completes into is unreachable anyway, since
+        // every kid authenticated request already rejects a non valid account, and
+        // it reaches the dashboard through the inventory sync.
+        // RFC 8555 section 7.1.3 gives an order an error field holding the problem
+        // document that explains why it became invalid, and these orders had none
+        // (issue #320). OrderService.DeactivateAuthorizationAsync already writes one
+        // for the sibling event, so writing it here makes the two demoters answer
+        // the same question the same way. "unauthorized" is the type that path uses
+        // and it fits this one too: section 6.7 defines it as the client lacking
+        // sufficient authorization, and a deactivated account key authorizes nothing.
+        // It is also the type section 7.3.6 already makes this server answer every
+        // later request from that key with, so one event is not described two ways.
+        //
+        // OrderService.ToResponse now projects this column into the order object's
+        // error member for every order (issue #330), so on the other demoter's path
+        // a client genuinely reads it. On this one it stays a record: every kid
+        // authenticated request from a deactivated account is refused 401 before an
+        // order object is built at all, so no client of this account will ever poll
+        // the orders this just invalidated. What reads it here is an operator with a
+        // SQL client and the tests below. That is a reason to word it well, not a
+        // reason to leave it out.
+        var errorJson = JsonSerializer.Serialize(new AcmeError
+        {
+            Type = AcmeErrorType.Unauthorized,
+            Detail = DescribeOrderCancellation(origin)
+        });
+
+        var invalidatedOrders = await _db.AcmeOrders
             .Where(o => o.AccountId == account.Id &&
-                (o.Status == "pending" || o.Status == "ready" || o.Status == "processing"))
-            .ToListAsync(cancellationToken);
-        foreach (var order in openOrders)
-            order.Status = "invalid";
+                (o.Status == "pending" || o.Status == "ready"))
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(o => o.Status, "invalid")
+                .SetProperty(o => o.ErrorJson, errorJson),
+                cancellationToken);
 
         account.Status = "deactivated";
         account.UpdatedAt = DateTime.UtcNow;
         await _db.SaveChangesAsync(cancellationToken);
 
+        await tx.CommitAsync(cancellationToken);
+
+        // No ReloadAsync here, unlike DeactivateAuthorizationAsync and the finalize
+        // claim. That reload exists when a caller re-reads the same rows through
+        // this scoped DbContext afterwards. No AcmeOrder is tracked in this scope
+        // any more, now that the select and the loop are gone, and neither call
+        // site reads an order after this returns, so there is nothing stale to
+        // serve.
         _logger.LogInformation(
-            "Deactivated ACME account {AccountId} from the dashboard and invalidated {Count} open order(s)",
-            account.AccountId, openOrders.Count);
+            "Deactivated ACME account {AccountId} ({Origin}) and invalidated {Count} open order(s)",
+            account.AccountId, DescribeOrigin(origin), invalidatedOrders);
 
         return new AccountDeactivationResult(
-            AccountDeactivationOutcome.Deactivated, account, openOrders.Count);
+            AccountDeactivationOutcome.Deactivated, account, invalidatedOrders);
     }
+
+    /// <summary>
+    /// Updates an account's contact list (RFC 8555 §7.3.2). An empty list
+    /// clears the contacts, and is stored as null rather than "[]" so a
+    /// cleared account object omits the contact member exactly as an account
+    /// that never set one does; the alternative would make "cleared" and
+    /// "never set" two distinguishable states over the wire for no gain.
+    /// The caller has already run <see cref="ValidateContacts"/>.
+    /// </summary>
+    public async Task UpdateContactAsync(
+        AcmeAccount account,
+        string[] contact,
+        CancellationToken cancellationToken = default)
+    {
+        account.ContactJson = contact.Length > 0
+            ? JsonSerializer.Serialize(contact)
+            : null;
+        account.UpdatedAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync(cancellationToken);
+
+        _logger.LogInformation(
+            "Updated the contact list of ACME account {AccountId} to {Count} entr(ies)",
+            account.AccountId, contact.Length);
+    }
+
+    /// <summary>The largest contact list this server will store for an account.</summary>
+    public const int MaxContactEntries = 10;
+
+    /// <summary>The longest single contact URI this server will store.</summary>
+    public const int MaxContactLength = 255;
+
+    /// <summary>
+    /// Bounds a client supplied contact list. This is a size guard, not RFC
+    /// §7.3 contact validation: it says nothing about the scheme or the
+    /// address, only that the list cannot be used to write unbounded data.
+    ///
+    /// The bound matters because the update endpoint (§7.3.2) makes the
+    /// contact list rewritable at will by anyone holding an account key,
+    /// where new-account only ever wrote it once. Both call sites use this,
+    /// so the two cannot disagree about what is storable.
+    ///
+    /// Returns true and a null error when the list is acceptable.
+    /// </summary>
+    public static bool ValidateContacts(string[]? contact, out string? error)
+    {
+        if (contact == null || contact.Length == 0)
+        {
+            error = null;
+            return true;
+        }
+
+        if (contact.Length > MaxContactEntries)
+        {
+            error = $"At most {MaxContactEntries} contact entries are accepted; " +
+                    $"the request carried {contact.Length}.";
+            return false;
+        }
+
+        for (var i = 0; i < contact.Length; i++)
+        {
+            var entry = contact[i];
+            if (string.IsNullOrWhiteSpace(entry))
+            {
+                error = $"Contact entry {i + 1} is empty.";
+                return false;
+            }
+
+            if (entry.Length > MaxContactLength)
+            {
+                error = $"Contact entry {i + 1} is {entry.Length} characters; " +
+                        $"at most {MaxContactLength} are accepted.";
+                return false;
+            }
+        }
+
+        error = null;
+        return true;
+    }
+
+    /// <summary>
+    /// How a deactivation reads in the log. Kept next to the enum it maps so a
+    /// new origin cannot be added without deciding what it is called.
+    /// </summary>
+    private static string DescribeOrigin(AccountDeactivationOrigin origin) => origin switch
+    {
+        AccountDeactivationOrigin.Dashboard => "from the dashboard",
+        AccountDeactivationOrigin.AcmeClient => "at the client's own request over ACME",
+        _ => "origin unrecorded",
+    };
+
+    /// <summary>
+    /// The detail carried by the ACME error written onto every order this
+    /// deactivation invalidates (issue #320). Kept apart from
+    /// <see cref="DescribeOrigin"/>, which phrases a log line about the account:
+    /// this one is the problem document RFC 8555 section 7.1.3 gives the order,
+    /// so it describes what happened to the order rather than to the account.
+    /// It names the origin for the same reason the log line does, and for the
+    /// same audience: nothing projects an order's error over the wire today, so
+    /// whoever reads this is an operator looking at the row.
+    /// </summary>
+    private static string DescribeOrderCancellation(
+        AccountDeactivationOrigin origin) => origin switch
+    {
+        AccountDeactivationOrigin.Dashboard =>
+            "The account that authorized this order was deactivated by an administrator.",
+        AccountDeactivationOrigin.AcmeClient =>
+            "The account that authorized this order was deactivated at the client's own request.",
+        _ => "The account that authorized this order was deactivated.",
+    };
 
     /// <summary>
     /// Parses a stored ContactJson column into the contact list. Shared with
@@ -647,6 +828,23 @@ public sealed record EabCredentialRef(
     string KeyId,
     string Name,
     string Status);
+
+/// <summary>
+/// Who asked for a deactivation. Recorded in the log line so an account that
+/// went away can be traced to the decision that killed it: an administrator's
+/// click, or the account's own client retiring a key.
+/// </summary>
+public enum AccountDeactivationOrigin
+{
+    /// <summary>An administrator clicked Deactivate on the dashboard.</summary>
+    Dashboard,
+
+    /// <summary>
+    /// The account's own client posted {"status":"deactivated"} to its account
+    /// URL (RFC 8555 §7.3.6), typically to retire a compromised key.
+    /// </summary>
+    AcmeClient
+}
 
 /// <summary>Outcome of <see cref="AccountService.DeactivateAsync"/>.</summary>
 public enum AccountDeactivationOutcome

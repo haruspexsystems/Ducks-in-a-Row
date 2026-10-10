@@ -54,10 +54,11 @@ var viewIids = new (string Name, Guid Iid)[]
 };
 
 // Issue #169: revocation (PR #202) dispatches through CertAdminClass, so the
-// net10 upgrade gate needs its activation and QI facts too. QI only, never a
-// method call: every CertAdmin method mutates a live CA (RevokeCertificate
-// and friends), so unlike the CertView invocation probe there is no safe
-// method to exercise. IIDs from certadm.h.
+// net10 upgrade gate needs its activation and QI facts too. This block is QI
+// only. The rights block further down (issue #440) calls the two CertAdmin
+// methods that only read, ICertAdmin2::GetMyRoles and ICertAdmin2::GetCAProperty;
+// the ones that change a live CA (RevokeCertificate and friends) are never
+// called anywhere in this tool. IIDs from certadm.h.
 var adminIids = new (string Name, Guid Iid)[]
 {
     ("IUnknown",    new Guid("00000000-0000-0000-c000-000000000046")),
@@ -104,6 +105,42 @@ else
 {
     Console.WriteLine($"  CA config: {caConfig}");
     ColumnProbe.Run(caConfig);
+}
+
+// CRL retrieval probe: what the CA will say about its own CRLs, whether the CA
+// database's CRL table is reachable, and whether this host can read a published
+// CRL back out of a distribution point. See CrlProbe for the four questions and
+// why a single tier lab can only answer three of them.
+Console.WriteLine();
+Console.WriteLine("=== CRL retrieval probe (issue #447) ===");
+if (string.IsNullOrWhiteSpace(caConfig))
+{
+    Console.WriteLine("  Skipped: set CERTUS_PROBE_CA=\"<host>\\<CA name>\" to enable.");
+}
+else
+{
+    Console.WriteLine($"  CA config: {caConfig}");
+    CrlProbe.Run(caConfig);
+}
+
+// Service rights probe: what the CA and the directory let this process's
+// account do. Opt in on top of CERTUS_PROBE_CA, because the ship lab gate sets
+// that variable on every run and has no use for these reads. See RightsProbe
+// for the questions and why its directory half only runs as SYSTEM.
+Console.WriteLine();
+Console.WriteLine("=== Service rights probe (issue #440) ===");
+if (string.IsNullOrWhiteSpace(caConfig))
+{
+    Console.WriteLine("  Skipped: set CERTUS_PROBE_CA=\"<host>\\<CA name>\" to enable.");
+}
+else if (Environment.GetEnvironmentVariable("CERTUS_PROBE_RIGHTS") != "1")
+{
+    Console.WriteLine("  Skipped: set CERTUS_PROBE_RIGHTS=1 as well to enable.");
+}
+else
+{
+    Console.WriteLine($"  CA config: {caConfig}");
+    RightsProbe.Run(caConfig);
 }
 
 static void RunCoclass(string label, Guid clsid, (string Name, Guid Iid)[] iids)
@@ -472,6 +509,23 @@ internal static class ColumnProbe
         {
             int dispIdx = (int)view.GetColumnIndex(SchemaColumn, "Disposition");
             view.SetRestriction(dispIdx, SeekEqual, SortNone, DbDispositionPending);
+
+            int submittedIdx = (int)view.GetColumnIndex(SchemaColumn, "SubmittedWhen");
+            object cutoff = DateTime.UtcNow.AddDays(-30);
+            view.SetRestriction(submittedIdx, SeekGreaterOrEqual, SortNone, cutoff);
+        });
+
+        // The same bounded shape on 8, so one lab run answers the question
+        // whichever way the disposition falls. The pass above proves the bound
+        // the sync ships only if a pending request really is 9; if the
+        // disambiguation pass shows the CA parks it at 8 instead, the sync has
+        // to restrict on 8, and then this is the combination it would use.
+        // Without it, an answer of 8 costs a second visit to the lab CA to
+        // prove a restriction we could have proved in the same run.
+        RunPass(caConfig, "Disposition=8 AND SubmittedWhen>=now-30d", view =>
+        {
+            int dispIdx = (int)view.GetColumnIndex(SchemaColumn, "Disposition");
+            view.SetRestriction(dispIdx, SeekEqual, SortNone, DbDispositionActive);
 
             int submittedIdx = (int)view.GetColumnIndex(SchemaColumn, "SubmittedWhen");
             object cutoff = DateTime.UtcNow.AddDays(-30);

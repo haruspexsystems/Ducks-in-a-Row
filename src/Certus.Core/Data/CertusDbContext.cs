@@ -30,6 +30,11 @@ public class CertusDbContext : DbContext
     // Phase 7: Alert deduplication tracking
     public DbSet<AlertSent> AlertsSent => Set<AlertSent>();
 
+    // CRL monitoring (issue #447): the last state of every CRL being watched,
+    // and the alerts already sent about each one
+    public DbSet<MonitoredCrl> MonitoredCrls => Set<MonitoredCrl>();
+    public DbSet<CrlAlertSent> CrlAlertsSent => Set<CrlAlertSent>();
+
     // Domain policy audit: orders refused by the allowed domain list
     public DbSet<DomainPolicyRejection> DomainPolicyRejections => Set<DomainPolicyRejection>();
 
@@ -94,6 +99,13 @@ public class CertusDbContext : DbContext
             entity.Property(e => e.Status).HasMaxLength(20).IsRequired().HasDefaultValue("pending");
             entity.Property(e => e.TemplateId).HasMaxLength(200).IsRequired();
             entity.Property(e => e.IdentifiersJson).IsRequired();
+            entity.Property(e => e.ReplacesCertificateId).HasMaxLength(128);
+            // The alreadyReplaced dedup (RFC 9773 §5) seeks on this per
+            // new-order. Partial, because the column is null on every order
+            // that names no replacement: a full index would make every order
+            // insert on every install maintain an entry it can never match.
+            entity.HasIndex(e => e.ReplacesCertificateId)
+                .HasFilter("\"ReplacesCertificateId\" IS NOT NULL");
 
             // Widens the index EF creates for the AccountId foreign key below
             // so the same one also covers CreatedAt. The account list reads
@@ -224,6 +236,47 @@ public class CertusDbContext : DbContext
                 .WithMany()
                 .HasForeignKey(e => e.CertificateId)
                 .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<MonitoredCrl>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+
+            // One row per copy of a CRL. The source is part of the key because
+            // two copies of one CRL can disagree, and that disagreement is the
+            // failure this feature exists to catch.
+            entity.HasIndex(e => new { e.Scope, e.IssuerKeyId, e.Kind, e.Source }).IsUnique();
+
+            entity.Property(e => e.Scope).HasMaxLength(10).IsRequired();
+            entity.Property(e => e.IssuerKeyId).HasMaxLength(64).IsRequired();
+            entity.Property(e => e.IssuerName).HasMaxLength(512).IsRequired();
+            entity.Property(e => e.Kind).HasMaxLength(10).IsRequired();
+            entity.Property(e => e.Source).HasMaxLength(512).IsRequired();
+            entity.Property(e => e.CrlNumber).HasMaxLength(64);
+            entity.Property(e => e.InstanceKey).HasMaxLength(64);
+            entity.Property(e => e.SignatureStatus).HasMaxLength(20);
+            entity.Property(e => e.LastError).HasMaxLength(500);
+            entity.Property(e => e.ETag).HasMaxLength(200);
+        });
+
+        modelBuilder.Entity<CrlAlertSent>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+
+            // One alert per CRL instance per stage, whichever source it was read
+            // from, so two copies of one CRL do not both warn.
+            entity.HasIndex(e => new { e.IssuerKeyId, e.Kind, e.InstanceKey, e.Stage }).IsUnique();
+
+            // The history list reads newest first, like the leaf alert history.
+            entity.HasIndex(e => e.SentAt);
+
+            entity.Property(e => e.IssuerKeyId).HasMaxLength(64).IsRequired();
+            entity.Property(e => e.Kind).HasMaxLength(10).IsRequired();
+            entity.Property(e => e.InstanceKey).HasMaxLength(64).IsRequired();
+            entity.Property(e => e.Stage).HasMaxLength(20).IsRequired();
+            entity.Property(e => e.IssuerName).HasMaxLength(512).IsRequired();
+            entity.Property(e => e.Channels).HasMaxLength(50).IsRequired();
+            entity.Property(e => e.ErrorMessage).HasMaxLength(1000);
         });
 
         modelBuilder.Entity<DomainPolicyRejection>(entity =>

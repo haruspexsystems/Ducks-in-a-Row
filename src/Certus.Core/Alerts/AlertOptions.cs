@@ -57,6 +57,29 @@ public sealed class AlertOptions
     public const int DefaultExpiryWarningDays = 30;
 
     /// <summary>
+    /// Certificate revocation list monitoring (issue #447). On by default: it
+    /// is the reason to install rather than a revenue feature, and an estate
+    /// that does not want it can switch it off in one key.
+    ///
+    /// A nested block like Smtp and Webhook, and like Webhook it is not editable
+    /// from the dashboard. Unlike both, it is never null: an absent block means
+    /// the defaults, not off.
+    ///
+    /// The accessor defends that rather than trusting the initializer. The
+    /// configuration binder applies an explicit JSON null over a C# initializer,
+    /// which is the trap the configuration binding section of CLAUDE.md records
+    /// against `Certus:DatabasePath`, and here it would be a null reference on
+    /// every pass of the monitor rather than a wrong default.
+    /// </summary>
+    public CrlAlertOptions Crl
+    {
+        get => _crl ??= new CrlAlertOptions();
+        set => _crl = value ?? new CrlAlertOptions();
+    }
+
+    private CrlAlertOptions? _crl;
+
+    /// <summary>
     /// Thresholds in days before expiry that trigger alerts.
     /// An alert fires the first time a certificate crosses each threshold.
     /// Effective default: 30, 14, 7, 1 days, applied by NormalizeThresholdDays.
@@ -276,7 +299,7 @@ public sealed class SmtpOptions
     public string? PasswordProtected { get; set; }
 
     /// <summary>Sender email address.</summary>
-    public string FromAddress { get; set; } = "certus@localhost";
+    public string FromAddress { get; set; } = "ducks@localhost";
 
     /// <summary>Sender display name.</summary>
     public string FromName { get; set; } = "Ducks in a Row";

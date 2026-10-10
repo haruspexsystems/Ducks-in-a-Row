@@ -66,9 +66,35 @@ internal static class CaPropertyId
     public const int CaSigCertCount = 11;
     public const int CaSigCert = 12;
     public const int CaSigCertChain = 13;
+
+    // The CRL properties (issue #447). Every one of them was measured
+    // dispatching by name on lab 2019 on 2026-09-23; 46
+    // (CR_PROP_CRLPARTITIONCOUNT) is deliberately absent, because Server 2019
+    // refuses it with E_INVALIDARG and nothing here reads partitioned CRLs.
+    public const int BaseCrl = 17;
+    public const int DeltaCrl = 18;
+    public const int CrlState = 20;
+    public const int BaseCrlPublishStatus = 30;
+    public const int DeltaCrlPublishStatus = 31;
+    public const int CertCdpUrls = 41;
+
     public const int DnsName = 22;
     public const int Templates = 29;
     public const int SanitizedCaShortName = 40;
+}
+
+/// <summary>
+/// CA_DISP values, the disposition of a CA certificate or of the CRL signed
+/// with its key. Returned by CR_PROP_CRLSTATE and CR_PROP_CACERTSTATE, and not
+/// to be confused with <see cref="DbDisposition"/>, which describes a request
+/// row in the CA database and uses an entirely different numbering.
+/// </summary>
+internal static class CaDisposition
+{
+    public const int Error = 1;
+    public const int Revoked = 2;
+    public const int Valid = 3;
+    public const int Invalid = 4;
 }
 
 /// <summary>

@@ -87,6 +87,49 @@ public class AdcsColumnMappingTests
         AdcsClient.NormalizeColumnName(input).Should().Be(expected);
     }
 
+    // ── MapCertificateStatus and CarriesExplanation ─────────────────────
+
+    // The two statics the row mapping and GetRequestStatusAsync share (issue
+    // #365). Tested directly because the second caller reads one row out of a
+    // live CA view and has no seam of its own: this is where the logic behind
+    // that read can be proved without a CA.
+
+    [Theory]
+    [InlineData(20, CertificateStatus.Issued)]
+    [InlineData(21, CertificateStatus.Revoked)]
+    [InlineData(9, CertificateStatus.Pending)]
+    [InlineData(31, CertificateStatus.Denied)]
+    [InlineData(30, CertificateStatus.Failed)]
+    // Active (8) is a foreign key placeholder rather than a request outcome, and
+    // anything unrecognized reads as Failed like the Error disposition itself.
+    [InlineData(8, CertificateStatus.Failed)]
+    [InlineData(9999, CertificateStatus.Failed)]
+    public void MapCertificateStatus_TranslatesDbDispositions(int disposition, CertificateStatus expected)
+    {
+        AdcsClient.MapCertificateStatus(disposition).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData(CertificateStatus.Pending)]
+    [InlineData(CertificateStatus.Denied)]
+    [InlineData(CertificateStatus.Failed)]
+    public void CarriesExplanation_TrueWhereTheCaRecordsOne(CertificateStatus status)
+    {
+        AdcsClient.CarriesExplanation(status).Should().BeTrue();
+    }
+
+    [Theory]
+    [InlineData(CertificateStatus.Issued)]
+    [InlineData(CertificateStatus.Revoked)]
+    public void CarriesExplanation_FalseWhereItDoesNot(CertificateStatus status)
+    {
+        // An issued row carries "Issued" and a zero status code, which is noise
+        // rather than an explanation; a revoked row says nothing about the request
+        // at all. Letting either through would leave a stale message behind when a
+        // held request is finally approved.
+        AdcsClient.CarriesExplanation(status).Should().BeFalse();
+    }
+
     // ── MapToCertificateInfo ────────────────────────────────────────────
 
     [Theory]
@@ -285,6 +328,48 @@ public class AdcsColumnMappingTests
         info.Should().NotBeNull();
         info!.SubjectAlternativeNames.Should().Be(
             "dns:web01.example.com, dns:alt.example.com, ip:10.0.0.5");
+    }
+
+    // ── Skipping the parse for a row already captured (issue #184) ──────
+
+    [Fact]
+    public void MapToCertificateInfo_AlreadyDetailedRow_SkipsTheParseEntirely()
+    {
+        // The sweep re-parsed every certificate the CA had ever issued on every
+        // interval tick. A row the caller says it already holds all four
+        // products of comes back carrying none of them, which is the same shape
+        // a row with no blob has always produced.
+        var der = CreateCertificate("CN=web01.example.com", san => san.AddDnsName("web01.example.com"));
+        var row = IssuedRow();
+        row["RawCertificate"] = Convert.ToBase64String(der);
+
+        var info = CreateClient().MapToCertificateInfo(
+            row, EmptyTemplateMap, new HashSet<int> { 7 });
+
+        info.Should().NotBeNull();
+        info!.SubjectAlternativeNames.Should().BeNull();
+        info.CryptoDetail.Should().BeNull();
+        info.RawCertificate.Should().BeNull();
+        // The CA database columns still name the row; only the certificate's own
+        // subject, which is the last fallback, goes unread.
+        info.Subject.Should().Be("CN=web01.example.com");
+    }
+
+    [Fact]
+    public void MapToCertificateInfo_RowNotInTheSkipSet_StillParses()
+    {
+        var der = CreateCertificate("CN=web01.example.com", san => san.AddDnsName("web01.example.com"));
+        var row = IssuedRow();
+        row["RawCertificate"] = Convert.ToBase64String(der);
+
+        // A set that names a different request must not touch this one.
+        var info = CreateClient().MapToCertificateInfo(
+            row, EmptyTemplateMap, new HashSet<int> { 8 });
+
+        info.Should().NotBeNull();
+        info!.SubjectAlternativeNames.Should().Be("dns:web01.example.com");
+        info.CryptoDetail.Should().NotBeNull();
+        info.RawCertificate.Should().Equal(der);
     }
 
     [Fact]
@@ -503,24 +588,58 @@ public class AdcsColumnMappingTests
     }
 
     [Fact]
-    public void SubjectRendering_DoesNotReorderRdns()
+    public void MapToCertificateInfo_IssuedRow_KeepsTheCommonNameOfAnAdcsShapedSubject()
     {
-        // The measurement the CN preserving truncation rests on, pinned here
-        // rather than left as a claim in a comment. X509Certificate2.Subject is a
-        // straight passthrough of the encoded RDN sequence: it does not move the
-        // CN to the front. ADCS conventionally encodes general to specific, so a
-        // real issued subject has the CN last, which is exactly where a plain tail
-        // cut would destroy it. If a future runtime starts reversing the order,
-        // this fails and the sanitizer's reasoning needs revisiting.
-        var generalToSpecific = "C=US, S=Washington, O=Example Corp, OU=IT, CN=leaf.example.com";
-        var der = CreateCertificate(generalToSpecific, null);
+        // Replaces SubjectRendering_DoesNotReorderRdns, which could not fail
+        // (issue #297). That test built a name from a string and read
+        // X509Certificate2.Subject back, so it round tripped through the very
+        // pair whose direction was in question, and its "does not start with
+        // CN=" assertion was really a statement about its own input string.
+        //
+        // What belongs here instead is the mapping, measured against the shape a
+        // certificate authority actually issues. The fixture proves that shape
+        // before it tests anything: the encoded RDN sequence has to run general
+        // to specific, country first and common name last, or the assertion
+        // underneath is about something else. X500NameOrderingTests is where the
+        // platform mechanism itself is pinned, including why the builder takes
+        // its components in the opposite order to the one it encodes them in.
+        //
+        // The organisation name is padded so the whole subject is over the
+        // column, which puts the sanitizer's truncation in the path. On this
+        // shape the plain head cut already carries the common name, so the CN
+        // leading repair branch is skipped and the value stays in its real RDN
+        // order. That is the corrected premise in one assertion: the branch is
+        // not what saves this name.
+        var builder = new X500DistinguishedNameBuilder();
+        builder.AddCommonName("leaf.example.com");
+        builder.AddOrganizationalUnitName("IT");
+        builder.Add("2.5.4.10", new string('o', 600), UniversalTagNumber.UTF8String);
+        builder.AddCountryOrRegion("US");
+        var subject = builder.Build();
 
-        var parsed = CertificateDerParser.Parse(der);
+        subject.EnumerateRelativeDistinguishedNames(reversed: false)
+            .Select(rdn => rdn.GetSingleElementType().Value)
+            .Should().Equal(
+                new[] { "2.5.4.6", "2.5.4.10", "2.5.4.11", "2.5.4.3" },
+                "the fixture has to carry the general to specific encoding a real " +
+                "certificate authority emits, or this measures nothing");
 
-        parsed.Should().NotBeNull();
-        parsed!.Subject.Should().Be(generalToSpecific);
-        parsed.Subject.Should().NotStartWith("CN=",
-            "the CN is encoded last and nothing reorders it on the way back");
+        var row = IssuedRow();
+        // Both certificate authority columns cleared, so the mapping falls
+        // through to the parsed certificate and the value under test really is
+        // X509Certificate2.Subject rather than a hand written column.
+        row.Remove("DistinguishedName");
+        row.Remove("CommonName");
+        row["RawCertificate"] = Convert.ToBase64String(CreateCertificate(subject, null));
+
+        var info = CreateClient().MapToCertificateInfo(row, EmptyTemplateMap);
+
+        info.Should().NotBeNull();
+        info!.Subject.Should().StartWith(
+            "CN=leaf.example.com, OU=IT, O=ooo",
+            "a general to specific encoding renders common name first, so the head " +
+            "cut keeps the name without the repair branch running");
+        info.Subject.Should().HaveLength(CertificateTextSanitizer.MaxSubjectLength);
     }
 
     [Fact]
@@ -697,11 +816,22 @@ public class AdcsColumnMappingTests
     // CertificateDerParserTests; what belongs here is that the mapping wires it
     // through, which the two CryptoDetail cases above assert.
 
-    private static byte[] CreateCertificate(string subject, Action<SubjectAlternativeNameBuilder>? sanSetup)
+    private static byte[] CreateCertificate(string subject, Action<SubjectAlternativeNameBuilder>? sanSetup) =>
+        CreateCertificate(new X500DistinguishedName(subject), sanSetup);
+
+    /// <summary>
+    /// The same, for a name built relative distinguished name by relative
+    /// distinguished name rather than parsed from a string. A caller that cares
+    /// about the encoded order needs this one: the string constructor reverses
+    /// what it is given, so a name written common name first is encoded common
+    /// name last (see X500NameOrderingTests).
+    /// </summary>
+    private static byte[] CreateCertificate(
+        X500DistinguishedName subject, Action<SubjectAlternativeNameBuilder>? sanSetup)
     {
         using var key = RSA.Create(2048);
         var request = new CertificateRequest(
-            new X500DistinguishedName(subject),
+            subject,
             key,
             HashAlgorithmName.SHA256,
             RSASignaturePadding.Pkcs1);

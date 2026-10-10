@@ -6,8 +6,10 @@ using Certus.Core.Configuration;
 using Certus.Core.Data;
 using Certus.Core.Data.Entities;
 using Certus.Core.Services;
+using System.Data.Common;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -25,7 +27,101 @@ public class CertificateSyncServiceTests : IDisposable
     private readonly SqliteConnection _connection;
     private readonly ServiceProvider _serviceProvider;
     private readonly IAdcsClient _adcs;
+    private readonly SyncedCertificateStatementCounter _sql = new();
     private readonly List<IServiceScope> _scopes = new();
+
+    /// <summary>
+    /// Counts statements against SyncedCertificates as they go to SQLite, split
+    /// into the writes and the reads.
+    ///
+    /// Needed because both sides of the sync's cheap path are invisible from the
+    /// data. A row the CA still describes exactly as stored is never loaded and
+    /// never tracked, and the one write it still earns sets the same LastSyncedAt
+    /// the expensive path sets, so every assertion on the resulting row passes
+    /// whether the optimisation ran or not.
+    ///
+    /// The two counts answer two different issues and neither stands in for the
+    /// other. Updates covers issue #184: a build that went back to a full load and
+    /// write per row. Reads covers issue #191, the per row FirstOrDefaultAsync,
+    /// which the update count cannot see at all, because a per row read followed
+    /// by the same batched ExecuteUpdate writes exactly the same statements.
+    ///
+    /// Statements rather than commands, because EF packs several into one command
+    /// text, and that is the number both issues are about.
+    ///
+    /// FROM rather than SELECT is the read needle, because EF puts the projection
+    /// list ahead of the table name, so a SELECT prefix could not tell one table
+    /// from another. Nothing in the product deletes a SyncedCertificate, so a
+    /// DELETE FROM cannot inflate the count today, and if a sweep ever adds one,
+    /// counting its read of the table is the answer we want anyway.
+    /// </summary>
+    private sealed class SyncedCertificateStatementCounter : DbCommandInterceptor
+    {
+        private const string UpdateNeedle = "UPDATE \"SyncedCertificates\"";
+        private const string ReadNeedle = "FROM \"SyncedCertificates\"";
+
+        private int _updates;
+        private int _reads;
+
+        public int Updates => Volatile.Read(ref _updates);
+
+        public int Reads => Volatile.Read(ref _reads);
+
+        public void Reset()
+        {
+            Volatile.Write(ref _updates, 0);
+            Volatile.Write(ref _reads, 0);
+        }
+
+        private void Count(DbCommand command)
+        {
+            var text = command.CommandText;
+            Add(ref _updates, text, UpdateNeedle);
+            Add(ref _reads, text, ReadNeedle);
+        }
+
+        private static void Add(ref int counter, string text, string needle)
+        {
+            var found = 0;
+            for (var i = text.IndexOf(needle, StringComparison.Ordinal); i >= 0;
+                 i = text.IndexOf(needle, i + needle.Length, StringComparison.Ordinal))
+            {
+                found++;
+            }
+            if (found > 0)
+                Interlocked.Add(ref counter, found);
+        }
+
+        public override InterceptionResult<DbDataReader> ReaderExecuting(
+            DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
+        {
+            Count(command);
+            return result;
+        }
+
+        public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+            DbCommand command, CommandEventData eventData,
+            InterceptionResult<DbDataReader> result, CancellationToken cancellationToken = default)
+        {
+            Count(command);
+            return ValueTask.FromResult(result);
+        }
+
+        public override InterceptionResult<int> NonQueryExecuting(
+            DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
+        {
+            Count(command);
+            return result;
+        }
+
+        public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+            DbCommand command, CommandEventData eventData,
+            InterceptionResult<int> result, CancellationToken cancellationToken = default)
+        {
+            Count(command);
+            return ValueTask.FromResult(result);
+        }
+    }
 
     public CertificateSyncServiceTests()
     {
@@ -36,7 +132,7 @@ public class CertificateSyncServiceTests : IDisposable
 
         var services = new ServiceCollection();
         services.AddDbContext<CertusDbContext>(options =>
-            options.UseSqlite(_connection));
+            options.UseSqlite(_connection).AddInterceptors(_sql));
 
         _serviceProvider = services.BuildServiceProvider();
 
@@ -689,6 +785,252 @@ public class CertificateSyncServiceTests : IDisposable
         row.RevokedReason.Should().BeNull();
     }
 
+    // ---- Releasing a hold clears the ACME stamp too (issue #375) ----------
+    //
+    // The test above covers the inventory row, which has always healed itself.
+    // These cover the other row, AcmeCertificates.RevokedAt, which nothing
+    // healed: renewalInfo answered a renew now window off that stamp for the
+    // certificate's whole remaining life, and revoke-cert kept refusing as
+    // alreadyRevoked.
+    //
+    // Five of the six are refusals, because the costly mistake here is clearing
+    // a stamp that should have stood. Each one holds exactly one term of the
+    // predicate and passes only because of it, so reverting that term fails it.
+
+    private const int HeldRequestId = 30;
+
+    /// <summary>
+    /// An ACME certificate bridged to a CA request id, carrying a revocation
+    /// stamp unless <paramref name="revokedAt"/> says otherwise. Separate from
+    /// <see cref="SeedAcmeCertificateAsync"/>, which fixes the request id at 999
+    /// because its own tests bridge on the serial instead.
+    /// </summary>
+    private async Task SeedBridgedAcmeCertificateAsync(
+        int adcsRequestId, DateTime? revokedAt, int? revokedReason = 6)
+    {
+        var db = GetDb();
+        var account = new AcmeAccount
+        {
+            AccountId = $"acct-{adcsRequestId}",
+            JwkJson = "{}",
+            JwkThumbprint = $"thumb-{adcsRequestId}",
+        };
+        var order = new AcmeOrder
+        {
+            OrderId = $"order-{adcsRequestId}",
+            Account = account,
+            Status = "valid",
+            TemplateId = "WebServer",
+            IdentifiersJson = "[]",
+            ExpiresAt = DateTime.UtcNow.AddDays(7),
+            CertificateId = $"cert-{adcsRequestId}",
+        };
+        db.AcmeCertificates.Add(new AcmeCertificate
+        {
+            CertificateId = $"cert-{adcsRequestId}",
+            Order = order,
+            CertificatePem = "pem",
+            AdcsRequestId = adcsRequestId,
+            SerialNumber = $"SERIAL{adcsRequestId:D4}",
+            RevokedAt = revokedAt,
+            RevokedReason = revokedAt == null ? null : revokedReason,
+        });
+        await db.SaveChangesAsync();
+    }
+
+    /// <summary>The inventory row the bridge lands on, as a held certificate.</summary>
+    private async Task SeedHeldInventoryRowAsync(
+        int requestId, string status = "Revoked", DateTime? lastSyncedAt = null)
+    {
+        var db = GetDb();
+        db.SyncedCertificates.Add(new SyncedCertificate
+        {
+            RequestId = requestId,
+            SerialNumber = $"SERIAL{requestId:D4}",
+            Subject = "CN=held.example.com",
+            TemplateName = "WebServer",
+            NotBefore = DateTime.UtcNow.AddDays(-30),
+            NotAfter = DateTime.UtcNow.AddDays(335),
+            Status = status,
+            RequestDate = DateTime.UtcNow.AddDays(-30),
+            RevokedAt = status == "Revoked" ? DateTime.UtcNow.AddDays(-7) : null,
+            RevokedReason = status == "Revoked" ? 6 : null,
+            LastSyncedAt = lastSyncedAt ?? DateTime.UtcNow,
+        });
+        await db.SaveChangesAsync();
+    }
+
+    private async Task<AcmeCertificate> ReadBridgedAcmeCertificateAsync(int adcsRequestId)
+    {
+        var db = GetDb();
+        return await db.AcmeCertificates.AsNoTracking()
+            .SingleAsync(a => a.AdcsRequestId == adcsRequestId);
+    }
+
+    [Fact]
+    public async Task Sync_CertReleasedFromHold_ClearsTheAcmeStamp()
+    {
+        // The fix itself. The CA reports the held certificate issued again, so
+        // the stamp the revocation left is no longer the CA's answer.
+        await SeedHeldInventoryRowAsync(HeldRequestId);
+        await SeedBridgedAcmeCertificateAsync(HeldRequestId, DateTime.UtcNow.AddDays(-7));
+
+        SetCaCertificates(
+            issued: new[] { Cert(HeldRequestId, "CN=held.example.com", CertificateStatus.Issued) },
+            revoked: Array.Empty<CertificateInfo>());
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        var acme = await ReadBridgedAcmeCertificateAsync(HeldRequestId);
+        acme.RevokedAt.Should().BeNull();
+        acme.RevokedReason.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task Sync_CertStillRevokedAtTheCa_KeepsTheAcmeStamp()
+    {
+        // The ordinary case, and the one that must never move: the CA still
+        // reports the certificate revoked, so the stamp is still its answer.
+        var stampedAt = DateTime.UtcNow.AddDays(-7);
+        await SeedHeldInventoryRowAsync(HeldRequestId);
+        await SeedBridgedAcmeCertificateAsync(HeldRequestId, stampedAt);
+
+        SetCaCertificates(
+            issued: Array.Empty<CertificateInfo>(),
+            revoked: new[] { Cert(HeldRequestId, "CN=held.example.com", CertificateStatus.Revoked) });
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        var acme = await ReadBridgedAcmeCertificateAsync(HeldRequestId);
+        acme.RevokedAt.Should().NotBeNull();
+        acme.RevokedReason.Should().Be(6);
+    }
+
+    [Fact]
+    public async Task Sync_IssuedRowStillCarryingARevocationInstant_KeepsTheAcmeStamp()
+    {
+        // Holds the inventory RevokedAt term, which the Issued allow list does
+        // not already cover. UpdateEntity writes the disposition and the
+        // revocation instant from the CA independently, so a CA that reports a
+        // row issued while still carrying a revocation instant produces a row
+        // that is Issued and freshly synced and yet contradicts itself. It is
+        // not the unambiguous release this repair requires.
+        await SeedHeldInventoryRowAsync(HeldRequestId);
+        await SeedBridgedAcmeCertificateAsync(HeldRequestId, DateTime.UtcNow.AddDays(-7));
+
+        var contradictory = Cert(HeldRequestId, "CN=held.example.com", CertificateStatus.Issued)
+            with { RevokedWhen = DateTime.UtcNow.AddDays(-7) };
+        SetCaCertificates(issued: new[] { contradictory }, revoked: Array.Empty<CertificateInfo>());
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        var inventory = await GetDb().SyncedCertificates
+            .AsNoTracking().SingleAsync(s => s.RequestId == HeldRequestId);
+        inventory.Status.Should().Be("Issued", "the row has to be the contradictory shape to test");
+        inventory.RevokedAt.Should().NotBeNull("the row has to be the contradictory shape to test");
+
+        var acme = await ReadBridgedAcmeCertificateAsync(HeldRequestId);
+        acme.RevokedAt.Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task Sync_RowTheCaDidNotReturn_KeepsTheAcmeStamp()
+    {
+        // Holds the LastSyncedAt term. The inventory row already looks released
+        // (Issued, no revocation) and the ACME row is still stamped, which is
+        // exactly the stuck state this repair exists for. It is still refused,
+        // because the CA said nothing about it this cycle and a stale row is
+        // not evidence. Repair waits for the CA to confirm.
+        await SeedHeldInventoryRowAsync(
+            HeldRequestId, status: "Issued", lastSyncedAt: DateTime.UtcNow.AddDays(-1));
+        await SeedBridgedAcmeCertificateAsync(HeldRequestId, DateTime.UtcNow.AddDays(-7));
+
+        SetCaCertificates(issued: Array.Empty<CertificateInfo>(), revoked: Array.Empty<CertificateInfo>());
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        var acme = await ReadBridgedAcmeCertificateAsync(HeldRequestId);
+        acme.RevokedAt.Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task Sync_RequestRowDisposition_KeepsTheAcmeStamp()
+    {
+        // Holds the Issued allow list. The CA returns the request id in a
+        // disposition that carries no live certificate, so it says nothing
+        // about whether the certificate is revoked and must clear nothing.
+        // Written against Denied rather than "not Revoked" so a disposition
+        // added later inherits the refusal.
+        await SeedHeldInventoryRowAsync(HeldRequestId);
+        await SeedBridgedAcmeCertificateAsync(HeldRequestId, DateTime.UtcNow.AddDays(-7));
+
+        SetCaCertificates(issued: Array.Empty<CertificateInfo>(), revoked: Array.Empty<CertificateInfo>());
+        SetCaRequests(CertificateStatus.Denied,
+            new[] { RequestRow(HeldRequestId, CertificateStatus.Denied) });
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        var acme = await ReadBridgedAcmeCertificateAsync(HeldRequestId);
+        acme.RevokedAt.Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task Sync_AcmeRowWithNoCaRequestId_KeepsTheAcmeStamp()
+    {
+        // Holds the identity guard. An unset request id selects by an unset
+        // value rather than by identity, so a freshly issued row that also
+        // carries request id zero must not reach across to it.
+        await SeedBridgedAcmeCertificateAsync(adcsRequestId: 0, DateTime.UtcNow.AddDays(-7));
+
+        SetCaCertificates(
+            issued: new[] { Cert(0, "CN=unrelated.example.com", CertificateStatus.Issued) },
+            revoked: Array.Empty<CertificateInfo>());
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        var acme = await ReadBridgedAcmeCertificateAsync(0);
+        acme.RevokedAt.Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task Sync_RevocationLandingMidCycle_KeepsTheAcmeStamp()
+    {
+        // Holds the passesStartedAt term, and the reason it is not merely
+        // defensive. The CA answered "issued" for this certificate, and only
+        // afterwards did a revocation land and stamp the row. That CA reading
+        // predates the revocation, so it is not evidence about it, and clearing
+        // on it would silently undo a revocation the CA has already performed.
+        //
+        // The stamp is written from a second scope while the issued pass is
+        // being answered, which is where a real revoke-cert would write it.
+        await SeedHeldInventoryRowAsync(HeldRequestId, status: "Issued");
+        await SeedBridgedAcmeCertificateAsync(HeldRequestId, revokedAt: null);
+
+        SetCaCertificates(issued: Array.Empty<CertificateInfo>(), revoked: Array.Empty<CertificateInfo>());
+        _adcs.QueryCertificatesAsync(
+                Arg.Is<CertificateQuery>(q => q.Status == CertificateStatus.Issued),
+                Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                var db = GetDb();
+                var row = db.AcmeCertificates.Single(a => a.AdcsRequestId == HeldRequestId);
+                row.RevokedAt = DateTime.UtcNow;
+                row.RevokedReason = 1;
+                db.SaveChanges();
+
+                return (IReadOnlyList<CertificateInfo>)new[]
+                {
+                    Cert(HeldRequestId, "CN=held.example.com", CertificateStatus.Issued),
+                };
+            });
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        var acme = await ReadBridgedAcmeCertificateAsync(HeldRequestId);
+        acme.RevokedAt.Should().NotBeNull("a revocation the CA data predates must survive the sweep");
+        acme.RevokedReason.Should().Be(1);
+    }
+
     [Fact]
     public async Task Sync_ReturnsProcessedCreatedAndUpdatedCounts()
     {
@@ -946,6 +1288,131 @@ public class CertificateSyncServiceTests : IDisposable
         row.Subject.Should().Be("CN=moc.live");
     }
 
+    // ---- The template column takes the same guard (issue #378) ------------
+    //
+    // A different exposure from the subject above it, although the same strip:
+    // this value is compared by RevocationEligibilityService and carried out of
+    // the process by the expiry mail and the webhook notifier, so it is not only
+    // a screen.
+
+    /// <summary>A CA row whose template carries the poison, subject clean.</summary>
+    private static CertificateInfo WithTemplate(int requestId, string templateName) =>
+        Cert(requestId, $"CN=tmpl{requestId:D4}.example.com", CertificateStatus.Issued)
+            with { TemplateName = templateName };
+
+    [Fact]
+    public async Task Sync_PoisonedTemplateFromTheClient_IsSanitizedOnTheWayIn()
+    {
+        // The client interface, not the real client, for the reason the subject
+        // test above gives: AdcsClient strips what it reads, but MockAdcsClient
+        // is a real IAdcsClient in both hosts and does not, so the guard has to
+        // hold at the writer.
+        var rlo = (char)0x202e;
+
+        SetCaCertificates(
+            issued: new[] { WithTemplate(60, "Web" + rlo + "Server") },
+            revoked: Array.Empty<CertificateInfo>());
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        var row = await GetDb().SyncedCertificates.SingleAsync(c => c.RequestId == 60);
+        row.TemplateName.Should().Be("WebServer");
+    }
+
+    [Fact]
+    public async Task Sync_OverWideTemplate_IsBoundedToTheColumn()
+    {
+        // SQLite does not enforce the declared width, and this column is indexed.
+        SetCaCertificates(
+            issued: new[] { WithTemplate(61, new string('x', 9000)) },
+            revoked: Array.Empty<CertificateInfo>());
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        var row = await GetDb().SyncedCertificates.SingleAsync(c => c.RequestId == 61);
+        row.TemplateName.Should().HaveLength(CertificateTextSanitizer.MaxTemplateNameLength);
+    }
+
+    [Fact]
+    public async Task Sync_TemplateThatSanitizesAwayEntirely_StoresTheEmptyString()
+    {
+        // The column is declared required, and the sanitizer answers null when
+        // nothing usable survives, so the writer has to coalesce or the sync
+        // faults on a row the CA is perfectly happy with.
+        SetCaCertificates(
+            issued: new[] { WithTemplate(62, "\u202e\u200b\u2028") },
+            revoked: Array.Empty<CertificateInfo>());
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        var row = await GetDb().SyncedCertificates.SingleAsync(c => c.RequestId == 62);
+        row.TemplateName.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task Sync_ExistingPoisonedTemplateRow_IsRewrittenOnTheNextPass()
+    {
+        // Why this needs no startup sweep where issue #224 needed one for
+        // subjects: IsUnchanged compares the stored value against the sanitized
+        // incoming one, so a row stored before this fix reads as changed exactly
+        // once, is rewritten clean, and is cheap from then on.
+        var rlo = (char)0x202e;
+
+        var seed = GetDb();
+        seed.SyncedCertificates.Add(new SyncedCertificate
+        {
+            RequestId = 63,
+            SerialNumber = "SERIAL0063",
+            Subject = "CN=tmpl0063.example.com",
+            TemplateName = "Web" + rlo + "Server",
+            NotBefore = DateTime.UtcNow.AddDays(-30),
+            NotAfter = DateTime.UtcNow.AddDays(335),
+            Status = "Issued",
+            RequestDate = DateTime.UtcNow.AddDays(-30),
+        });
+        await seed.SaveChangesAsync();
+
+        SetCaCertificates(
+            issued: new[] { WithTemplate(63, "Web" + rlo + "Server") },
+            revoked: Array.Empty<CertificateInfo>());
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        var row = await GetDb().SyncedCertificates.SingleAsync(c => c.RequestId == 63);
+        row.TemplateName.Should().Be("WebServer");
+    }
+
+    [Fact]
+    public async Task Sync_PoisonedTemplateSteadyState_StillTakesTheCheapPath()
+    {
+        // The half the assertions above cannot make, and the reason IsUnchanged
+        // sanitizes the incoming value rather than comparing it raw. The stored
+        // name is clean and the CA keeps handing back the poisoned one, so a raw
+        // comparison calls every row changed on every cycle, for ever: the row is
+        // loaded, rewritten, and reported as moved, which is exactly the per row
+        // cost issue #184 removed. The data cannot show it, because both paths
+        // leave the same clean value behind.
+        var rlo = (char)0x202e;
+        const int rows = 250;
+        var issued = Enumerable.Range(1, rows)
+            .Select(i => FullyDetailed(i, $"CN=poison{i:D4}.example.com")
+                with { TemplateName = "Web" + rlo + "Server" })
+            .ToArray();
+        SetCaCertificates(issued: issued, revoked: Array.Empty<CertificateInfo>());
+
+        var sut = CreateService();
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        _sql.Reset();
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        _sql.Updates.Should().BeGreaterThan(0, "the rows were still seen");
+        _sql.Updates.Should().BeLessThan(10,
+            "the poisoned name sanitizes to what is already stored, so nothing moved");
+        (await GetDb().SyncedCertificates.CountAsync(c => c.TemplateName == "WebServer"))
+            .Should().Be(rows);
+    }
+
     [Fact]
     public async Task Sync_EmptySubjectRow_SanitizesTheBackfilledPemSubject()
     {
@@ -1094,13 +1561,18 @@ public class CertificateSyncServiceTests : IDisposable
             JwkJson = "{}",
             JwkThumbprint = $"thumb-{serialNumber}",
         };
+        // "valid" with a matching CertificateId is the only shape a stored certificate
+        // can have in production; see the same note in CertificateQueryServiceTests
+        // (issue #318).
         var order = new AcmeOrder
         {
             OrderId = $"order-{serialNumber}",
             Account = account,
+            Status = "valid",
             TemplateId = "WebServer",
             IdentifiersJson = identifiersJson,
             ExpiresAt = DateTime.UtcNow.AddDays(7),
+            CertificateId = $"cert-{serialNumber}",
         };
         db.AcmeCertificates.Add(new AcmeCertificate
         {
@@ -1290,6 +1762,497 @@ public class CertificateSyncServiceTests : IDisposable
 
         sut.LastAttempt.Should().BeNull();
         sut.LastSuccess.Should().BeNull();
+    }
+
+    // ── Skipping work for rows already captured (issue #184) ────────────
+
+    /// <summary>
+    /// A certificate reading with everything the DER parse produces, so a row
+    /// synced from it satisfies every term of the skip predicate.
+    /// </summary>
+    private static CertificateInfo FullyDetailed(int requestId, string subject) =>
+        Cert(requestId, subject, CertificateStatus.Issued) with
+        {
+            SubjectAlternativeNames = "dns:full.example.com",
+            CryptoDetail = new CertificateCryptoDetail(
+                KeyAlgorithm: "RSA",
+                KeySizeBits: 2048,
+                SignatureAlgorithmOid: "1.2.840.113549.1.1.11",
+                Sha256Thumbprint: $"THUMB{requestId:D4}",
+                ExtendedKeyUsageOids: "1.3.6.1.5.5.7.3.1",
+                KeyUsage: 5),
+            RawCertificate = TestDer((byte)requestId)
+        };
+
+    [Fact]
+    public async Task Sync_AsksTheCaToSkipDetailForARowAlreadyFullyDetailed()
+    {
+        // The whole point of the issue: the sweep re-parsed every certificate
+        // the CA had ever issued on every interval tick, to reproduce values
+        // that were stored the first time and cannot legitimately change.
+        var cert = FullyDetailed(50, "CN=detailed.example.com");
+        SetCaCertificates(issued: new[] { cert }, revoked: Array.Empty<CertificateInfo>());
+
+        var sut = CreateService();
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        // First cycle created the row, so it could not have been in the set.
+        await _adcs.Received(1).QueryCertificatesAsync(
+            Arg.Is<CertificateQuery>(q =>
+                q.Status == CertificateStatus.Issued &&
+                (q.AlreadyDetailed == null || !q.AlreadyDetailed.Contains(50))),
+            Arg.Any<CancellationToken>());
+
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        await _adcs.Received(1).QueryCertificatesAsync(
+            Arg.Is<CertificateQuery>(q =>
+                q.Status == CertificateStatus.Issued &&
+                q.AlreadyDetailed != null &&
+                q.AlreadyDetailed.Contains(50)),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task Sync_StillParsesARowStoredBeforeTheDerColumnExisted()
+    {
+        // The trap the obvious version of this optimisation falls into. The
+        // crypto columns and the DER column arrived in separate migrations four
+        // days apart, so a database that synced between them holds a row with
+        // full crypto detail and a null blob. Skipping it on the strength of its
+        // crypto columns would strand it with nothing to download, for ever,
+        // because the write once assignment in UpdateEntity is the only thing
+        // that ever fills that column.
+        var seed = GetDb();
+        seed.SyncedCertificates.Add(new SyncedCertificate
+        {
+            RequestId = 51,
+            SerialNumber = "SERIAL0051",
+            Subject = "CN=preblob.example.com",
+            TemplateName = "WebServer",
+            NotBefore = DateTime.UtcNow.AddDays(-10),
+            NotAfter = DateTime.UtcNow.AddDays(355),
+            Status = "Issued",
+            RequestDate = DateTime.UtcNow.AddDays(-10),
+            KeyAlgorithm = "RSA",
+            KeySizeBits = 2048,
+            SignatureAlgorithmOid = "1.2.840.113549.1.1.11",
+            Sha256Thumbprint = "THUMB0051",
+            ExtendedKeyUsageOids = "1.3.6.1.5.5.7.3.1",
+            KeyUsage = 5,
+            RawCertificate = null
+        });
+        await seed.SaveChangesAsync();
+
+        var der = TestDer(51);
+        SetCaCertificates(
+            issued: new[] { FullyDetailed(51, "CN=preblob.example.com") with { RawCertificate = der } },
+            revoked: Array.Empty<CertificateInfo>());
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        await _adcs.Received().QueryCertificatesAsync(
+            Arg.Is<CertificateQuery>(q =>
+                q.Status == CertificateStatus.Issued &&
+                (q.AlreadyDetailed == null || !q.AlreadyDetailed.Contains(51))),
+            Arg.Any<CancellationToken>());
+
+        (await GetDb().SyncedCertificates.SingleAsync(c => c.RequestId == 51))
+            .RawCertificate.Should().Equal(der);
+    }
+
+    [Fact]
+    public async Task Sync_StillParsesARowWhoseSubjectIsStillBlank()
+    {
+        // The parsed subject is the last link in the chain that names a row, so
+        // a row the CA has never managed to name has to keep being offered it.
+        var seed = GetDb();
+        seed.SyncedCertificates.Add(new SyncedCertificate
+        {
+            RequestId = 52,
+            SerialNumber = "SERIAL0052",
+            Subject = "",
+            TemplateName = "WebServer",
+            NotBefore = DateTime.UtcNow.AddDays(-10),
+            NotAfter = DateTime.UtcNow.AddDays(355),
+            Status = "Issued",
+            RequestDate = DateTime.UtcNow.AddDays(-10),
+            Sha256Thumbprint = "THUMB0052",
+            RawCertificate = TestDer(52)
+        });
+        await seed.SaveChangesAsync();
+
+        SetCaCertificates(issued: new[] { FullyDetailed(52, "") }, revoked: Array.Empty<CertificateInfo>());
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        await _adcs.Received().QueryCertificatesAsync(
+            Arg.Is<CertificateQuery>(q =>
+                q.Status == CertificateStatus.Issued &&
+                (q.AlreadyDetailed == null || !q.AlreadyDetailed.Contains(52))),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task Sync_SkippedRow_KeepsTheDetailTheFirstPassCaptured()
+    {
+        // What a skipped pass looks like coming back: null SANs, null crypto,
+        // null blob, and a subject the CA database columns could not supply.
+        // That is the same shape a row whose blob was missing has always had,
+        // and every writer in UpdateEntity already guards against it.
+        var cert = FullyDetailed(53, "CN=survives.example.com");
+        SetCaCertificates(issued: new[] { cert }, revoked: Array.Empty<CertificateInfo>());
+
+        var sut = CreateService();
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        SetCaCertificates(
+            issued: new[]
+            {
+                cert with
+                {
+                    Subject = "",
+                    SubjectAlternativeNames = null,
+                    CryptoDetail = null,
+                    RawCertificate = null
+                }
+            },
+            revoked: Array.Empty<CertificateInfo>());
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        var row = await GetDb().SyncedCertificates.SingleAsync(c => c.RequestId == 53);
+        row.Subject.Should().Be("CN=survives.example.com");
+        row.SubjectAlternativeNames.Should().Be("dns:full.example.com");
+        row.KeyAlgorithm.Should().Be("RSA");
+        row.KeySizeBits.Should().Be(2048);
+        row.SignatureAlgorithmOid.Should().Be("1.2.840.113549.1.1.11");
+        row.Sha256Thumbprint.Should().Be("THUMB0053");
+        row.ExtendedKeyUsageOids.Should().Be("1.3.6.1.5.5.7.3.1");
+        row.KeyUsage.Should().Be(5);
+        row.RawCertificate.Should().Equal(TestDer(53));
+    }
+
+    [Fact]
+    public async Task Sync_UnchangedRow_StillRecordsThatTheCaWasSeen()
+    {
+        // "Last Synced" means when the CA last handed this row back, not when
+        // something about it last moved, and the dashboard detail page shows it
+        // under that name. A row taking the cheap path still earns that write.
+        var cert = FullyDetailed(54, "CN=touched.example.com");
+        SetCaCertificates(issued: new[] { cert }, revoked: Array.Empty<CertificateInfo>());
+
+        var sut = CreateService();
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        // Backdated rather than compared against the previous cycle's stamp, so
+        // the assertion does not rest on two syncs landing on different ticks.
+        var backdate = GetDb();
+        var seeded = await backdate.SyncedCertificates.SingleAsync(c => c.RequestId == 54);
+        seeded.LastSyncedAt = DateTime.UtcNow.AddDays(-1);
+        var firstSynced = seeded.FirstSyncedAt;
+        await backdate.SaveChangesAsync();
+
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        var row = await GetDb().SyncedCertificates.SingleAsync(c => c.RequestId == 54);
+        row.LastSyncedAt.Should().BeCloseTo(DateTime.UtcNow, TimeSpan.FromMinutes(1));
+        // And nothing else moved, FirstSyncedAt included.
+        row.FirstSyncedAt.Should().Be(firstSynced);
+        row.Subject.Should().Be("CN=touched.example.com");
+        row.Sha256Thumbprint.Should().Be("THUMB0054");
+    }
+
+    [Fact]
+    public async Task Sync_UnchangedRow_IsStillCountedAsUpdated()
+    {
+        // The manual sync endpoint reports this number to an operator. It has
+        // always meant "rows the CA handed back that we already had", and taking
+        // the cheap path for one must not quietly change what it counts.
+        var cert = FullyDetailed(55, "CN=counted.example.com");
+        SetCaCertificates(issued: new[] { cert }, revoked: Array.Empty<CertificateInfo>());
+
+        var sut = CreateService();
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+        var second = await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        second.Processed.Should().Be(1);
+        second.Created.Should().Be(0);
+        second.Updated.Should().Be(1);
+    }
+
+    /// <summary>
+    /// The guard on the one place in the product where the same rules are
+    /// written twice. IsUnchanged decides whether a row is loaded at all, so a
+    /// column added to UpdateEntity and forgotten there would stop being synced
+    /// with nothing to say why. Each case moves exactly one column and asserts a
+    /// cycle writes it through.
+    /// </summary>
+    [Theory]
+    [InlineData("SerialNumber")]
+    [InlineData("Subject")]
+    [InlineData("SubjectAlternativeNames")]
+    [InlineData("TemplateName")]
+    [InlineData("NotBefore")]
+    [InlineData("NotAfter")]
+    [InlineData("Status")]
+    [InlineData("Requestor")]
+    [InlineData("RequestDate")]
+    [InlineData("RevokedAt")]
+    [InlineData("RevokedReason")]
+    [InlineData("KeyAlgorithm")]
+    [InlineData("KeySizeBits")]
+    [InlineData("SignatureAlgorithmOid")]
+    [InlineData("Sha256Thumbprint")]
+    [InlineData("ExtendedKeyUsageOids")]
+    [InlineData("KeyUsage")]
+    public async Task Sync_WritesThroughAColumnTheCaChanged(string column)
+    {
+        var baseline = FullyDetailed(56, "CN=baseline.example.com");
+        SetCaCertificates(issued: new[] { baseline }, revoked: Array.Empty<CertificateInfo>());
+
+        var sut = CreateService();
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        var crypto = baseline.CryptoDetail!;
+        var moved = column switch
+        {
+            "SerialNumber" => baseline with { SerialNumber = "SERIALMOVED" },
+            "Subject" => baseline with { Subject = "CN=moved.example.com" },
+            "SubjectAlternativeNames" => baseline with { SubjectAlternativeNames = "dns:moved.example.com" },
+            "TemplateName" => baseline with { TemplateName = "MovedTemplate" },
+            "NotBefore" => baseline with { NotBefore = baseline.NotBefore.AddDays(-3) },
+            "NotAfter" => baseline with { NotAfter = baseline.NotAfter.AddDays(3) },
+            "Status" => baseline with { Status = CertificateStatus.Revoked },
+            "Requestor" => baseline with { Requestor = "HOME\\moved" },
+            "RequestDate" => baseline with { RequestDate = baseline.RequestDate.AddDays(-3) },
+            "RevokedAt" => baseline with { RevokedWhen = DateTime.UtcNow.AddDays(-1) },
+            "RevokedReason" => baseline with { RevokedReason = 4 },
+            "KeyAlgorithm" => baseline with { CryptoDetail = crypto with { KeyAlgorithm = "ECDSA" } },
+            "KeySizeBits" => baseline with { CryptoDetail = crypto with { KeySizeBits = 384 } },
+            "SignatureAlgorithmOid" => baseline with
+            {
+                CryptoDetail = crypto with { SignatureAlgorithmOid = "1.2.840.10045.4.3.3" }
+            },
+            "Sha256Thumbprint" => baseline with { CryptoDetail = crypto with { Sha256Thumbprint = "THUMBMOVED" } },
+            "ExtendedKeyUsageOids" => baseline with
+            {
+                CryptoDetail = crypto with { ExtendedKeyUsageOids = "1.3.6.1.5.5.7.3.2" }
+            },
+            "KeyUsage" => baseline with { CryptoDetail = crypto with { KeyUsage = 128 } },
+            _ => throw new ArgumentOutOfRangeException(nameof(column), column, "Unhandled column")
+        };
+
+        // Revoked readings arrive on the revoked pass, and revocation values are
+        // only ever populated there.
+        var revokedPass = column is "Status" or "RevokedAt" or "RevokedReason";
+        SetCaCertificates(
+            issued: revokedPass ? Array.Empty<CertificateInfo>() : new[] { moved },
+            revoked: revokedPass ? new[] { moved with { Status = CertificateStatus.Revoked } } : Array.Empty<CertificateInfo>());
+
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        var row = await GetDb().SyncedCertificates.SingleAsync(c => c.RequestId == 56);
+        var actual = column switch
+        {
+            "SerialNumber" => row.SerialNumber,
+            "Subject" => row.Subject,
+            "SubjectAlternativeNames" => row.SubjectAlternativeNames,
+            "TemplateName" => row.TemplateName,
+            "NotBefore" => row.NotBefore.ToString("O"),
+            "NotAfter" => row.NotAfter.ToString("O"),
+            "Status" => row.Status,
+            "Requestor" => row.Requestor,
+            "RequestDate" => row.RequestDate.ToString("O"),
+            "RevokedAt" => row.RevokedAt?.ToString("O"),
+            "RevokedReason" => row.RevokedReason?.ToString(),
+            "KeyAlgorithm" => row.KeyAlgorithm,
+            "KeySizeBits" => row.KeySizeBits?.ToString(),
+            "SignatureAlgorithmOid" => row.SignatureAlgorithmOid,
+            "Sha256Thumbprint" => row.Sha256Thumbprint,
+            "ExtendedKeyUsageOids" => row.ExtendedKeyUsageOids,
+            "KeyUsage" => row.KeyUsage?.ToString(),
+            _ => throw new ArgumentOutOfRangeException(nameof(column), column, "Unhandled column")
+        };
+        var expected = column switch
+        {
+            "SerialNumber" => "SERIALMOVED",
+            "Subject" => "CN=moved.example.com",
+            "SubjectAlternativeNames" => "dns:moved.example.com",
+            "TemplateName" => "MovedTemplate",
+            "NotBefore" => moved.NotBefore.ToString("O"),
+            "NotAfter" => moved.NotAfter.ToString("O"),
+            "Status" => "Revoked",
+            "Requestor" => "HOME\\moved",
+            "RequestDate" => moved.RequestDate.ToString("O"),
+            "RevokedAt" => moved.RevokedWhen?.ToString("O"),
+            "RevokedReason" => "4",
+            "KeyAlgorithm" => "ECDSA",
+            "KeySizeBits" => "384",
+            "SignatureAlgorithmOid" => "1.2.840.10045.4.3.3",
+            "Sha256Thumbprint" => "THUMBMOVED",
+            "ExtendedKeyUsageOids" => "1.3.6.1.5.5.7.3.2",
+            "KeyUsage" => "128",
+            _ => throw new ArgumentOutOfRangeException(nameof(column), column, "Unhandled column")
+        };
+
+        actual.Should().Be(expected);
+    }
+
+    [Fact]
+    public async Task Sync_SteadyStateCycle_WritesOncePerBatchRatherThanOncePerRow()
+    {
+        // The assertion the rest of this section cannot make. A row taking the
+        // cheap path is invisible from the data, because it writes the same
+        // LastSyncedAt the expensive path writes, so every other test here passes
+        // whether the optimisation ran or not. Counting the statements is what
+        // separates "it works" from "it silently does nothing".
+        const int rows = 250;
+        var issued = Enumerable.Range(1, rows)
+            .Select(i => FullyDetailed(i, $"CN=steady{i:D4}.example.com"))
+            .ToArray();
+        SetCaCertificates(issued: issued, revoked: Array.Empty<CertificateInfo>());
+
+        var sut = CreateService();
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        _sql.Reset();
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        // Three batches of 100, 100 and 50, so three ExecuteUpdate statements.
+        // The bound is loose enough not to pin the batch size and tight enough
+        // that one statement per row (250) fails it by two orders of magnitude.
+        _sql.Updates.Should().BeGreaterThan(0, "the rows were still seen");
+        _sql.Updates.Should().BeLessThan(10,
+            "a steady state cycle writes once per batch, not once per row");
+    }
+
+    [Fact]
+    public async Task Sync_CycleThatChangedEverything_StillWritesEveryRow()
+    {
+        // The other direction, so the bound above cannot be met by simply not
+        // writing. When the CA really has moved every row, every row is written.
+        const int rows = 120;
+        var first = Enumerable.Range(1, rows)
+            .Select(i => FullyDetailed(i, $"CN=moving{i:D4}.example.com"))
+            .ToArray();
+        SetCaCertificates(issued: first, revoked: Array.Empty<CertificateInfo>());
+
+        var sut = CreateService();
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        var second = first
+            .Select(c => c with { Requestor = "HOME\\somebodyelse" })
+            .ToArray();
+        SetCaCertificates(issued: second, revoked: Array.Empty<CertificateInfo>());
+
+        _sql.Reset();
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        _sql.Updates.Should().BeGreaterThanOrEqualTo(rows,
+            "every row genuinely moved, so every row is written");
+        (await GetDb().SyncedCertificates.CountAsync(c => c.Requestor == "HOME\\somebodyelse"))
+            .Should().Be(rows);
+    }
+
+    [Fact]
+    public async Task Sync_SteadyStateCycle_ReadsOncePerBatchRatherThanOncePerRow()
+    {
+        // The read side of the pair above, and the half the update count cannot
+        // see (issue #191). A per row FirstOrDefaultAsync followed by the same
+        // batched ExecuteUpdate writes exactly the statements the test above
+        // allows, so that test stays green while the sync issues one query per
+        // certificate. This is the one that fails.
+        const int rows = 250;
+        var issued = Enumerable.Range(1, rows)
+            .Select(i => FullyDetailed(i, $"CN=steadyread{i:D4}.example.com"))
+            .ToArray();
+        SetCaCertificates(issued: issued, revoked: Array.Empty<CertificateInfo>());
+
+        var sut = CreateService();
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        _sql.Reset();
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        // Measured at 5 on the current build: one read for the already detailed
+        // set, three for the batch projections of 100, 100 and 50, one for the
+        // supersession lineage projection. A per row FirstOrDefaultAsync makes it
+        // 252, so the bound sits two orders of magnitude clear of the regression.
+        //
+        // It is a bound on batches, not a bound independent of them: the count is
+        // one plus one per batch plus one, so it holds for any batch size down to
+        // about 14 and would need raising below that. Unlike the write bound above
+        // this one cannot be read as indifferent to the batch size.
+        _sql.Reads.Should().BeGreaterThan(0, "the rows were still read");
+        _sql.Reads.Should().BeLessThan(20,
+            "a steady state cycle reads once per batch, not once per row");
+    }
+
+    [Fact]
+    public async Task Sync_CycleThatChangedEverything_StillReadsOncePerBatch()
+    {
+        // The direction the steady state cycle cannot cover. Every row moves, so
+        // every row lands in the changed list and the second read fires for each
+        // batch. A build that batched the first read but reloaded changed
+        // entities one at a time would pass the test above and fail this one.
+        const int rows = 120;
+        var first = Enumerable.Range(1, rows)
+            .Select(i => FullyDetailed(i, $"CN=movingread{i:D4}.example.com"))
+            .ToArray();
+        SetCaCertificates(issued: first, revoked: Array.Empty<CertificateInfo>());
+
+        var sut = CreateService();
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        var second = first
+            .Select(c => c with { Requestor = "HOME\\somebodyelse" })
+            .ToArray();
+        SetCaCertificates(issued: second, revoked: Array.Empty<CertificateInfo>());
+
+        _sql.Reset();
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        // Measured at 6: the steady state five, plus one reload per batch for the
+        // rows that moved. Reloading those one at a time makes it 124. Two reads
+        // per batch rather than one, so this is the tighter of the pair against a
+        // shrinking batch size and holds down to a batch of about 16.
+        _sql.Reads.Should().BeGreaterThan(0, "the rows were still read");
+        _sql.Reads.Should().BeLessThan(20,
+            "the changed rows are reloaded once per batch, not once per row");
+
+        // The read bound cannot be met by a build that simply stopped reading,
+        // because a cycle that skipped the reload would write nothing through.
+        (await GetDb().SyncedCertificates.CountAsync(c => c.Requestor == "HOME\\somebodyelse"))
+            .Should().Be(rows);
+    }
+
+    [Fact]
+    public async Task Sync_BackfillsSubjectsForRowsSpreadAcrossSeveralBatches()
+    {
+        // The disposition passes no longer keep every row attached: they clear
+        // the change tracker after each batch of 100. So the backfill can no
+        // longer be handed entity references, and this is the shape that catches
+        // it if it ever is again, because the rows it must name were detached
+        // several batches before it ran.
+        const int rows = 150;
+        for (var i = 0; i < rows; i++)
+            await SeedAcmeOrderAsync(200 + i, $$"""[{"type":"dns","value":"batch{{i}}.example.com"}]""");
+
+        var requests = Enumerable.Range(0, rows)
+            .Select(i => RequestRow(200 + i, CertificateStatus.Denied))
+            .ToArray();
+        SetCaCertificates(issued: Array.Empty<CertificateInfo>(),
+            revoked: Array.Empty<CertificateInfo>());
+        SetCaRequests(CertificateStatus.Denied, requests);
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        var db = GetDb();
+        (await db.SyncedCertificates.CountAsync(c => c.Subject == "")).Should().Be(0);
+        (await db.SyncedCertificates.SingleAsync(c => c.RequestId == 200)).Subject
+            .Should().Be("batch0.example.com");
+        (await db.SyncedCertificates.SingleAsync(c => c.RequestId == 200 + rows - 1)).Subject
+            .Should().Be($"batch{rows - 1}.example.com");
     }
 
     public void Dispose()

@@ -1,3 +1,5 @@
+using System.Reflection;
+using Certus.Core.Acme.Models;
 using Certus.Core.Adcs;
 using Certus.Core.Data;
 using Certus.Core.Data.Entities;
@@ -78,6 +80,24 @@ public class CertusDbContextTests : IDisposable
             "the background validation sweep filters challenges by Status");
     }
 
+    /// <summary>
+    /// The declared width has to hold every identifier type this server knows, and the
+    /// vocabulary is what the assertion reads rather than a pinned number. SQLite does
+    /// not enforce a TEXT width and EF Core does not validate MaxLength on save, so this
+    /// test is the only thing standing between a longer type and a column that silently
+    /// misdescribes what it holds. "dns" is 3, "hardware-module" is 15 and
+    /// "permanent-identifier" is 20; the original cap of 10 fit only the first.
+    ///
+    /// Reflecting over the constants rather than listing them means a type added to
+    /// AcmeIdentifierTypes later is covered without anyone remembering to come back
+    /// here. Pinning the width at 32, which is what this asserted before, passed just
+    /// as happily for a 40 character type.
+    ///
+    /// The migration history records 10 for this column and always will, because a
+    /// width never reaches SQLite DDL and EF therefore emits no AlterColumn for a
+    /// widening. That is correct rather than drift; see CLAUDE.md, "Declared column
+    /// widths and what a migration can record" (issue #348).
+    /// </summary>
     [Fact]
     public void AcmeAuthorization_IdentifierTypeFitsDeviceTypes()
     {
@@ -86,8 +106,24 @@ public class CertusDbContextTests : IDisposable
             .FindProperty(nameof(AcmeAuthorization.IdentifierType))!
             .GetMaxLength();
 
-        maxLength.Should().Be(32,
-            "\"permanent-identifier\" is 20 characters and the old cap of 10 fit only \"dns\"");
+        maxLength.Should().NotBeNull(
+            "the column declares a width for the reader and for this test, even though "
+            + "nothing at runtime enforces it");
+
+        var vocabulary = typeof(AcmeIdentifierTypes)
+            .GetFields(BindingFlags.Public | BindingFlags.Static)
+            .Where(f => f.IsLiteral && f.FieldType == typeof(string))
+            .Select(f => (string)f.GetRawConstantValue()!)
+            .ToList();
+
+        vocabulary.Should().NotBeEmpty(
+            "the loop below asserts nothing at all if the reflection stops finding the "
+            + "constants, which a rename of AcmeIdentifierTypes' members would do quietly");
+
+        foreach (var identifierType in vocabulary)
+            identifierType.Length.Should().BeLessThanOrEqualTo(maxLength!.Value,
+                $"the column has to hold \"{identifierType}\", which is "
+                + $"{identifierType.Length} characters");
     }
 
     [Fact]

@@ -4,6 +4,7 @@ using Certus.Core.Acme.Crypto;
 using Certus.Core.Acme.Models;
 using Certus.Core.Acme.Services;
 using Certus.Core.Adcs;
+using Certus.Core.Security;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 
@@ -16,7 +17,7 @@ namespace Certus.Web.Controllers.Acme;
 /// RFC 8555 §7.6
 /// </summary>
 [ApiController]
-[EnableRateLimiting("acme-general")]
+[EnableRateLimiting(AcmeRateLimitPolicies.General)]
 public sealed class RevokeCertController : AcmeControllerBase
 {
     // Permitted CRL revocation reason codes (RFC 5280 §5.3.1). Value 7 is unused. A request

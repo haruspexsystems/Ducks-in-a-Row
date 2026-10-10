@@ -1,6 +1,5 @@
 using System.DirectoryServices;
 using System.Security.Principal;
-using System.Text;
 using Certus.Core.ActiveDirectory;
 using Microsoft.Extensions.Logging;
 
@@ -251,25 +250,10 @@ public sealed class AdPrincipalLookup : IAdPrincipalLookup
     /// <summary>
     /// Escapes one value for embedding in an LDAP filter (RFC 4515), so a
     /// typed query can never terminate or extend the filter expression.
-    /// Internal for unit tests.
+    /// The escaping itself lives in <see cref="LdapFilterValue"/>, which the
+    /// service rights reader shares. Internal for unit tests.
     /// </summary>
-    internal static string EscapeFilterValue(string value)
-    {
-        var sb = new StringBuilder(value.Length);
-        foreach (var ch in value)
-        {
-            switch (ch)
-            {
-                case '\\': sb.Append(@"\5c"); break;
-                case '*': sb.Append(@"\2a"); break;
-                case '(': sb.Append(@"\28"); break;
-                case ')': sb.Append(@"\29"); break;
-                case '\0': sb.Append(@"\00"); break;
-                default: sb.Append(ch); break;
-            }
-        }
-        return sb.ToString();
-    }
+    internal static string EscapeFilterValue(string value) => LdapFilterValue.Escape(value);
 
     private static object? GetSingle(SearchResult sr, string property)
     {

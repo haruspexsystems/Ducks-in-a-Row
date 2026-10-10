@@ -107,13 +107,17 @@ public sealed class AcmeAccountsController : ControllerBase
     /// <summary>
     /// POST /api/acme/accounts/{id}/deactivate: terminal (RFC 8555 §7.3.6).
     /// The account's open orders are invalidated in the same change, and
-    /// every later ACME request it signs is rejected with 403 by the
-    /// existing account status check.
+    /// every later ACME request it signs is rejected with 401 by the
+    /// existing account status check. The client can also do this itself by
+    /// posting {"status":"deactivated"} to its own account URL; both routes
+    /// land on the same service method and differ only in the origin they
+    /// record.
     /// </summary>
     [HttpPost("{id:int}/deactivate")]
     public async Task<IActionResult> Deactivate(int id, CancellationToken ct)
     {
-        var result = await _accountService.DeactivateAsync(id, ct);
+        var result = await _accountService.DeactivateAsync(
+            id, AccountDeactivationOrigin.Dashboard, ct);
         return result.Outcome switch
         {
             AccountDeactivationOutcome.NotFound =>

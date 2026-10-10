@@ -4,6 +4,7 @@ using Certus.Core.Health;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
 
@@ -77,6 +78,47 @@ public class CertusHealthCheckTests : IDisposable
 
         result.Status.Should().Be(HealthStatus.Degraded);
         result.Data["ca"].Should().BeOfType<string>().Which.Should().Contain("DCOM error");
+    }
+
+    [Fact]
+    public async Task CheckHealth_CaUnavailableThrown_ReadsExactlyAsNotAccessible()
+    {
+        // Issue #440: GetCaInfoAsync throws this for an unreachable CA rather
+        // than answering "not accessible", and so does the unconfigured client.
+        // The health endpoint must read exactly as it did before, with no error
+        // text and no warning every probe.
+        _mockClient.GetCaInfoAsync(Arg.Any<CancellationToken>())
+            .Returns<CaInfo>(_ => throw new CaUnavailableException("unreachable"));
+
+        var check = CreateCheck();
+
+        var result = await check.CheckHealthAsync(new HealthCheckContext());
+
+        result.Status.Should().Be(HealthStatus.Degraded);
+        result.Description.Should().Be("CA is not accessible");
+        result.Data["ca"].Should().Be("not accessible");
+    }
+
+    [Fact]
+    public async Task CheckHealth_CaRefusesTheAccount_IsDegradedWithTheReason_AndNoWarning()
+    {
+        _mockClient.GetCaInfoAsync(Arg.Any<CancellationToken>())
+            .Returns<CaInfo>(_ => throw new CaAccessDeniedException(
+                CaAccessDeniedException.ConnectPermissionMessage, new UnauthorizedAccessException()));
+        var logger = Substitute.For<ILogger<CertusHealthCheck>>();
+
+        var check = new CertusHealthCheck(_db, _mockClient, new CaHealthCache(), logger);
+
+        var result = await check.CheckHealthAsync(new HealthCheckContext());
+
+        result.Status.Should().Be(HealthStatus.Degraded);
+        result.Data["ca"].Should().BeOfType<string>().Which.Should().Contain("Request Certificates");
+        // AdcsClient has logged the refusal at Error; a warning here on every
+        // 30 second probe would only repeat it.
+        logger.ReceivedCalls()
+            .Where(call => call.GetMethodInfo().Name == nameof(ILogger.Log)
+                           && call.GetArguments()[0] is LogLevel.Warning)
+            .Should().BeEmpty();
     }
 
     [Fact]

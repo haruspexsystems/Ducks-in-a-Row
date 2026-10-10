@@ -5,6 +5,15 @@ network. This page collects the optional lockdowns and explains the reasoning
 behind each default, so an open posture is an informed choice rather than an
 accident.
 
+## The data folder
+
+The installer restricts the data folder, `C:\ProgramData\Ducks in a Row` by
+default, to SYSTEM and Administrators, and lets Users only read and run the
+installation folder. Keep it that way. Whoever can write `settings.json` can
+name the group the dashboard admits, and whoever can write `ducks-setup.json`
+sets the ACME policy. The service refuses either file if anyone else may write
+it, which is a backstop, not a reason to widen the folder.
+
 ## Challenge validation egress
 
 For HTTP-01 and TLS-ALPN-01 challenges, the server itself is the party that
@@ -120,8 +129,9 @@ this product substitutes for that patch.
 > request attributes: `cdc` points the CA at an attacker controlled host and
 > `rmd` names the domain controller to impersonate. Ducks in a Row sends exactly
 > one request attribute, `CertificateTemplate`, and builds it in a single place
-> that refuses any template name carrying a control character, so an ACME client
-> cannot append a second attribute through this product. That closes Ducks in a
+> that refuses any template name carrying a control character, a line separator,
+> or a Unicode formatting character, so an ACME client cannot append a second
+> attribute through this product. That closes Ducks in a
 > Row as a route to the bug. It does not fix the bug, and it does not stop
 > anyone reaching the CA by any other path.
 

@@ -58,7 +58,7 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
     /// Creates a new ADCS client.
     /// </summary>
     /// <param name="caConnectionString">
-    /// CA config string in the format "CAHostName\CAName" (e.g., "ca01.contoso.local\Contoso-CA").
+    /// CA config string in the format "CAHostName\CAName" (e.g., "ca-server.corp.example.com\Example-CA").
     /// </param>
     /// <param name="logger">Logger instance.</param>
     public AdcsClient(string caConnectionString, ILogger<AdcsClient> logger)
@@ -101,7 +101,19 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                     DisplayName: caName,
                     IsAccessible: true);
             }
-            catch (COMException ex)
+            catch (Exception ex) when (ClassifyConnectFailure(ex) is { } mapped)
+            {
+                // Access denied and an unreachable CA are answers the setup
+                // wizard and the rights check act on, so they leave as the
+                // typed exceptions every other path here throws (issue #440).
+                // Folding them into "not accessible" is what left Test
+                // Connection unable to tell a missing right from a CA that is
+                // down.
+                _logger.LogError(ex, "Failed to connect to CA at {Config}. HRESULT: 0x{HResult:X8}",
+                    _caConnectionString, ex.HResult);
+                throw mapped;
+            }
+            catch (COMException ex) when (!IsMissingComponent(ex))
             {
                 _logger.LogError(ex, "Failed to connect to CA at {Config}. HRESULT: 0x{HResult:X8}",
                     _caConnectionString, ex.HResult);
@@ -118,6 +130,39 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
             }
         }, cancellationToken);
     }
+
+    /// <summary>
+    /// The exception a failed <see cref="GetCaInfoAsync"/> leaves with, or null
+    /// when the failure stays an ordinary "not accessible" answer. Internal for
+    /// unit tests.
+    ///
+    /// Access denied arrives three ways: as UnauthorizedAccessException, the
+    /// usual shape through IDispatch; as a COMException carrying E_ACCESSDENIED;
+    /// or as CERTSRV_E_ENROLL_DENIED, which a CA answers when the caller lacks
+    /// its Enroll right or when it refuses remote requests altogether
+    /// (IF_NOREMOTEICERTREQUEST). All three mean the CA refused the service,
+    /// and none of them means the CA is down.
+    /// </summary>
+    internal static Exception? ClassifyConnectFailure(Exception ex) => ex switch
+    {
+        UnauthorizedAccessException =>
+            new CaAccessDeniedException(CaAccessDeniedException.ConnectPermissionMessage, ex),
+        COMException com when CaAccessDeniedException.IsRefusal(com) =>
+            new CaAccessDeniedException(CaAccessDeniedException.ConnectPermissionMessage, com),
+        COMException com when CaUnavailableException.IsRpcUnavailable(com) =>
+            new CaUnavailableException("ADCS Certificate Authority is unavailable (CertSvc RPC unreachable).", com),
+        _ => null,
+    };
+
+    /// <summary>
+    /// A COM class that is not registered (REGDB_E_CLASSNOTREG), or one that
+    /// activates and cannot resolve its methods (DISP_E_MEMBERNOTFOUND, which
+    /// the troubleshooting guide reports for a server without RSAT-ADCS-Mgmt).
+    /// Both are this server's problem rather than the CA's, so
+    /// <see cref="GetCaInfoAsync"/> lets them through to callers that say so.
+    /// </summary>
+    internal static bool IsMissingComponent(COMException ex) =>
+        ex.HResult == unchecked((int)0x80040154) || ex.HResult == unchecked((int)0x80020003);
 
     public Task<IReadOnlyList<TemplateInfo>> GetTemplatesAsync(CancellationToken cancellationToken = default)
     {
@@ -177,7 +222,9 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                             info.EnrollmentFlags,
                             info.RaSignatureCount,
                             info.CertificateNameFlags,
-                            info.AsymmetricAlgorithm,
+                            info.SchemaVersion,
+                            info.PrivateKeyFlags,
+                            info.RaApplicationPolicies ?? Array.Empty<string>(),
                             info.DefaultCsps ?? Array.Empty<string>(),
                             info.MinimalKeySize),
                     };
@@ -303,6 +350,17 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                 templateName, _caConnectionString);
 
             object? certRequest = null;
+
+            // False until Submit itself has returned. Past that line the CA holds a
+            // request for this CSR whatever else fails, so a CaUnavailableException
+            // must never escape from beyond it: the ACME finalize reads that
+            // exception as "nothing reached the CA" and releases its claim so the
+            // client can retry the same order (issue #324). A failure of
+            // GetRequestId or GetDispositionMessage leaves a request nobody can
+            // name, which is a different thing: it stays a plain
+            // InvalidOperationException and invalidates the order with the orphan
+            // logged, which is the right answer for it.
+            var submitReturned = false;
             try
             {
                 certRequest = new CertRequestClass();
@@ -322,32 +380,95 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                     csrBase64,
                     attributes,
                     _caConnectionString);
+                submitReturned = true;
+
+                // The reason behind the disposition (issue #356). Read here, on the
+                // line after the Submit, rather than below beside the message it
+                // explains. The documented rule is that GetLastStatus reflects the
+                // latest Submit, RetrievePending or GetCACertificate, so GetRequestId
+                // and GetDispositionMessage would not disturb it, but reading first
+                // means nothing here rests on that list being complete.
+                //
+                // Asked for only where a refusal is being reported. An issued request
+                // would answer S_OK by definition, and a pending one is not a failure
+                // and has no reason to give: the docs describe this value as the cause
+                // behind a disposition other than issued, and it is denials they name.
+                // Nothing reads the code on a pending result either, since both pending
+                // arms build their own message about waiting for a CA manager. So a
+                // template with CT_FLAG_PEND_ALL_REQUESTS, which answers every single
+                // order this way, would have paid a COM round trip per order for a
+                // value nothing consumes.
+                var statusCode = IsRefusal(disposition) ? ReadLastStatus(certRequest) : null;
 
                 var requestId = (int)d.GetRequestId();
-                var message = (string)d.GetDispositionMessage();
+                var rawMessage = (string?)d.GetDispositionMessage();
 
+                // The one line form for the log, the sanitized form for the result
+                // (issue #362). This was the last CA authored string in the product
+                // that reached an ACME problem document, the wizard, the settings
+                // page and this log line untouched; the sync path lower down this
+                // same file has run its copy of the column through the sanitizer
+                // since issue #224. The log gets the flattened form because Serilog
+                // writes the rendered message straight through, so a multi line
+                // denial otherwise reads back as several records.
+                //
+                // The reason rides in its own property rather than inside that one.
+                // It is our own single line text so it needs no flattening, and
+                // keeping the two apart leaves Message meaning exactly what the CA
+                // said, which is what a structured consumer filtering on it expects.
                 _logger.LogInformation(
-                    "CSR submitted. RequestId={RequestId}, Disposition={Disposition}, Message={Message}",
-                    requestId, disposition, message);
+                    "CSR submitted. RequestId={RequestId}, Disposition={Disposition}, " +
+                    "Message={Message}, Reason={Reason}",
+                    requestId, disposition,
+                    CertificateTextSanitizer.SanitizeDispositionMessageForLog(rawMessage),
+                    CaStatusCode.Explain(statusCode) ?? "none recorded");
 
-                var status = disposition switch
-                {
-                    DispositionCode.Issued => SubmitStatus.Issued,
-                    DispositionCode.IssuedOutOfBand => SubmitStatus.Issued,
-                    DispositionCode.UnderSubmission => SubmitStatus.Pending,
-                    DispositionCode.Denied => SubmitStatus.Denied,
-                    _ => SubmitStatus.Error
-                };
+                return BuildSubmitResult(requestId, disposition, rawMessage, statusCode);
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                // E_ACCESSDENIED needs an arm of its own because it is usually not a
+                // COMException at all: the CLR maps well known HRESULTs to their
+                // managed equivalents on the dynamic IDispatch path, which is why the
+                // CertView and CertAdmin paths below each carry this same pair.
+                //
+                // This is the rarer of the two ways a permissions problem shows up
+                // here, and deliberately not the one an operator meets most. A
+                // template the service account cannot enroll against is refused by the
+                // CA's policy module, so Submit returns normally with a Denied
+                // disposition and never reaches this arm. Confirmed on the lab CA on
+                // 2026-08-24: request 109 came back Disposition=2 with no exception
+                // raised at all, and a disposition message of just "Denied by Policy
+                // Module". What lands here is the CA refusing the call itself.
+                _logger.LogError(ex,
+                    "CA request access denied for template {Template}. HRESULT: 0x{HResult:X8}",
+                    templateName, ex.HResult);
 
-                return new SubmitResult(requestId, status, message);
+                // Gated on !submitReturned exactly as the outage mapping below is, and
+                // for the same reason. Both exceptions promise the ACME finalize that
+                // nothing reached the CA, which is what lets it release its claim and
+                // leave the order retryable. Past the Submit the CA holds a request
+                // for this CSR, so a denial out of GetRequestId or GetDispositionMessage
+                // leaves a request nobody can name: that takes the plain path, and the
+                // order is invalidated with the orphan logged, which is right for it.
+                if (!submitReturned)
+                    throw new CaAccessDeniedException(
+                        CaAccessDeniedException.EnrollPermissionMessage, ex);
+                throw new InvalidOperationException(
+                    $"Failed to submit certificate request: {ex.Message}", ex);
             }
             catch (COMException ex)
             {
                 _logger.LogError(ex, "Failed to submit CSR for template {Template}. HRESULT: 0x{HResult:X8}",
                     templateName, ex.HResult);
-                if (CaUnavailableException.IsRpcUnavailable(ex))
+                if (!submitReturned && CaUnavailableException.IsRpcUnavailable(ex))
                     throw new CaUnavailableException(
                         "ADCS Certificate Authority is unavailable (CertSvc RPC unreachable).", ex);
+                // The same denial arriving as a COMException instead. Same gate, same
+                // promise; only the shape the CLR chose differs.
+                if (!submitReturned && CaAccessDeniedException.IsAccessDenied(ex))
+                    throw new CaAccessDeniedException(
+                        CaAccessDeniedException.EnrollPermissionMessage, ex);
                 throw new InvalidOperationException(
                     $"Failed to submit certificate request: {ex.Message}", ex);
             }
@@ -356,6 +477,181 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                 ReleaseCom(certRequest);
             }
         }, cancellationToken);
+    }
+
+    /// <summary>
+    /// The status a disposition maps to.
+    ///
+    /// One switch, so <see cref="BuildSubmitResult"/> and <see cref="IsRefusal"/>
+    /// cannot come to disagree about which dispositions are refusals.
+    /// </summary>
+    internal static SubmitStatus MapDisposition(int disposition) => disposition switch
+    {
+        DispositionCode.Issued => SubmitStatus.Issued,
+        DispositionCode.IssuedOutOfBand => SubmitStatus.Issued,
+        DispositionCode.UnderSubmission => SubmitStatus.Pending,
+        DispositionCode.Denied => SubmitStatus.Denied,
+        _ => SubmitStatus.Error
+    };
+
+    /// <summary>
+    /// The status a CA database disposition maps to, for a request row read back
+    /// out of the CA view.
+    ///
+    /// The read side sibling of <see cref="MapDisposition"/>, and a different
+    /// vocabulary on both ends: the numbers are the database's
+    /// <see cref="DbDisposition"/> values rather than the submit's
+    /// <see cref="DispositionCode"/> ones, and the answer distinguishes a revoked
+    /// certificate, which a submit never sees. One switch, so
+    /// <see cref="MapToCertificateInfo"/> and
+    /// <see cref="GetRequestStatusAsync"/> cannot come to disagree about what a
+    /// row says (issue #365).
+    ///
+    /// Anything unrecognised reads as <see cref="CertificateStatus.Failed"/>,
+    /// which is what the Error disposition itself maps to. The remaining value,
+    /// Active (8), is a foreign key placeholder rather than a request outcome.
+    /// </summary>
+    internal static CertificateStatus MapCertificateStatus(int disposition) => disposition switch
+    {
+        DbDisposition.Issued => CertificateStatus.Issued,
+        DbDisposition.Revoked => CertificateStatus.Revoked,
+        DbDisposition.Pending => CertificateStatus.Pending,
+        DbDisposition.Denied => CertificateStatus.Denied,
+        _ => CertificateStatus.Failed
+    };
+
+    /// <summary>
+    /// Whether the CA recorded an explanation worth reading against a row in this
+    /// state. The CA writes DispositionMessage and StatusCode for a request it is
+    /// still holding or has refused; an issued row carries "Issued" and a zero
+    /// status code, which is noise rather than an explanation, and a revoked one
+    /// carries nothing about the request at all.
+    ///
+    /// One predicate, so <see cref="MapToCertificateInfo"/> and
+    /// <see cref="GetRequestStatusAsync"/> withhold the same pair on the same rows
+    /// (issue #365).
+    /// </summary>
+    internal static bool CarriesExplanation(CertificateStatus status) =>
+        status is CertificateStatus.Pending
+            or CertificateStatus.Denied
+            or CertificateStatus.Failed;
+
+    /// <summary>
+    /// The CA's own account of a request, sanitized. CA authored text bound for
+    /// an ACME problem document and the dashboard, so it goes through
+    /// <see cref="CertificateTextSanitizer"/> on both read paths.
+    /// </summary>
+    private static string? ReadDispositionMessage(Dictionary<string, object?> values) =>
+        CertificateTextSanitizer.SanitizeDispositionMessage(
+            values.GetValueOrDefault(ColumnName.DispositionMessage)?.ToString());
+
+    /// <summary>
+    /// The HRESULT the CA recorded, or null. Zero means success and never carries
+    /// information, so it reads the same as nothing recorded; so does a column the
+    /// IDispatch path handed back as something other than an int.
+    /// </summary>
+    private static int? ReadStatusCode(Dictionary<string, object?> values) =>
+        values.GetValueOrDefault(ColumnName.StatusCode) is int code && code != 0
+            ? code
+            : null;
+
+    /// <summary>
+    /// Whether the CA refused this request, and so whether it holds a reason worth
+    /// asking <c>GetLastStatus</c> for (issue #356).
+    ///
+    /// Written as the two outcomes that admit a reason rather than as "not issued",
+    /// following the house rule that these are allow lists: a SubmitStatus added
+    /// later then costs nothing until someone decides it should.
+    /// </summary>
+    internal static bool IsRefusal(int disposition) =>
+        MapDisposition(disposition) is SubmitStatus.Denied or SubmitStatus.Error;
+
+    /// <summary>
+    /// The HRESULT behind a disposition, from <c>ICertRequest::GetLastStatus</c>
+    /// (issue #356), or null when the CA recorded nothing or the read failed.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Its own try/catch, inside the submit's, and that placement is the point
+    /// rather than defensive habit. By the time this runs the CA holds a request
+    /// for the CSR, so <c>submitReturned</c> is already true and the outage and
+    /// access denied gates above cannot fire. But a COMException escaping from
+    /// here would still reach the plain arm of the submit's own catch, become an
+    /// InvalidOperationException, and invalidate an order the CA had already
+    /// decided. A line added to explain a refusal would have destroyed the
+    /// refusal it was explaining.
+    /// </para>
+    /// <para>
+    /// Deliberately broad, because the failures are not one shape. The dispatch
+    /// can raise COMException, a certcli build that does not expose the name
+    /// raises RuntimeBinderException, and a return shape other than a LONG raises
+    /// InvalidCastException. None of them is worth a request. The value is a
+    /// diagnostic and its absence is an ordinary answer, which is why
+    /// <see cref="SubmitResult.StatusCode"/> documents "read failed" as one of
+    /// the three cases no caller may tell apart.
+    /// </para>
+    /// <para>
+    /// Zero maps to null. GetLastStatus answers S_OK after a call that succeeded,
+    /// so a zero means the request was not refused rather than refused for reason
+    /// zero, and <see cref="MapToCertificateInfo"/> already reads the CA view's
+    /// own StatusCode column the same way.
+    /// </para>
+    /// </remarks>
+    /// <param name="certRequest">
+    /// The CCertRequest instance that ran the submit, taken as object rather than
+    /// as dynamic on purpose. A dynamic argument makes the whole call dynamically
+    /// dispatched, which makes its result dynamic too, and that spreads: the log
+    /// call below it cannot bind an extension method on a dynamic argument at all
+    /// (CS1973). Binding this one call statically keeps the dynamic dispatch where
+    /// it belongs, on the COM method inside.
+    /// </param>
+    private int? ReadLastStatus(object certRequest)
+    {
+        try
+        {
+            dynamic d = certRequest;
+            var code = (int)d.GetLastStatus();
+            return code == 0 ? null : code;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "The CA accepted the request but its status code could not be read, so the " +
+                "refusal is reported with the CA's own message alone");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// What the CA said about a submitted request, as a <see cref="SubmitResult"/>.
+    ///
+    /// Split out of <see cref="SubmitCertificateRequestAsync"/> so the mapping and
+    /// the sanitize have a test seam, the same shape as
+    /// <see cref="MapToCertificateInfo"/> one path over: the submit itself needs a
+    /// live CA, this does not.
+    ///
+    /// The message is CA authored text bound for an ACME problem document, the
+    /// wizard and the settings page, so it goes through
+    /// <see cref="CertificateTextSanitizer"/> exactly as the sync path's copy of
+    /// the same column does (issue #362). That call is pure string work and cannot
+    /// reach the CA, so placing it here does not disturb the submitReturned
+    /// reasoning above: nothing it can throw is a statement about connectivity.
+    ///
+    /// A blank message becomes null rather than an empty string, which is what
+    /// lets the "no reason given" fallbacks in <c>OrderService</c> and
+    /// <c>TlsCertificateEnroller</c> fire for a CA that answered with nothing.
+    /// </summary>
+    /// <param name="statusCode">
+    /// The HRESULT the caller read for a refusal (issue #356), or null. It is not
+    /// read here because reading it needs the live CCertRequest instance, which is
+    /// exactly what keeping this method free of the CA buys.
+    /// </param>
+    internal static SubmitResult BuildSubmitResult(
+        int requestId, int disposition, string? rawMessage, int? statusCode = null)
+    {
+        return new SubmitResult(requestId, MapDisposition(disposition),
+            CertificateTextSanitizer.SanitizeDispositionMessage(rawMessage),
+            statusCode);
     }
 
     public Task<CertificateResult> GetCertificateAsync(
@@ -425,6 +721,29 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                     CertificateStatus.Issued,
                     CertificateDer: certDer,
                     CertificatePem: chainPem);
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                // ICertRequest::GetIssuedCertificate needs the caller to be the
+                // request's own submitter or to hold "Read" on the CA, the same ACL
+                // CCertView::OpenConnection needs below. No gate here, unlike the
+                // submit: this call writes nothing and decides nothing, so there is no
+                // "past this point" to protect. The certificate exists at the CA
+                // either way and is collected by the pending issuance sweep once the
+                // right is restored.
+                _logger.LogError(ex,
+                    "CA collection access denied for RequestId={RequestId}. HRESULT: 0x{HResult:X8}",
+                    requestId, ex.HResult);
+                throw new CaAccessDeniedException(
+                    CaAccessDeniedException.CollectPermissionMessage, ex);
+            }
+            catch (COMException ex) when (CaAccessDeniedException.IsAccessDenied(ex))
+            {
+                _logger.LogError(ex,
+                    "CA collection access denied for RequestId={RequestId}. HRESULT: 0x{HResult:X8}",
+                    requestId, ex.HResult);
+                throw new CaAccessDeniedException(
+                    CaAccessDeniedException.CollectPermissionMessage, ex);
             }
             catch (COMException ex)
             {
@@ -567,6 +886,17 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                 var skipped = 0;
                 var warnedMissingDisposition = false;
 
+                // Resolved once rather than per row. A subject search runs on the
+                // mapped subject below, and the certificate's own parsed subject
+                // is the last link in the chain that produces it, so a skipped
+                // row would be searched on a different value than an unskipped
+                // one. The sync never sets SubjectContains and is the only
+                // production caller, so this costs nothing today; it is here so
+                // the two cannot start interacting silently later.
+                var alreadyDetailed = query.SubjectContains == null
+                    ? query.AlreadyDetailed
+                    : null;
+
                 // Skip and Take count result-eligible rows, not raw view rows: a
                 // malformed row or one filtered out by SubjectContains must not
                 // consume a page slot. ICertView has no server-side offset, so for a
@@ -595,7 +925,7 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                             string.Join(", ", values.Keys));
                     }
 
-                    var certInfo = MapToCertificateInfo(values, templateMap);
+                    var certInfo = MapToCertificateInfo(values, templateMap, alreadyDetailed);
                     if (certInfo == null)
                         continue; // malformed row, does not count toward paging
 
@@ -640,6 +970,157 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                         "ADCS Certificate Authority is unavailable (CertSvc RPC unreachable).", ex);
                 throw new InvalidOperationException(
                     $"Failed to query CA database: {ex.Message}", ex);
+            }
+            finally
+            {
+                ReleaseCom(rowEnum);
+                ReleaseCom(certView);
+            }
+        }, cancellationToken);
+    }
+
+    /// <summary>
+    /// Reads back what the CA recorded against one request (issue #365).
+    ///
+    /// <para>
+    /// Deliberately not <see cref="QueryCertificatesAsync"/> with a request id
+    /// added to <see cref="CertificateQuery"/>. Two reasons, and the first is a
+    /// trap. <see cref="ApplyRestrictions"/> confines a query with no explicit
+    /// status to issued rows, so a request id query routed through it would
+    /// return nothing for exactly the denial this exists to read, and would do so
+    /// only against a real CA. The second is cost: that path resolves template
+    /// display names on every call, which needs a CA round trip and an AD bind
+    /// this has no use for.
+    /// </para>
+    ///
+    /// <para>
+    /// One restriction, on the request table's primary key, and no disposition
+    /// restriction at all, so every disposition is visible. That is the shape
+    /// <c>certutil -view -restrict "RequestId=N"</c> takes.
+    /// </para>
+    /// </summary>
+    public Task<CaRequestStatus?> GetRequestStatusAsync(
+        int requestId,
+        CancellationToken cancellationToken = default)
+    {
+        return Task.Run<CaRequestStatus?>(() =>
+        {
+            _logger.LogDebug("Reading the CA's record of request {RequestId}", requestId);
+
+            object? certView = null;
+            object? rowEnum = null;
+            try
+            {
+                certView = new CertViewClass();
+                dynamic v = certView;
+                v.OpenConnection(_caConnectionString);
+
+                // The same degrade unless required treatment the query path uses:
+                // a schema name the deployed certcli does not recognise must cost
+                // the column rather than the whole read. RequestID and Disposition
+                // are required for the same reason they are there, since without
+                // either there is nothing to answer with.
+                var columns = new[]
+                {
+                    ColumnName.RequestId,
+                    ColumnName.Disposition,
+                    ColumnName.DispositionMessage,
+                    ColumnName.StatusCode
+                };
+
+                var resolvedColumns = new List<int>(columns.Length);
+                var requestIdIndex = -1;
+                foreach (var col in columns)
+                {
+                    try
+                    {
+                        var index = (int)v.GetColumnIndex(ColumnType.Schema, col);
+                        resolvedColumns.Add(index);
+                        if (col == ColumnName.RequestId)
+                            requestIdIndex = index;
+                    }
+                    catch (Exception ex) when (!IsRequiredColumn(col))
+                    {
+                        _logger.LogWarning(ex,
+                            "CA view does not expose the {Column} column; continuing without it",
+                            col);
+                    }
+                }
+
+                v.SetResultColumnCount(resolvedColumns.Count);
+                foreach (var idx in resolvedColumns)
+                    v.SetResultColumn(idx);
+
+                object idValue = requestId;
+                v.SetRestriction(
+                    requestIdIndex,
+                    SeekOperator.Equal,
+                    SortOrder.None,
+                    idValue);
+
+                rowEnum = v.OpenView();
+                dynamic e = rowEnum!;
+
+                if ((int)e.Next() == -1)
+                {
+                    // No such request. Not an error: the caller holds a request id
+                    // this CA has no row for, which is what a restored database
+                    // pointed at a different CA looks like.
+                    _logger.LogDebug("The CA has no row for request {RequestId}", requestId);
+                    return null;
+                }
+
+                object colEnum = e.EnumCertViewColumn();
+                var values = ReadColumnValues(colEnum, resolvedColumns.Count);
+                ReleaseCom(colEnum);
+
+                if (!values.ContainsKey(ColumnName.Disposition))
+                {
+                    // Unclassifiable, exactly as in MapToCertificateInfo. Guessing
+                    // a status here would put a wrong word in an ACME error.
+                    _logger.LogWarning(
+                        "The CA returned request {RequestId} without a readable Disposition " +
+                        "column (columns seen: {Columns})",
+                        requestId, string.Join(", ", values.Keys));
+                    return null;
+                }
+
+                var disposition = values.GetValueOrDefault(ColumnName.Disposition) is int disp ? disp : 0;
+                var status = MapCertificateStatus(disposition);
+
+                return new CaRequestStatus(
+                    requestId,
+                    status,
+                    CarriesExplanation(status) ? ReadDispositionMessage(values) : null,
+                    CarriesExplanation(status) ? ReadStatusCode(values) : null);
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                // A CA view read, so it is the sync's "Read" right that is missing
+                // and not the collection one. Naming the wrong permission would
+                // send an operator to the wrong checkbox.
+                _logger.LogError(ex,
+                    "CA view access denied reading request {RequestId}. HRESULT: 0x{HResult:X8}",
+                    requestId, ex.HResult);
+                throw new CaAccessDeniedException(CaAccessDeniedException.SyncReadPermissionMessage, ex);
+            }
+            catch (COMException ex) when (CaAccessDeniedException.IsAccessDenied(ex))
+            {
+                _logger.LogError(ex,
+                    "CA view access denied reading request {RequestId}. HRESULT: 0x{HResult:X8}",
+                    requestId, ex.HResult);
+                throw new CaAccessDeniedException(CaAccessDeniedException.SyncReadPermissionMessage, ex);
+            }
+            catch (COMException ex)
+            {
+                _logger.LogError(ex,
+                    "Failed to read the CA's record of request {RequestId}. HRESULT: 0x{HResult:X8}",
+                    requestId, ex.HResult);
+                if (CaUnavailableException.IsRpcUnavailable(ex))
+                    throw new CaUnavailableException(
+                        "ADCS Certificate Authority is unavailable (CertSvc RPC unreachable).", ex);
+                throw new InvalidOperationException(
+                    $"Failed to read the CA's record of request {requestId}: {ex.Message}", ex);
             }
             finally
             {
@@ -774,17 +1255,32 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
 
     /// <summary>
     /// Resolves a raw CA template token to its friendly display name using the
-    /// map from <see cref="BuildTemplateDisplayMap"/>. Returns the raw token
-    /// unchanged when there is no entry (for example a decommissioned template no
-    /// longer present on the CA), and an empty string for empty input.
+    /// map from <see cref="BuildTemplateDisplayMap"/>. Returns the raw token when
+    /// there is no entry (for example a decommissioned template no longer present
+    /// on the CA), and an empty string for empty input.
+    ///
+    /// <para>
+    /// The result is sanitized, which is why the token is returned "when" there is
+    /// no entry rather than "unchanged" (issue #378). Neither value it can return
+    /// is authored by Ducks: one is a CA row, the other a directory read. Doing it
+    /// here rather than at the call site covers both with one strip and puts it
+    /// where a test can reach it, since the row mapper itself needs a live CA view.
+    /// </para>
+    ///
+    /// <para>
+    /// After the lookup, never before. The map is keyed on exactly what the CA
+    /// stored, so a stripped key would miss its entry and force the raw fallback
+    /// for the very rows this guards.
+    /// </para>
     /// </summary>
     internal static string ResolveTemplateName(string? rawTemplate, IReadOnlyDictionary<string, string> map)
     {
         if (string.IsNullOrEmpty(rawTemplate))
             return "";
-        return map.TryGetValue(rawTemplate, out var displayName) && !string.IsNullOrWhiteSpace(displayName)
+        var resolved = map.TryGetValue(rawTemplate, out var displayName) && !string.IsNullOrWhiteSpace(displayName)
             ? displayName
             : rawTemplate;
+        return CertificateTextSanitizer.SanitizeTemplateName(resolved) ?? "";
     }
 
     /// <summary>
@@ -1020,9 +1516,15 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
         return values;
     }
 
+    /// <param name="alreadyDetailed">
+    /// Request IDs whose DER the caller already holds everything from, so the
+    /// decode and parse are skipped for them (issue #184). Null parses every row.
+    /// See <see cref="CertificateQuery.AlreadyDetailed"/> for the contract.
+    /// </param>
     internal CertificateInfo? MapToCertificateInfo(
         Dictionary<string, object?> values,
-        IReadOnlyDictionary<string, string> templateMap)
+        IReadOnlyDictionary<string, string> templateMap,
+        IReadOnlySet<int>? alreadyDetailed = null)
     {
         try
         {
@@ -1039,14 +1541,7 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
 
             var serialNumber = values.GetValueOrDefault(ColumnName.SerialNumber)?.ToString() ?? "";
             var disposition = values.GetValueOrDefault(ColumnName.Disposition) is int disp ? disp : 0;
-            var status = disposition switch
-            {
-                DbDisposition.Issued => CertificateStatus.Issued,
-                DbDisposition.Revoked => CertificateStatus.Revoked,
-                DbDisposition.Pending => CertificateStatus.Pending,
-                DbDisposition.Denied => CertificateStatus.Denied,
-                _ => CertificateStatus.Failed
-            };
+            var status = MapCertificateStatus(disposition);
 
             // Which subject column is authoritative depends on whether anything
             // was actually issued, so the status is resolved before the name.
@@ -1090,6 +1585,8 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                     issuedDn,
                     issuedCn)
                 : FirstNonBlank(issuedDn, issuedCn);
+            // ResolveTemplateName sanitizes what it returns (issue #378), so this
+            // column arrives guarded like the names above it rather than raw.
             var rawTemplate = values.GetValueOrDefault(ColumnName.CertificateTemplate)?.ToString() ?? "";
             var template = ResolveTemplateName(rawTemplate, templateMap);
             var notBefore = values.GetValueOrDefault(ColumnName.NotBefore) is DateTime nb ? nb : DateTime.MinValue;
@@ -1104,10 +1601,21 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
             // subject DN, so the CA database subject columns are empty and the
             // issued certificate is the authoritative source. All of it is
             // optional: any decode failure keeps the row, just without them.
+            //
+            // Skipped entirely for a row the caller says it already holds all
+            // four of (issue #184). The sync sweeps the whole inventory on every
+            // interval tick, so without this every certificate the CA has ever
+            // issued is decoded from base64, loaded through crypt32, hashed, has
+            // its public key imported and four extensions decoded, several
+            // hundred times a day, to reproduce values that were stored the first
+            // time and cannot legitimately change. The three locals stay null,
+            // which is the same shape a row with no blob has always produced and
+            // which every writer in CertificateSyncService.UpdateEntity guards.
             string? sans = null;
             CertificateCryptoDetail? cryptoDetail = null;
             byte[]? rawCertificate = null;
-            if (values.GetValueOrDefault(ColumnName.RawCertificate) is string rawBase64 &&
+            if (alreadyDetailed?.Contains(requestId) != true &&
+                values.GetValueOrDefault(ColumnName.RawCertificate) is string rawBase64 &&
                 !string.IsNullOrWhiteSpace(rawBase64))
             {
                 try
@@ -1173,15 +1681,10 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
             // A zero StatusCode means success and never carries information.
             string? dispositionMessage = null;
             int? statusCode = null;
-            if (status is CertificateStatus.Pending
-                or CertificateStatus.Denied
-                or CertificateStatus.Failed)
+            if (CarriesExplanation(status))
             {
-                dispositionMessage = CertificateTextSanitizer.SanitizeDispositionMessage(
-                    values.GetValueOrDefault(ColumnName.DispositionMessage)?.ToString());
-                statusCode = values.GetValueOrDefault(ColumnName.StatusCode) is int sc && sc != 0
-                    ? sc
-                    : null;
+                dispositionMessage = ReadDispositionMessage(values);
+                statusCode = ReadStatusCode(values);
             }
 
             return new CertificateInfo(

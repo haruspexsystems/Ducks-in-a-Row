@@ -89,6 +89,68 @@ public class PermanentIdentifierValueTests
         error.Should().NotBeNullOrEmpty();
     }
 
+    // Until issue #234 this guard checked control characters and nothing else,
+    // so a device serial could carry a bidirectional override into the domain
+    // policy audit rows and the dashboard that renders them. The value arrives
+    // client supplied over ACME newOrder.
+    [Theory]
+    [InlineData("AB\u2028C", "line separator", 0x2028)] // Zl, the issue #234 gap
+    [InlineData("AB\u2029C", "line separator", 0x2029)] // Zp
+    [InlineData("AB\u202EC", "formatting", 0x202E)]     // right to left override
+    [InlineData("AB\u200BC", "formatting", 0x200B)]     // zero width space
+    [InlineData("AB\u0007C", "control", 0x0007)]        // unchanged behaviour
+    public void TryParse_DeceptiveCharacter_RejectsWithItsOwnLabel(
+        string raw, string kind, int codePoint)
+    {
+        var ok = PermanentIdentifierValue.TryParse(raw, out var parsed, out var error);
+
+        ok.Should().BeFalse();
+        parsed.Should().BeNull();
+        error.Should().Contain($"{kind} character");
+        error.Should().Contain($"U+{codePoint:X4}");
+        error.Should().NotContain(raw, "a client supplied value is never echoed back");
+    }
+
+    [Theory]
+    [InlineData(0xE0001)] // language tag
+    [InlineData(0xE0041)] // tag latin capital A, which hides text outright
+    [InlineData(0xE007F)] // cancel tag
+    public void TryParse_FormatCharacterAboveTheBmp_Rejects(int codePoint)
+    {
+        // The old per char loop could not see these at all: they arrive as a
+        // surrogate pair and the category of a lone surrogate is Surrogate,
+        // never Format. This guard never got the issue #228 fix the others did.
+        var raw = "SN-1" + char.ConvertFromUtf32(codePoint) + "234";
+
+        PermanentIdentifierValue.TryParse(raw, out var parsed, out var error).Should().BeFalse();
+        parsed.Should().BeNull();
+        error.Should().Contain(
+            $"U+{codePoint:X4}", "the reported code point is the rune, not a surrogate half");
+    }
+
+    [Fact]
+    public void TryParse_TrailingLineSeparator_ReportsTheSeparatorNotWhitespace()
+    {
+        // char.IsWhiteSpace is true for Zl and Zp, so the leading and trailing
+        // whitespace check would answer first and name the wrong reason. The
+        // character scan deliberately runs ahead of it.
+        PermanentIdentifierValue.TryParse("SN-1\u2028", out _, out var error).Should().BeFalse();
+
+        error.Should().Contain("line separator character");
+        error.Should().NotContain("whitespace");
+    }
+
+    [Fact]
+    public void TryParse_OrdinaryCharacterAboveTheBmp_Parses()
+    {
+        // The guard refuses named classes, not everything wide. An asset tag
+        // reaching outside the BMP is not this guard's business.
+        PermanentIdentifierValue.TryParse("SN-1 \U0001F600", out var parsed, out var error)
+            .Should().BeTrue();
+        parsed.Should().NotBeNull();
+        error.Should().BeNull();
+    }
+
     [Fact]
     public void TryParse_MaxLength_IsExactly253()
     {

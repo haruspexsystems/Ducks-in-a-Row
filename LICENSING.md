@@ -25,12 +25,19 @@ You need a commercial license from Haruspex Systems B.V. if you want to:
 - offer Ducks in a Row to third parties as a **hosted or managed service**
   whose value comes mainly from the software itself, or
 - **resell or redistribute** it as a competing commercial certificate
-  lifecycle management product, or
-- use the **paid tier** features (multi-CA, REST API, RBAC, advanced
-  reporting, HA / clustering, EST).
+  lifecycle management product.
 
 If that describes you, contact us about a commercial license rather than using
 the work under the BSL.
+
+## The paid tier is separate
+
+This repository holds the core of Ducks in a Row, and everything in it is
+published under the BSL as this page describes. The paid tier is not part of
+this repository and is not covered by the BSL: it ships as separate, closed
+source modules that install alongside the core, under a commercial license from
+Haruspex Systems B.V. The four year conversion to Apache 2.0 described below
+applies to the core.
 
 ## It becomes open source over time
 
@@ -48,4 +55,5 @@ permissive open source.
 
 ## Commercial licensing and questions
 
-Contact Haruspex Systems B.V. at licensing@haruspex.systems.
+Contact Haruspex Systems B.V. (Zevenaar, the Netherlands, KVK 42142878) at
+licensing@haruspex.systems.

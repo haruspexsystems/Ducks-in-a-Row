@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
@@ -5,6 +6,16 @@ import path from 'path'
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
+  // Unit tests for the pure helpers: the readers in src/types that mirror C#
+  // code the dashboard has to agree with, the rules in src/lib, and the client
+  // setup snippet builders. Node environment rather than a DOM one on purpose:
+  // nothing here touches the document, and pulling in jsdom for string
+  // functions would be a dependency the suite does not use. Add a DOM
+  // environment alongside this when the first component test arrives.
+  test: {
+    environment: 'node',
+    include: ['src/**/*.test.ts'],
+  },
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),

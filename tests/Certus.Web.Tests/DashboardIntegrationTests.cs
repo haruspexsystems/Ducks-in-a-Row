@@ -244,19 +244,64 @@ public class DashboardIntegrationTests
         body.GetProperty("detail").GetString().Should().Contain("expiring");
     }
 
-    [Fact]
-    public async Task ListCertificates_ExpiredState_MatchesTheExpiredStatCard()
+    [Theory]
+    [InlineData("expiring", "expiringSoon")]
+    [InlineData("expired", "expired")]
+    [InlineData("revoked", "revokedCertificates")]
+    public async Task ListCertificates_StateFilter_MatchesTheStatCardItLinksFrom(
+        string state, string cardProperty)
     {
-        // The two surfaces the dashboard puts side by side: the Expired card and
-        // the list its Quick Action links to. They read the same predicate now,
-        // so the numbers cannot drift (issue #155).
+        // The two surfaces the dashboard puts side by side: a stat card and the
+        // list its Quick Action links to. They read the same predicate now, so
+        // the numbers cannot drift (issue #155).
+        //
+        // All three pairs, not just expired. Issue #214 reported the revoked
+        // pair disagreeing on a live install, and CI could not answer it: the
+        // expired pair was pinned here and the other two were not. The report
+        // turned out to be a QA harness misreading the card's property name,
+        // but the gap it walked into was real, and an invariant worth stating
+        // for one card is worth proving for all of them.
+        //
+        // The card property is named as a literal on purpose. Deserializing
+        // into CertificateStats would follow a rename on both sides at once and
+        // prove nothing about the wire; these strings are the contract the
+        // dashboard and every external reader actually bind to.
+        //
+        // Relational, not absolute. The factory is shared, so what matters is
+        // that the two numbers agree, never what they are.
         await SeedCertificatesAsync();
 
-        var listed = await ParseJsonAsync(await _client.GetAsync("/api/certificates?state=expired"));
+        var listed = await ParseJsonAsync(await _client.GetAsync($"/api/certificates?state={state}"));
         var stats = await ParseJsonAsync(await _client.GetAsync("/api/certificates/stats"));
 
         listed.GetProperty("totalCount").GetInt32()
-            .Should().Be(stats.GetProperty("expired").GetInt32());
+            .Should().Be(stats.GetProperty(cardProperty).GetInt32());
+    }
+
+    [Fact]
+    public async Task ListCertificates_ValidExpiringExpired_PartitionTheIssuedStatCard()
+    {
+        // The invariant StatePredicate's own remarks assert: the three issued
+        // states partition Status == Issued with no gap and no overlap, so
+        // valid + expiring + expired always equals the issued count.
+        //
+        // Proved rather than trusted, because it is the one check that catches a
+        // boundary drift in either direction. A certificate counted twice or
+        // dropped between two states breaks the sum even when all four counts
+        // still look individually plausible, and the per card pairing above
+        // would pass throughout.
+        await SeedCertificatesAsync();
+
+        var valid = await ParseJsonAsync(await _client.GetAsync("/api/certificates?state=valid"));
+        var expiring = await ParseJsonAsync(await _client.GetAsync("/api/certificates?state=expiring"));
+        var expired = await ParseJsonAsync(await _client.GetAsync("/api/certificates?state=expired"));
+        var stats = await ParseJsonAsync(await _client.GetAsync("/api/certificates/stats"));
+
+        var partitioned = valid.GetProperty("totalCount").GetInt32()
+                        + expiring.GetProperty("totalCount").GetInt32()
+                        + expired.GetProperty("totalCount").GetInt32();
+
+        partitioned.Should().Be(stats.GetProperty("issuedCertificates").GetInt32());
     }
 
     [Fact]

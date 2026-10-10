@@ -1,5 +1,6 @@
 using Certus.Core.Acme.Models;
 using Certus.Core.Acme.Services;
+using Certus.Core.Security;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 
@@ -11,7 +12,7 @@ namespace Certus.Web.Controllers.Acme;
 /// Each ADCS template gets its own directory: GET /acme/{template}/directory
 /// </summary>
 [ApiController]
-[EnableRateLimiting("acme-general")]
+[EnableRateLimiting(AcmeRateLimitPolicies.General)]
 public sealed class DirectoryController : AcmeControllerBase
 {
     private readonly TemplateService _templateService;
@@ -41,6 +42,7 @@ public sealed class DirectoryController : AcmeControllerBase
             NewNonce = AcmeUrl($"/acme/{template}/new-nonce"),
             NewAccount = AcmeUrl($"/acme/{template}/new-account"),
             NewOrder = AcmeUrl($"/acme/{template}/new-order"),
+            RenewalInfo = AcmeUrl($"/acme/{template}/renewalInfo"),
             RevokeCert = AcmeUrl($"/acme/{template}/revoke-cert"),
             KeyChange = AcmeUrl($"/acme/{template}/key-change"),
             Meta = new AcmeDirectoryMeta

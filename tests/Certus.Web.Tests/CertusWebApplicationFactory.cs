@@ -60,6 +60,19 @@ public class CertusWebApplicationFactory : WebApplicationFactory<Program>
         builder.UseSetting(
             $"{AuthOptions.SectionName}:{nameof(AuthOptions.Mode)}", AuthOptions.ModeDisabled);
 
+        // Keep the settings overlay out of the real data directory for the
+        // manually bound options copy too. The PostConfigure below redirects
+        // SettingsOverlayPath for every IOptions<CertusOptions> consumer, but
+        // Program.cs binds its own copy from configuration before DI is built,
+        // and the startup CA guard reads the overlay through that copy (issue
+        // #305). Without this line the guard would read the real
+        // ProgramData overlay, so a developer machine with a configured
+        // installation on it would fail every web test at host startup.
+        // Configuration, not DI, for the same reason as the two settings above.
+        builder.UseSetting(
+            $"{CertusOptions.SectionName}:{nameof(CertusOptions.SettingsOverlayPath)}",
+            Path.Combine(_tempDataDir, "settings.json"));
+
         Directory.CreateDirectory(_tempDataDir);
 
         // The template policy fails closed (issue #101): with no wizard status

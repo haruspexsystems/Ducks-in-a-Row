@@ -26,7 +26,7 @@
     if (dark) {
       document.documentElement.classList.add('dark');
     }
-  } catch (e) {
+  } catch {
     /* Storage or matchMedia unavailable (private mode, ancient browser).
        Fall through to light, which is the default the stylesheet already
        assumes, so there is nothing to undo. */

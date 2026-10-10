@@ -38,7 +38,7 @@ public class CaUnavailableIntegrationTests : IClassFixture<CaUnavailableIntegrat
 
         root.GetProperty("status").GetInt32().Should().Be(503);
         root.GetProperty("title").GetString().Should().NotBeNullOrEmpty();
-        root.GetProperty("type").GetString().Should().Be("https://ducksinarow.app/problems/ca-unavailable");
+        root.GetProperty("type").GetString().Should().Be("https://ducksinarow.dev/problems/ca-unavailable");
         root.GetProperty("detail").GetString().Should().NotBeNullOrEmpty();
     }
 
@@ -105,7 +105,7 @@ public class CaUnavailableIntegrationTests : IClassFixture<CaUnavailableIntegrat
         var root = doc.RootElement;
 
         root.GetProperty("status").GetInt32().Should().Be(503);
-        root.GetProperty("type").GetString().Should().Be("https://ducksinarow.app/problems/ca-unavailable");
+        root.GetProperty("type").GetString().Should().Be("https://ducksinarow.dev/problems/ca-unavailable");
         root.GetProperty("title").GetString().Should().NotBeNullOrEmpty();
         root.GetProperty("detail").GetString().Should().NotBeNullOrEmpty();
     }
@@ -188,6 +188,10 @@ public class CaUnavailableIntegrationTests : IClassFixture<CaUnavailableIntegrat
 
         public Task<IReadOnlyList<CertificateInfo>> QueryCertificatesAsync(
             CertificateQuery query, CancellationToken cancellationToken = default)
+            => throw Build();
+
+        public Task<CaRequestStatus?> GetRequestStatusAsync(
+            int requestId, CancellationToken cancellationToken = default)
             => throw Build();
 
         public Task RevokeCertificateAsync(

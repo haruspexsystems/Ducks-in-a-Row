@@ -69,7 +69,8 @@ public class AlertConfigWriteIntegrationTests : IClassFixture<CertusWebApplicati
         string username = "",
         string fromName = "Ducks in a Row",
         string? password = null,
-        bool clearPassword = false) => new
+        bool clearPassword = false,
+        bool clearUsername = false) => new
         {
             enabled,
             checkIntervalMinutes = interval,
@@ -80,6 +81,7 @@ public class AlertConfigWriteIntegrationTests : IClassFixture<CertusWebApplicati
                 port,
                 tlsMode,
                 username,
+                clearUsername,
                 password,
                 clearPassword,
                 fromAddress = from,
@@ -182,7 +184,7 @@ public class AlertConfigWriteIntegrationTests : IClassFixture<CertusWebApplicati
     }
 
     [Fact]
-    public async Task Put_ClearPassword_RemovesTheStoredBlob()
+    public async Task Put_ClearPassword_StoresAnEmptyBlobSoTheRemovalIsRecorded()
     {
         await _client.PutAsJsonAsync(
             "/api/alerts/config", ValidBody(username: "svc-ducks", password: "hunter2"));
@@ -192,7 +194,13 @@ public class AlertConfigWriteIntegrationTests : IClassFixture<CertusWebApplicati
             "/api/alerts/config", ValidBody(clearPassword: true));
 
         response.StatusCode.Should().Be(HttpStatusCode.OK);
-        SavedAlerts()!.Smtp!.PasswordProtected.Should().BeNull();
+
+        // Empty, not null, the same distinction the username draws. Null would
+        // mean the dashboard does not manage this field and appsettings.json
+        // decides, which is indistinguishable from never having saved a
+        // password, so every reader that falls back on the overlay's silence
+        // would go on using the one this save just removed (issue #286).
+        SavedAlerts()!.Smtp!.PasswordProtected.Should().BeEmpty();
     }
 
     [Fact]
@@ -266,6 +274,96 @@ public class AlertConfigWriteIntegrationTests : IClassFixture<CertusWebApplicati
         saved.Smtp.TlsMode.Should().Be("implicit");
         saved.Smtp.Username.Should().Be("svc-ducks");
         saved.Smtp.FromName.Should().Be("Certificate Alerts");
+    }
+
+    /// <summary>
+    /// The regression issue #261 had to avoid to be shippable at all. The config
+    /// endpoint no longer returns the username, so the card renders an empty
+    /// username box, and a save of any unrelated field submits that empty box.
+    /// If an empty username still meant "contact the relay anonymously", the
+    /// first ordinary edit after a page load would drop relay authentication
+    /// with no error and nothing in the response to notice it by.
+    /// </summary>
+    [Fact]
+    public async Task Put_WithNoUsername_KeepsTheStoredOneRatherThanBlankingIt()
+    {
+        await _client.PutAsJsonAsync("/api/alerts/config", ValidBody(username: "svc-ducks"));
+        SavedAlerts()!.Smtp!.Username.Should().Be("svc-ducks");
+
+        // An ordinary edit of an unrelated field, with the username box empty
+        // exactly as the card submits it.
+        var response = await _client.PutAsJsonAsync(
+            "/api/alerts/config", ValidBody(interval: 120, username: ""));
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        var saved = SavedAlerts();
+        saved!.CheckIntervalMinutes.Should().Be(120);
+        saved.Smtp!.Username.Should().Be("svc-ducks");
+    }
+
+    [Fact]
+    public async Task Put_WithClearUsername_StoresAnEmptyOneSoTheRelayIsAnonymous()
+    {
+        await _client.PutAsJsonAsync("/api/alerts/config", ValidBody(username: "svc-ducks"));
+
+        var response = await _client.PutAsJsonAsync(
+            "/api/alerts/config", ValidBody(clearUsername: true));
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        // Empty, not null. Null would mean the dashboard does not manage this
+        // field and appsettings.json decides, which is a different state from
+        // an administrator having deliberately removed the account name.
+        SavedAlerts()!.Smtp!.Username.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task Put_SettingAndClearingTheUsernameAtOnce_IsRejected()
+    {
+        var response = await _client.PutAsJsonAsync(
+            "/api/alerts/config", ValidBody(username: "svc-ducks", clearUsername: true));
+
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+
+        var body = await ParseJsonAsync(response);
+        body.GetProperty("problems").EnumerateArray().Should().Contain(
+            p => p.GetString()!.Contains("remove the saved one"));
+    }
+
+    /// <summary>
+    /// The warning has to read the overlay rather than the process once a
+    /// removal is saved. The bound options still carry the old account name
+    /// until the restart lands, so treating those as evidence that a username
+    /// is stored would silence the warning about the state the removal just
+    /// created: a password standing on its own.
+    /// </summary>
+    [Fact]
+    public async Task Put_AfterClearingTheUsername_StillWarnsThatThePasswordStandsAlone()
+    {
+        await _client.PutAsJsonAsync(
+            "/api/alerts/config", ValidBody(username: "svc-ducks", password: "hunter2"));
+        await _client.PutAsJsonAsync("/api/alerts/config", ValidBody(clearUsername: true));
+
+        // An ordinary later edit, carrying no username at all.
+        var response = await _client.PutAsJsonAsync(
+            "/api/alerts/config", ValidBody(interval: 90));
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body = await ParseJsonAsync(response);
+        body.GetProperty("warnings").EnumerateArray().Select(w => w.GetString())
+            .Should().Contain(w => w!.Contains("username is blank"));
+    }
+
+    [Fact]
+    public async Task Put_ANewUsername_ReplacesTheStoredOne()
+    {
+        await _client.PutAsJsonAsync("/api/alerts/config", ValidBody(username: "svc-ducks"));
+
+        var response = await _client.PutAsJsonAsync(
+            "/api/alerts/config", ValidBody(username: "svc-herons"));
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        SavedAlerts()!.Smtp!.Username.Should().Be("svc-herons");
     }
 
     [Fact]
@@ -381,6 +479,29 @@ public class AlertConfigWriteIntegrationTests : IClassFixture<CertusWebApplicati
     }
 
     /// <summary>
+    /// Removing a credential is still an act of ownership. Both halves have to
+    /// stay on the managed list afterwards, or the card would tell an
+    /// administrator that appsettings.json decides a field they just emptied
+    /// from this page. Before issue #286 the username stayed and the password
+    /// silently dropped off, because a removal stored nothing for it.
+    /// </summary>
+    [Fact]
+    public async Task GetConfig_AfterClearingBothHalvesOfTheCredential_StillReportsThemManaged()
+    {
+        await _client.PutAsJsonAsync(
+            "/api/alerts/config", ValidBody(username: "svc-ducks", password: "hunter2"));
+        await _client.PutAsJsonAsync(
+            "/api/alerts/config", ValidBody(clearUsername: true, clearPassword: true));
+
+        var body = await ParseJsonAsync(await _client.GetAsync("/api/alerts/config"));
+
+        var managed = body.GetProperty("managedFields").EnumerateArray()
+            .Select(e => e.GetString()).ToList();
+        managed.Should().Contain("smtp.username");
+        managed.Should().Contain("smtp.password");
+    }
+
+    /// <summary>
     /// A restart stays owed until it happens, so the server has to answer that
     /// question on every read rather than the browser remembering it.
     ///
@@ -406,7 +527,7 @@ public class AlertConfigWriteIntegrationTests : IClassFixture<CertusWebApplicati
     public async Task Put_BlankSenderWithARelayHost_IsRejected()
     {
         // Every save writes this key, so a blank one would overwrite the
-        // certus@localhost default with an empty string. Nothing downstream
+        // ducks@localhost default with an empty string. Nothing downstream
         // objects and the failure only appears at the relay.
         var response = await _client.PutAsJsonAsync("/api/alerts/config", ValidBody(from: ""));
 
@@ -432,10 +553,12 @@ public class AlertConfigWriteIntegrationTests : IClassFixture<CertusWebApplicati
     /// </para>
     ///
     /// <para>
-    /// The assertions are on secret values rather than key names now that the
-    /// username is a writable, readable field and hasPassword is a legitimate
-    /// presence flag: the field names appear, the password in any form must
-    /// not. The populated in-force case is covered by AlertConfigViewTests in
+    /// Mostly assertions on values rather than key names, because hasPassword
+    /// and hasCredentials are legitimate presence flags whose names must
+    /// appear. The username is the exception and gets both: since issue #261 it
+    /// is write only, so neither the value nor a property called "username" may
+    /// come back, which is also the rule the QA secret guard applies. The
+    /// populated in-force case is covered by AlertConfigViewTests in
     /// Certus.Core.Tests; it cannot be covered here without restarting the
     /// host.
     /// </para>
@@ -453,9 +576,12 @@ public class AlertConfigWriteIntegrationTests : IClassFixture<CertusWebApplicati
         json.Should().NotContain(blob);
         json.Should().NotContain("\"url\"");
         json.Should().NotContain("relay.example.com");
-        // The saved username is reported through managedFields only; the value
-        // shown in the clear is the running one, which is unset on this host.
+        // The saved username is reported through managedFields and
+        // hasCredentials only. Neither the value nor the property name comes
+        // back since issue #261, and the name matters on its own: the QA secret
+        // guard flags a field called "username" without reading it.
         json.Should().NotContain("svc-ducks");
+        json.Should().NotContain("\"username\"");
 
         var managed = JsonSerializer.Deserialize<JsonElement>(json)
             .GetProperty("managedFields").EnumerateArray().Select(e => e.GetString());

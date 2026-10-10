@@ -192,6 +192,10 @@ public class AlertTestServiceTests
         public Task<AlertNotificationResult> SendServerCertificateAlertAsync(
             ServerCertificateAlert alert, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
+
+        public Task<AlertNotificationResult> SendCrlAlertAsync(
+            CrlAlert alert, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
     }
 
     private sealed class TestTimeProvider : TimeProvider

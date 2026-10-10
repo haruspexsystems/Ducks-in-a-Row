@@ -241,6 +241,23 @@ public sealed class HttpsCertificateAutoRenewalService : BackgroundService
             await SendFailureAlertAsync(scope, attempt, daysRemaining, cancellationToken);
             return;
         }
+        catch (CaAccessDeniedException ex)
+        {
+            // Its own arm rather than the loop's general catch (issue #336). That
+            // catch keeps the service alive, which is why this was never fatal, but it
+            // records no attempt and sends no alert, so a renewal blocked by a
+            // withdrawn permission would go quiet until the certificate expired. This
+            // is the one CA failure that does not clear on its own, so it is the one
+            // that most needs the alert, and the alert carries the remediation.
+            _logger.LogError(ex,
+                "Automatic HTTPS certificate renewal was denied by the certificate authority; " +
+                "the current certificate stays in place and this will not clear on its own");
+            var attempt = Record(HttpsCertificateRenewalOutcome.Failed,
+                $"The certificate authority denied access: {ex.Message}",
+                template: context.Template);
+            await SendFailureAlertAsync(scope, attempt, daysRemaining, cancellationToken);
+            return;
+        }
 
         if (result.Outcome == HttpsCertificateRenewalOutcome.Installed)
         {

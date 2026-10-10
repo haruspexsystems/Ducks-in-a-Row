@@ -3,16 +3,53 @@ using System.Text;
 namespace Certus.Core.Adcs;
 
 /// <summary>
-/// Reads the common name out of a stored subject string, honouring the escaping
-/// the encoders actually use (issue #231).
+/// Reads the common name out of a stored subject string, honouring the quoting
+/// the encoder actually uses (issue #231).
 ///
-/// A comma is legal inside a common name value, and neither encoder that feeds
-/// this codebase drops it. Windows CertNameToStr wraps the whole value in double
-/// quotes and doubles any quote already inside it; the RFC 4514 form puts a
-/// backslash in front of it instead. Reading up to the first comma therefore
-/// returns a fragment of the name rather than the name. On a template with
-/// enrollee supplies subject the common name is whatever the certificate signing
-/// request asked for, so a requester decides when that happens.
+/// A comma is legal inside a common name value, and the encoder does not drop
+/// it: Windows CertNameToStr wraps the whole value in double quotes and doubles
+/// any quote already inside it. Reading up to the first comma therefore returns
+/// a fragment of the name rather than the name. On a template with enrollee
+/// supplies subject the common name is whatever the certificate signing request
+/// asked for, so a requester decides when that happens.
+///
+/// Quoting is the only escaping form this grammar knows, and that is a
+/// deliberate narrowing rather than an omission (issue #296). CertNameToStr has
+/// no backslash escape in either direction: a value holding a backslash is
+/// rendered with it intact and no quotes around it, because a backslash is not
+/// on its list of characters worth quoting for. So every backslash that reaches
+/// this parser is literal, and it is written back out literal.
+///
+/// The parser used to read the RFC 4514 backslash dialect alongside the Windows
+/// one, because MockAdcsClient rendered subjects through BouncyCastle. PR #293
+/// moved the mock onto X509Certificate2 like every other producer, which left
+/// one dialect and made the narrowing safe. Reading both was not merely
+/// redundant, it was wrong, and in three escalating ways that are worth keeping
+/// on the record because each one was a security finding:
+///
+/// - Decoding the RFC 4514 "\hh" byte form forged names outright (issue #238). A
+///   requester may put the literal text "\74\72\75\73\74\65\64" in a common name
+///   and Windows stores it verbatim; read as hex it spells "trusted".
+/// - Resolving the character after a backslash unconditionally rewrote names
+///   that were never escaped, so "CORP\svc" came back as "CORPsvc" with the
+///   backslash simply gone, and "CORP\ab-server" decoded to a lone 0xAB byte
+///   that is not valid UTF-8 alone and landed as a replacement character.
+/// - Treating a backslash in front of a separator as an escape swallowed the
+///   component boundary whenever a value ended in one (issue #296). Measured off
+///   a real certificate, "CN=CORP\, O=Example" read back as "CORP, O=Example",
+///   and with a component ahead of the common name, "O=CORP\,
+///   CN=leaf.example.com" read back as no common name at all. That second shape
+///   was called the ordinary ADCS ordering here until issue #297 corrected the
+///   premise: the string rendering reverses the encoding, so a name encoded
+///   general to specific renders common name first (X500NameOrderingTests). It
+///   is reachable all the same, because the callers usually hold the certificate
+///   authority's own column rather than a managed rendering, and because a multi
+///   valued relative distinguished name puts text ahead of the common name
+///   inside one component whatever the order.
+///
+/// A quoted value is unaffected by any of this. CertNameToStr writes
+/// CN="evil, O=Trusted Corp" for a name carrying a separator, and the quote and
+/// doubled quote handling below reads it exactly as it always did.
 ///
 /// This parses the string rather than the encoded name, which is deliberate.
 /// X500DistinguishedName.EnumerateRelativeDistinguishedNames is the correct
@@ -35,7 +72,7 @@ namespace Certus.Core.Adcs;
 internal static class DistinguishedNameParser
 {
     /// <summary>
-    /// The first common name value, unquoted and unescaped, or null when the
+    /// The first common name value, with its quoting decoded, or null when the
     /// subject carries none. This is the name a reader displays or keys a
     /// lineage on.
     /// </summary>
@@ -43,12 +80,16 @@ internal static class DistinguishedNameParser
 
     /// <summary>
     /// The first common name component exactly as it was spelled, "CN=" prefix
-    /// and escaping intact, or null when the subject carries none.
+    /// and quoting intact, or null when the subject carries none.
     ///
     /// The original spelling is load bearing rather than incidental.
     /// CertificateTextSanitizer re-emits this slice into a truncated subject that
-    /// then has to parse back to the same name, so handing it the unescaped value
+    /// then has to parse back to the same name, so handing it the decoded value
     /// would turn a quoted comma into a real separator and break that round trip.
+    /// That round trip is also what carries a value ending in a backslash safely
+    /// through the sanitizer: the slice keeps the backslash, the sanitizer puts a
+    /// separator after it, and the second pass no longer reads the pair as one
+    /// (issue #296).
     ///
     /// On a multi-valued relative distinguished name ("CN=a+OU=b") this returns
     /// the common name component alone rather than the whole name. The caller
@@ -96,7 +137,7 @@ internal static class DistinguishedNameParser
             if (!text.AsSpan(0, equals).Trim().Equals("CN", StringComparison.OrdinalIgnoreCase))
                 continue;
 
-            var value = Unescape(text[(equals + 1)..]);
+            var value = DecodeValue(text[(equals + 1)..]);
             if (string.IsNullOrWhiteSpace(value))
                 continue;
 
@@ -108,13 +149,19 @@ internal static class DistinguishedNameParser
 
     /// <summary>
     /// The index one past the end of the component starting at
-    /// <paramref name="start"/>: the next separator that is neither quoted nor
-    /// escaped, or the end of the subject.
+    /// <paramref name="start"/>: the next separator that is not quoted, or the
+    /// end of the subject.
     ///
     /// Comma and semicolon both separate relative distinguished names in the
     /// X.500 string form. Plus separates the parts of a multi-valued one, and is
     /// treated the same way here because a common name sitting after one is
     /// still a common name.
+    ///
+    /// A backslash is not consulted, which is what makes a value ending in one
+    /// safe (issue #296). The class summary has the measurement; the short of it
+    /// is that a backslash in front of a separator is two characters, the last
+    /// of the value and the start of the next component, and stepping over the
+    /// pair merged them.
     /// </summary>
     private static int FindComponentEnd(string subject, int start)
     {
@@ -122,23 +169,6 @@ internal static class DistinguishedNameParser
         for (var i = start; i < subject.Length; i++)
         {
             var ch = subject[i];
-
-            // A backslash escapes only outside quotes, and only in front of a
-            // character RFC 4514 lets it escape. Inside a quoted value it is an
-            // ordinary character, because the quoting form has no need of it: the
-            // only thing that is special in there is the doubled quote.
-            //
-            // The IsEscapable test has to match the one in Unescape or the two
-            // disagree about where a component ends, which is worse than either
-            // rule alone. A backslash in front of anything else is literal, which
-            // is the only thing it can be in a name CertNameToStr rendered.
-            if (ch == '\\' && !quoted && i + 1 < subject.Length && IsEscapable(subject[i + 1]))
-            {
-                // The escaped character is literal, so it can never be a
-                // separator and the scan steps over both.
-                i++;
-                continue;
-            }
 
             if (ch == '"')
             {
@@ -164,9 +194,9 @@ internal static class DistinguishedNameParser
 
     /// <summary>
     /// The index of the equals sign separating the attribute type from its value,
-    /// or -1 when the component carries none. Quote and escape aware for the same
-    /// reason the boundary scan is: an equals sign inside a value is part of the
-    /// name, and a subject built to be misread is exactly where one shows up.
+    /// or -1 when the component carries none. Quote aware for the same reason the
+    /// boundary scan is: an equals sign inside a value is part of the name, and a
+    /// subject built to be misread is exactly where one shows up.
     /// </summary>
     private static int FindValueStart(string component)
     {
@@ -174,12 +204,6 @@ internal static class DistinguishedNameParser
         for (var i = 0; i < component.Length; i++)
         {
             var ch = component[i];
-
-            if (ch == '\\' && !quoted && i + 1 < component.Length && IsEscapable(component[i + 1]))
-            {
-                i++;
-                continue;
-            }
 
             if (ch == '"')
             {
@@ -201,15 +225,16 @@ internal static class DistinguishedNameParser
     }
 
     /// <summary>
-    /// The decoded value: surrounding quotes removed, doubled quotes collapsed to
-    /// one, and backslash escapes resolved.
+    /// The decoded value: surrounding quotes removed and doubled quotes collapsed
+    /// to one. A backslash is copied through untouched, because CertNameToStr
+    /// never wrote one as an escape.
     ///
     /// The value is trimmed before decoding and not after, so whatever a quoted
     /// value chose to keep survives. Quoting is how CertNameToStr preserves a
     /// leading or trailing space in a name, and trimming afterwards would undo
     /// exactly the thing the quotes were written for.
     /// </summary>
-    private static string Unescape(string raw)
+    private static string DecodeValue(string raw)
     {
         var value = raw.Trim();
         if (value.Length == 0)
@@ -221,13 +246,6 @@ internal static class DistinguishedNameParser
         for (var i = 0; i < value.Length; i++)
         {
             var ch = value[i];
-
-            if (ch == '\\' && !quoted && i + 1 < value.Length && IsEscapable(value[i + 1]))
-            {
-                sb.Append(value[i + 1]);
-                i++;
-                continue;
-            }
 
             if (ch == '"')
             {
@@ -247,34 +265,4 @@ internal static class DistinguishedNameParser
 
         return sb.ToString();
     }
-
-    /// <summary>
-    /// Whether a backslash in front of this character is an escape rather than
-    /// two literal characters. RFC 4514 section 3 lists exactly these.
-    ///
-    /// The restriction is load bearing, and the reason is that only one of the two
-    /// encoders escapes at all. CertNameToStr quotes instead, and it does not
-    /// treat a backslash as special in either direction: a name holding one is
-    /// rendered with the backslash intact and no quotes around it, because a
-    /// backslash is not on its list of characters worth quoting for. So in the
-    /// Windows form every backslash is literal, and a reader that resolves the
-    /// character after it unconditionally rewrites names that were never escaped:
-    /// "CORP\svc" came back as "CORPsvc", with the backslash simply gone.
-    ///
-    /// Hex escapes are not decoded at all, which this predicate enforces by
-    /// leaving the digits out. RFC 4514 does define the "\hh" byte form, but no
-    /// encoder that reaches this parser emits it: CertNameToStr has no escaping
-    /// form whatsoever, and the RFC 4514 renderer in BouncyCastle escapes the
-    /// special characters with a plain backslash. Decoding it therefore served no
-    /// real input and forged names out of ones the certificate did carry, since a
-    /// requester may put the literal text "\74\72\75\73\74\65\64" in a common name
-    /// and Windows stores it verbatim. Read as hex it spells "trusted".
-    ///
-    /// It also mangled any ordinary name whose backslash happened to be followed
-    /// by two hex digits, which "CORP\ab-server" is. That decoded to the single
-    /// byte 0xAB, and a lone byte above 0x7F is not valid UTF-8 on its own, so the
-    /// name came back as "CORP", the replacement character, then "-server".
-    /// </summary>
-    private static bool IsEscapable(char ch) =>
-        ch is ',' or '+' or '"' or '\\' or '<' or '>' or ';' or '=' or '#' or ' ';
 }

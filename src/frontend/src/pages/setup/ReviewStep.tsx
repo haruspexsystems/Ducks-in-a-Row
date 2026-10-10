@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { CheckCircle2, Server, FileCheck2, Globe, Loader2, AlertTriangle, RefreshCw, Copy, KeyRound, ShieldAlert, ShieldCheck } from 'lucide-react';
 import { completeSetup, waitForServiceRestart, type SetupUnreachableUrlResponse } from '@/api/setup';
+import { certbotKeyFlags, resolveTemplateKey } from '@/lib/templateKey';
+import { ServiceRightsAcknowledgement } from './ServiceRightsAcknowledgement';
 import type { WizardState } from './SetupWizard';
 
 interface ReviewStepProps {
@@ -16,6 +18,10 @@ export function ReviewStep({ state, onUpdate, onComplete }: ReviewStepProps) {
   const [error, setError] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>('review');
   const [refusal, setRefusal] = useState<SetupUnreachableUrlResponse | null>(null);
+  // Whether the rights check lets Complete Setup go ahead: it has answered, and
+  // anything it could not prove has been acknowledged (issue #440). Never a
+  // block on a Failed right, only on going ahead without being told.
+  const [rightsAcknowledged, setRightsAcknowledged] = useState(false);
 
   // Mirror the completion flow into the wizard state, so the shell's Back
   // button locks while completion is submitting or the service is restarting
@@ -252,6 +258,12 @@ export function ReviewStep({ state, onUpdate, onComplete }: ReviewStepProps) {
         </div>
       </div>
 
+      <ServiceRightsAcknowledgement
+        caConnectionString={state.caConnectionString}
+        templates={state.selectedTemplates}
+        onReadyChange={setRightsAcknowledged}
+      />
+
       {/* The completion probe found the URL unreachable: show the outcome
           and ask for an explicit confirmation. Never a hard block. */}
       {refusal && (
@@ -271,7 +283,7 @@ export function ReviewStep({ state, onUpdate, onComplete }: ReviewStepProps) {
             </p>
             <button
               onClick={() => handleComplete(true)}
-              disabled={submitting}
+              disabled={submitting || !rightsAcknowledged}
               className="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold
                          text-amber-900 dark:text-amber-200 bg-amber-100 dark:bg-amber-500/15 border border-amber-300 rounded-lg
                          hover:bg-amber-200 dark:bg-amber-500/25 disabled:opacity-50 transition-colors"
@@ -291,7 +303,7 @@ export function ReviewStep({ state, onUpdate, onComplete }: ReviewStepProps) {
 
       <button
         onClick={() => handleComplete(false)}
-        disabled={submitting}
+        disabled={submitting || !rightsAcknowledged}
         className="w-full inline-flex items-center justify-center gap-2 px-6 py-3 text-sm font-semibold
                    text-white bg-certus-600 rounded-lg hover:bg-certus-700
                    disabled:opacity-50 transition-colors"
@@ -337,26 +349,16 @@ function RsaKeyNote({
     if (copyTimer.current) clearTimeout(copyTimer.current);
   }, []);
 
-  const algorithm = keyAlgorithm?.toUpperCase() ?? null;
-  const isVerifiedRsa = algorithm === 'RSA';
-  const isEcdsa = algorithm?.startsWith('ECDSA') ?? false;
-  const rsaKeySize = minimalKeySize ?? 2048;
-
-  // The ECDSA curve from the algorithm name suffix (ECDSA_P256 and friends),
-  // or from the minimum key size when the name carries no curve.
-  const curve = !isEcdsa
-    ? null
-    : algorithm!.endsWith('P384') ? 'P-384'
-    : algorithm!.endsWith('P521') ? 'P-521'
-    : algorithm!.endsWith('P256') ? 'P-256'
-    : (minimalKeySize ?? 256) >= 521 ? 'P-521'
-    : (minimalKeySize ?? 256) >= 384 ? 'P-384'
-    : 'P-256';
+  const key = resolveTemplateKey(keyAlgorithm, minimalKeySize);
+  const isVerifiedRsa = key.kind === 'rsa';
+  const isEcdsa = key.kind === 'ecdsa';
+  const { rsaKeySize, curve, substituted } = key;
+  const keyFlags = certbotKeyFlags(key);
 
   // A template with a verified algorithm we cannot write a certbot command
   // for gets a short note instead: DSA and ECDH algorithms always, and
   // ECDSA P-521 because certbot does not support that curve.
-  if ((algorithm != null && !isVerifiedRsa && !isEcdsa) || curve === 'P-521') {
+  if (keyFlags === null) {
     return (
       <div className="bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/30 rounded-lg p-4 text-left max-w-md mx-auto">
         <div className="flex items-center gap-2 mb-2">
@@ -364,14 +366,35 @@ function RsaKeyNote({
           <h3 className="text-sm font-semibold text-amber-900 dark:text-amber-200">Before requesting a certificate</h3>
         </div>
         <p className="text-sm text-amber-800 dark:text-amber-300">
-          Your selected template requires <code className="bg-amber-100 dark:bg-amber-500/15 px-1 rounded text-xs">{keyAlgorithm}</code>{' '}
-          keys{minimalKeySize ? ` (minimum ${minimalKeySize} bits)` : ''}. Configure your ACME
-          client to request a matching key type, or the CA will reject the request with{' '}
+          {/* An ECDH template lands here only on P-521, where certbot has no
+              curve to offer. Asking for a "matching key type" would be the one
+              instruction nobody can follow, so name the curve instead. */}
+          {substituted ? (
+            <>
+              Your selected template requires keys on curve {curve}. Your ACME client must
+              request one, or the CA will reject the request with{' '}
+            </>
+          ) : (
+            <>
+              Your selected template requires <code className="bg-amber-100 dark:bg-amber-500/15 px-1 rounded text-xs">{keyAlgorithm}</code>{' '}
+              keys{minimalKeySize ? ` (minimum ${minimalKeySize} bits)` : ''}. Configure your ACME
+              client to request a matching key type, or the CA will reject the request with{' '}
+            </>
+          )}
           <code className="bg-amber-100 dark:bg-amber-500/15 px-1 rounded text-xs">Denied by Policy Module</code>.
           {curve === 'P-521' && (
             <> certbot does not support P-521 keys; use a client that does, for example acme.sh.</>
           )}
         </p>
+        {substituted && (
+          <p className="text-xs text-amber-700 dark:text-amber-300 mt-2">
+            Your template records{' '}
+            <code className="bg-amber-100 dark:bg-amber-500/15 px-1 rounded">{keyAlgorithm}</code>, an
+            encryption only algorithm. A certificate request is signed, so it can only ever carry
+            the signing key on that same curve. To have the template record ECDSA instead, set its
+            Purpose to “Signature” on the Request Handling tab in the Certificate Templates console.
+          </p>
+        )}
       </div>
     );
   }
@@ -379,10 +402,7 @@ function RsaKeyNote({
   const commandPrefix =
     `certbot certonly --standalone --server ${directoryUrl} -d <your host> ` +
     '-m <your-email@example.com> --agree-tos --no-eff-email';
-  const curveParam = curve === 'P-384' ? 'secp384r1' : 'secp256r1';
-  const command = isEcdsa
-    ? `${commandPrefix} --key-type ecdsa --elliptic-curve ${curveParam}`
-    : `${commandPrefix} --key-type rsa --rsa-key-size ${rsaKeySize}`;
+  const command = `${commandPrefix} ${keyFlags}`;
 
   const handleCopy = async () => {
     try {
@@ -405,7 +425,7 @@ function RsaKeyNote({
       <p className="text-sm text-amber-800 dark:text-amber-300">
         {isEcdsa ? (
           <>
-            Your selected template requires ECDSA keys on curve {curve}. Your ACME client
+            Your selected template requires keys on curve {curve}. Your ACME client
             must request one, or the CA will reject the request with{' '}
           </>
         ) : isVerifiedRsa ? (
@@ -443,6 +463,19 @@ function RsaKeyNote({
       <p className="text-xs text-amber-700 dark:text-amber-300 mt-1">
         Replace the host and email placeholders before running.
       </p>
+      {/* The command above is right as printed, so this is about the template,
+          not about the command. ADCS records an ECDH algorithm when Purpose is
+          "Signature and encryption"; a TLS template wants "Signature". */}
+      {substituted && (
+        <p className="text-xs text-amber-700 dark:text-amber-300 mt-2">
+          Your template records{' '}
+          <code className="bg-amber-100 dark:bg-amber-500/15 px-1 rounded">{keyAlgorithm}</code>, an
+          encryption only algorithm. The command above is still correct, because a certificate
+          request is signed and so can only ever carry the signing key on that same curve. To have
+          the template record ECDSA instead, set its Purpose to “Signature” on the Request Handling
+          tab in the Certificate Templates console.
+        </p>
+      )}
       <p className="text-xs text-amber-700 dark:text-amber-300 mt-2">
         {isEcdsa ? (
           curve === 'P-384' ? (

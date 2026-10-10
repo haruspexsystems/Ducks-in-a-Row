@@ -98,6 +98,24 @@ public class Http01ChallengeValidatorTests
     }
 
     [Fact]
+    public async Task Validate_SteeredToABlockedPort_SaysSoRatherThanBlamingTheAddress()
+    {
+        // Only a redirect can reach this, since the validator builds its own
+        // URL on port 80. The address resolved perfectly well, so reporting it
+        // as a blocked address would send the client to check DNS and firewall
+        // rules for a problem that is neither.
+        var sut = CreateValidator(_ => throw new HttpRequestException(
+            "blocked", new AddressBlockedException("redirect.example.com", 8080)));
+
+        var result = await sut.ValidateAsync(Context());
+
+        result.IsValid.Should().BeFalse();
+        result.Transient.Should().BeFalse();
+        result.ErrorDetail.Should().Contain("port 8080");
+        result.ErrorDetail.Should().NotContain("resolves to an address");
+    }
+
+    [Fact]
     public async Task Validate_ConnectionError_IsTransient()
     {
         var sut = CreateValidator(_ => throw new HttpRequestException("connection refused"));
@@ -107,6 +125,70 @@ public class Http01ChallengeValidatorTests
         result.IsValid.Should().BeFalse();
         result.Transient.Should().BeTrue(); // no response received — a transport failure
         result.ErrorDetail.Should().NotBeNullOrEmpty();
+    }
+
+    [Theory]
+    // An identifier that carried its own port. Before issue #345 this was a
+    // legal identifier and the fetch URL was built by interpolation, so the
+    // client chose which internal port the validator opened a connection to
+    // and the answer told it whether anything was listening there.
+    [InlineData("10.0.0.5:22")]
+    // A fragment marker truncates the well known path, so the request that
+    // actually goes out asks for "/" at the host.
+    [InlineData("example.com#")]
+    // A path fragment moves the request off the challenge path entirely.
+    [InlineData("example.com/../../admin")]
+    // Userinfo changes who the request presents as.
+    [InlineData("user@internal.host")]
+    public async Task Validate_IdentifierThatIsNotAWholeAuthority_NeverLeavesTheProcess(
+        string domain)
+    {
+        // The second fence. The new-order grammar refuses all of these long
+        // before a challenge exists, so this can only fire if that grammar is
+        // ever loosened; the point is that loosening it cannot silently reopen
+        // the authority.
+        var requested = 0;
+        var sut = CreateValidator(_ =>
+        {
+            requested++;
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(ExpectedKeyAuth)
+            };
+        });
+
+        var result = await sut.ValidateAsync(Context(domain));
+
+        result.IsValid.Should().BeFalse();
+        result.Transient.Should().BeFalse();
+        result.ErrorDetail.Should().Contain("challenge URL");
+        requested.Should().Be(0, "no request may go out for an identifier that is not a host");
+    }
+
+    [Fact]
+    public async Task Validate_GoodIdentifier_RequestsPort80AndNothingElse()
+    {
+        Uri? requested = null;
+        var sut = CreateValidator(request =>
+        {
+            requested = request.RequestUri;
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(ExpectedKeyAuth)
+            };
+        });
+
+        var result = await sut.ValidateAsync(Context());
+
+        result.IsValid.Should().BeTrue();
+        requested!.Scheme.Should().Be("http");
+        requested.Host.Should().Be(TestDomain);
+        requested.Port.Should().Be(80);
+        requested.IsDefaultPort.Should().BeTrue();
+        requested.UserInfo.Should().BeEmpty();
+        requested.Query.Should().BeEmpty();
+        requested.Fragment.Should().BeEmpty();
+        requested.AbsolutePath.Should().Be($"/.well-known/acme-challenge/{TestToken}");
     }
 
     [Fact]

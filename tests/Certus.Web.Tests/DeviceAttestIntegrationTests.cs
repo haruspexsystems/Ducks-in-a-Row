@@ -48,30 +48,57 @@ public class DeviceAttestIntegrationTests
 
     // ---- newOrder gate ----
 
-    [Fact]
-    public async Task NewOrder_NoProfile_AnswersLikeAnUnsupportedType()
+    /// <summary>
+    /// The values a client probes a template with when it is trying to learn
+    /// whether this build implements the draft. The first is well formed; the
+    /// rest each fail a different arm of the permanent-identifier grammar, in
+    /// order: empty, whitespace only, over the length ceiling, an embedded
+    /// control character (a literal U+0007 that renders as nothing, not a
+    /// duplicate of the well formed value), leading whitespace, and a
+    /// malformed assigner OID. A template that does not offer device orders
+    /// has to answer all of them identically, or the difference tells the
+    /// client the feature is there (issue #193).
+    /// </summary>
+    public static TheoryData<string> DeviceProbeValues() => new()
+    {
+        Serial,
+        "",
+        "   ",
+        new string('S', PermanentIdentifierValue.MaxLength + 1),
+        "SN-0001",
+        " SN-0001",
+        "SN-0001/not.an.oid"
+    };
+
+    [Theory]
+    [MemberData(nameof(DeviceProbeValues))]
+    public async Task NewOrder_NoProfile_AnswersLikeAnUnsupportedType(string value)
     {
         await _factory.ResetDeviceStateAsync();
         var (account, rsa) = await CreateAccountAsync();
 
-        var response = await PostNewOrderAsync(rsa, account.Kid, DeviceIdentifier(Serial));
+        var response = await PostNewOrderAsync(rsa, account.Kid, DeviceIdentifier(value));
 
         response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
         var error = await ReadErrorAsync(response);
         error.Type.Should().Be(AcmeErrorType.UnsupportedIdentifier);
         // The refusal must be byte identical to the unsupported type answer:
         // no mention of profiles, allowlists, or the feature existing at all.
+        // Asserting the detail is the point of the test, not decoration: a
+        // malformed value used to draw a permanent-identifier specific detail
+        // here, which is the whole of issue #193.
         error.Detail.Should().Be("Unsupported identifier type: 'permanent-identifier'.");
     }
 
-    [Fact]
-    public async Task NewOrder_DisabledProfile_SameInvisibleRefusal()
+    [Theory]
+    [MemberData(nameof(DeviceProbeValues))]
+    public async Task NewOrder_DisabledProfile_SameInvisibleRefusal(string value)
     {
         await _factory.ResetDeviceStateAsync();
         await _factory.SeedProfileAsync(enabled: false, allowlistedDevices: Serial);
         var (account, rsa) = await CreateAccountAsync();
 
-        var response = await PostNewOrderAsync(rsa, account.Kid, DeviceIdentifier(Serial));
+        var response = await PostNewOrderAsync(rsa, account.Kid, DeviceIdentifier(value));
 
         response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
         var error = await ReadErrorAsync(response);
@@ -80,6 +107,54 @@ public class DeviceAttestIntegrationTests
 
         (await _factory.GetAuditRowsAsync("newOrder-device")).Should().BeEmpty(
             "an invisible refusal must not leave an audit trail either");
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task NewOrder_MixedIdentifiers_NoProfile_StaysInvisible(bool deviceFirst)
+    {
+        await _factory.ResetDeviceStateAsync();
+        var (account, rsa) = await CreateAccountAsync();
+
+        var device = DeviceIdentifier(Serial);
+        var dns = new AcmeIdentifier { Type = "dns", Value = "mixed.example.com" };
+        var identifiers = deviceFirst
+            ? new[] { device, dns }
+            : new[] { dns, device };
+
+        var response = await PostNewOrderAsync(rsa, account.Kid, identifiers);
+
+        // The single identifier rule is a device specific rule, so it must not
+        // be the thing that answers on a template that does not take device
+        // orders, in either identifier order.
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        var error = await ReadErrorAsync(response);
+        error.Type.Should().Be(AcmeErrorType.UnsupportedIdentifier);
+        error.Detail.Should().Be("Unsupported identifier type: 'permanent-identifier'.");
+    }
+
+    [Fact]
+    public async Task NewOrder_EnabledProfile_MalformedValueStillReportsTheGrammarError()
+    {
+        await _factory.ResetDeviceStateAsync();
+        // Open mode so the allowlist cannot intercept the value first: the
+        // point is that once a template does offer device orders, a bad value
+        // gets the grammar error it earned and not a policy refusal.
+        await _factory.SeedProfileAsync(gateMode: "open");
+        var (account, rsa) = await CreateAccountAsync();
+
+        var oversize = new string('S', PermanentIdentifierValue.MaxLength + 1);
+        var response = await PostNewOrderAsync(rsa, account.Kid, DeviceIdentifier(oversize));
+
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        var error = await ReadErrorAsync(response);
+        error.Type.Should().Be(AcmeErrorType.Malformed);
+        error.Detail.Should().Be(
+            $"The permanent-identifier value exceeds {PermanentIdentifierValue.MaxLength} characters.");
+
+        (await _factory.GetAuditRowsAsync("newOrder-device")).Should().BeEmpty(
+            "a grammar refusal is not a policy refusal and must not be audited as one");
     }
 
     [Fact]

@@ -13,20 +13,32 @@ namespace Certus.Core.Alerts;
 /// </para>
 ///
 /// <para>
-/// <b>What is deliberately not here.</b> The SMTP password and the webhook URL
-/// and its custom header names. The webhook URL is treated as sensitive because
-/// it routinely embeds a bearer token (that is how Slack and Teams
-/// authenticate), and a password is a password. Presence flags are all that is
-/// said about either.
+/// <b>What is deliberately not here.</b> The SMTP username and password, and the
+/// webhook URL and its custom header names. The webhook URL is treated as
+/// sensitive because it routinely embeds a bearer token (that is how Slack and
+/// Teams authenticate), and a password is a password. The username joined them
+/// in issue #261: it is the account half of a relay credential, and several
+/// providers derive it from a real key rather than a name (AWS SES uses an IAM
+/// access key id), so the endpoint reports only whether one is set. Presence
+/// flags are all that is said about any of them.
 /// </para>
 ///
 /// <para>
 /// <b>Everything else about the SMTP transport is shown in the clear.</b> The
-/// host and from address came back in issue #162; the port, TLS mode, username
-/// and from name followed when the transport became fully dashboard writable.
-/// The rule has stayed the same throughout: a field an administrator can set
-/// from the dashboard is one they must be able to read there, because a field
-/// nobody can read is a field nobody can safely edit.
+/// host and from address came back in issue #162; the port, TLS mode and from
+/// name followed when the transport became fully dashboard writable. The rule
+/// for those has not changed: a field an administrator can set from the
+/// dashboard is one they must be able to read there, because a field nobody can
+/// read is a field nobody can safely edit.
+/// </para>
+///
+/// <para>
+/// The username is the one field that is writable and unreadable at once, and
+/// the write side pays for that with an explicit clearUsername flag. Omitting
+/// the field on a save means "keep what is stored", never "blank it", so a form
+/// that cannot show the value also cannot destroy it. Before issue #261 the
+/// opposite was true: an omitted-looking empty string meant anonymous, which is
+/// why the value had to be returned for the form to post back unchanged.
 /// </para>
 /// </summary>
 /// <param name="ManagedFields">
@@ -142,7 +154,6 @@ public sealed record AlertConfigView(
                 TlsMode: SmtpTlsModes.Canonical(
                     options.Smtp.TlsMode
                     ?? SmtpTlsModes.Derive(options.Smtp.UseSsl, options.Smtp.Port)),
-                Username: options.Smtp.Username ?? string.Empty,
                 // Whitespace counts as absent, matching the notifier's own
                 // IsEnabled rule, so the two flags cannot disagree about one
                 // value.
@@ -150,6 +161,8 @@ public sealed record AlertConfigView(
                 FromAddress: options.Smtp.FromAddress,
                 FromName: options.Smtp.FromName,
                 Recipients: options.Smtp.Recipients,
+                // The only thing said about the relay account name since issue
+                // #261. The value itself never leaves the server.
                 HasCredentials: !string.IsNullOrEmpty(options.Smtp.Username),
                 // Either source counts: the dashboard's protected blob or a
                 // password from the configuration file or environment. The
@@ -361,21 +374,26 @@ public sealed record AlertConfigView(
 /// configured while every send fails at the relay, so the card needs the
 /// sender's presence reported on its own to give that case its own advice.
 ///
-/// The writable transport settings are returned in the clear so the form can
+/// Most writable transport settings are returned in the clear so the form can
 /// show what it is editing: the host and sender address (issue #162), and the
-/// port, TLS mode, username and sender display name since the transport became
-/// fully dashboard configurable. A field an administrator can set but cannot
-/// see is one they cannot safely edit; none of these is a secret, and the
-/// error redactor keeps the host and username out of failure text shown wider
-/// than this admin-only endpoint. <see cref="TlsMode"/> is always the
-/// effective mode, whether chosen explicitly or derived from the legacy
-/// UseSsl and port rule.
+/// port, TLS mode and sender display name since the transport became fully
+/// dashboard configurable. A field an administrator can set but cannot see is
+/// one they cannot safely edit; none of these is a secret, and the error
+/// redactor keeps the host out of failure text shown wider than this
+/// admin-only endpoint. <see cref="TlsMode"/> is always the effective mode,
+/// whether chosen explicitly or derived from the legacy UseSsl and port rule.
 ///
-/// The password is the one exception and it never appears in any form;
-/// <see cref="HasPassword"/> is all that is said about it, and it counts a
-/// password from either source (the dashboard's protected blob or the
-/// configuration file). <see cref="HasCredentials"/> keeps its issue #161
-/// meaning, presence of a username.
+/// Both halves of the relay credential are the exception, and neither appears
+/// here in any form. <see cref="HasPassword"/> is all that is said about the
+/// password, and it counts one from either source (the dashboard's protected
+/// blob or the configuration file). <see cref="HasCredentials"/> keeps its
+/// issue #161 name and meaning, presence of a username, and since issue #261
+/// it is the only thing said about it: the value used to be returned alongside
+/// this flag so the form could post it back unchanged, which
+/// <c>AlertErrorRedactor</c> had already contradicted by treating the username
+/// as a value that must never reach an error message. The write side now
+/// carries that weight instead, through the clearUsername flag that lets an
+/// omitted field mean "keep".
 /// </summary>
 public sealed record AlertSmtpView(
     [property: JsonPropertyName("enabled")] bool Enabled,
@@ -383,7 +401,6 @@ public sealed record AlertSmtpView(
     [property: JsonPropertyName("host")] string Host,
     [property: JsonPropertyName("port")] int Port,
     [property: JsonPropertyName("tlsMode")] string TlsMode,
-    [property: JsonPropertyName("username")] string Username,
     [property: JsonPropertyName("hasFromAddress")] bool HasFromAddress,
     [property: JsonPropertyName("fromAddress")] string FromAddress,
     [property: JsonPropertyName("fromName")] string FromName,

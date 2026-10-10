@@ -29,6 +29,12 @@ public sealed class CertificateSyncService : BackgroundService
     private readonly TimeSpan _syncInterval;
     private readonly int _requestHistoryDays;
 
+    // EF turns a Contains over a list into one parameter per element and
+    // SQLite's older default ceiling is 999, so the one place that reloads an
+    // unbounded id list chunks well under it. The disposition passes need no
+    // such guard: they read and write in batches of 100.
+    private const int BackfillChunkSize = 500;
+
     // Serializes the timer loop, the ACME issuance nudge, and the manual sync
     // endpoint: only one full CA pull runs at a time.
     private readonly SemaphoreSlim _syncGate = new(1, 1);
@@ -225,7 +231,29 @@ public sealed class CertificateSyncService : BackgroundService
         // because it was entirely control or format characters. The backfill does
         // not care which, so both routes land in the same list. Resolved after the
         // disposition passes from the certificates this proxy issued itself.
-        var emptySubjectRows = new List<SyncedCertificate>();
+        //
+        // Request ids rather than tracked entities (issue #184). The loop below no
+        // longer loads every row it sees, and it clears the change tracker between
+        // batches, so an entity reference captured here would be detached by the
+        // time the backfill ran and its writes would go nowhere. Nothing is lost:
+        // a row with no subject can never be in the skip set, so it is always
+        // either created or loaded on the path that can name it.
+        var emptySubjectRequestIds = new List<int>();
+
+        // Request ids whose stored row already holds everything a parse of the
+        // certificate's DER would produce, so the client can skip that parse
+        // (issue #184). Read once for the whole cycle rather than per pass: a row
+        // carries one disposition and so appears in exactly one pass, and a row
+        // created during this cycle is absent from the set and therefore parsed,
+        // which is the answer we want for it.
+        var alreadyDetailed = await ReadAlreadyDetailedAsync(db, cancellationToken);
+
+        // Taken before the first CA query, and load bearing for the stamp repair
+        // after the passes. It is the instant everything this cycle learns from
+        // the CA is no older than, so it separates what the CA has told us now
+        // from what we believed before asking. See
+        // ClearReleasedRevocationStampsAsync.
+        var passesStartedAt = DateTime.UtcNow;
 
         foreach (var (status, submittedAfter, resolvedAfter) in passes)
         {
@@ -238,7 +266,8 @@ public sealed class CertificateSyncService : BackgroundService
                 Status: status,
                 Take: int.MaxValue,
                 SubmittedAfter: submittedAfter,
-                ResolvedAfter: resolvedAfter);
+                ResolvedAfter: resolvedAfter,
+                AlreadyDetailed: alreadyDetailed);
 
             IReadOnlyList<CertificateInfo> certs;
             try
@@ -270,39 +299,170 @@ public sealed class CertificateSyncService : BackgroundService
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
+                // One projected read for the whole batch, replacing a
+                // FirstOrDefaultAsync per row (issue #184). Every column
+                // UpdateEntity can write except the certificate blob itself,
+                // which is present only as a "is it there" flag: the blob is the
+                // expensive part of the row and its sole use in the update is the
+                // write once test, so nothing needs the bytes.
+                var wanted = batch.Select(c => c.RequestId).ToList();
+                var stored = (await db.SyncedCertificates
+                        .Where(s => wanted.Contains(s.RequestId))
+                        .Select(s => new StoredRowState(
+                            s.RequestId,
+                            s.SerialNumber,
+                            s.Subject,
+                            s.SubjectAlternativeNames,
+                            s.TemplateName,
+                            s.NotBefore,
+                            s.NotAfter,
+                            s.Status,
+                            s.Requestor,
+                            s.RequestDate,
+                            s.RevokedAt,
+                            s.RevokedReason,
+                            s.KeyAlgorithm,
+                            s.KeySizeBits,
+                            s.SignatureAlgorithmOid,
+                            s.Sha256Thumbprint,
+                            s.ExtendedKeyUsageOids,
+                            s.KeyUsage,
+                            s.RawCertificate != null,
+                            s.DispositionMessage,
+                            s.StatusCode))
+                        .ToListAsync(cancellationToken))
+                    .ToDictionary(s => s.RequestId);
+
+                // Rows the CA still describes exactly as we stored them. Their
+                // only write is LastSyncedAt, so they are never loaded and never
+                // tracked; the whole batch's worth goes out as one statement below.
+                var unchanged = new List<int>();
+
+                // Rows that genuinely moved. Loaded tracked, blob and all, because
+                // UpdateEntity reads RawCertificate for its write once test and is
+                // still the only thing that writes a synced row.
+                var changed = new List<CertificateInfo>();
+
                 foreach (var cert in batch)
                 {
-                    var existing = await db.SyncedCertificates
-                        .FirstOrDefaultAsync(s => s.RequestId == cert.RequestId, cancellationToken);
-
-                    if (existing == null)
+                    if (!stored.TryGetValue(cert.RequestId, out var state))
                     {
                         var entity = MapToEntity(cert);
                         db.SyncedCertificates.Add(entity);
                         if (string.IsNullOrWhiteSpace(entity.Subject))
-                            emptySubjectRows.Add(entity);
+                            emptySubjectRequestIds.Add(entity.RequestId);
                         totalCreated++;
                     }
                     else
                     {
-                        UpdateEntity(existing, cert);
-                        if (string.IsNullOrWhiteSpace(existing.Subject))
-                            emptySubjectRows.Add(existing);
+                        if (IsUnchanged(state, cert))
+                        {
+                            unchanged.Add(cert.RequestId);
+                            // Decided from the projection, because an unchanged
+                            // row is never loaded. A stored subject that is still
+                            // blank is exactly the row the ACME backfill exists
+                            // for, and it stays blank cycle after cycle until
+                            // some later order names it.
+                            if (string.IsNullOrWhiteSpace(state.Subject))
+                                emptySubjectRequestIds.Add(cert.RequestId);
+                        }
+                        else
+                        {
+                            changed.Add(cert);
+                        }
+
+                        // Counted the same way it always has been: every row the
+                        // CA handed back for a row we already had. The manual sync
+                        // endpoint reports this to an operator as "updated", which
+                        // has always meant seen rather than altered, and pairs with
+                        // LastSyncedAt meaning when we last saw the row.
                         totalUpdated++;
                     }
 
                     totalSynced++;
                 }
 
+                if (changed.Count > 0)
+                {
+                    var changedIds = changed.Select(c => c.RequestId).ToList();
+                    var entities = await db.SyncedCertificates
+                        .Where(s => changedIds.Contains(s.RequestId))
+                        .ToDictionaryAsync(s => s.RequestId, cancellationToken);
+
+                    foreach (var cert in changed)
+                    {
+                        // A row read into the projection a moment ago and gone now
+                        // cannot happen (nothing deletes a SyncedCertificate), but
+                        // the lookup is guarded rather than asserted so a future
+                        // sweep that does delete costs a skipped update, not a
+                        // faulted sync.
+                        if (!entities.TryGetValue(cert.RequestId, out var existing))
+                            continue;
+
+                        UpdateEntity(existing, cert);
+                        if (string.IsNullOrWhiteSpace(existing.Subject))
+                            emptySubjectRequestIds.Add(existing.RequestId);
+                    }
+                }
+
                 await db.SaveChangesAsync(cancellationToken);
+
+                if (unchanged.Count > 0)
+                {
+                    // The one write an unchanged row still earns. ExecuteUpdate
+                    // goes round the change tracker, which normally means the
+                    // caller owes a ReloadAsync, but nothing here re-reads these
+                    // rows: they were never loaded, the set is disjoint from the
+                    // rows SaveChanges just wrote, and the tracker is cleared on
+                    // the next line anyway.
+                    await db.SyncedCertificates
+                        .Where(s => unchanged.Contains(s.RequestId))
+                        .ExecuteUpdateAsync(
+                            setters => setters.SetProperty(s => s.LastSyncedAt, DateTime.UtcNow),
+                            cancellationToken);
+                }
+
+                // Detach what this batch touched. Without it the tracker grows to
+                // the size of the whole inventory and every SaveChanges rescans
+                // all of it, so the change detection cost over a cycle is
+                // quadratic in the number of certificates and every loaded blob
+                // is held, plus its snapshot, until the cycle ends.
+                db.ChangeTracker.Clear();
             }
+        }
+
+        // Repair ACME rows still stamped revoked for a certificate the CA has
+        // since released from hold (issue #375). The inventory heals itself in
+        // UpdateEntity above; nothing until now healed the other row.
+        //
+        // A failure here must not cost the sync, the same stance the
+        // supersession relink below takes: the inventory is the product, and the
+        // next cycle repeats the whole test from scratch, so one bad pass is self
+        // correcting. It is logged at Error rather than swallowed because until
+        // it succeeds the certificate keeps answering a renew now window it has
+        // grown out of.
+        try
+        {
+            var cleared = await ClearReleasedRevocationStampsAsync(
+                db, passesStartedAt, cancellationToken);
+            if (cleared > 0)
+                _logger.LogInformation(
+                    "Cleared the revocation stamp on {Count} ACME certificate(s) the CA has " +
+                    "released from hold", cleared);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex,
+                "Clearing the revocation stamp on released certificates failed; the inventory " +
+                "synced and the stamps are retested on the next cycle");
         }
 
         // Lazily resolve names the CA could not provide, from the ACME store.
         // No empty rows means no extra queries.
-        if (emptySubjectRows.Count > 0)
+        if (emptySubjectRequestIds.Count > 0)
         {
-            var filled = await BackfillSubjectsFromAcmeStoreAsync(db, emptySubjectRows, cancellationToken);
+            var filled = await BackfillSubjectsFromAcmeStoreAsync(
+                db, emptySubjectRequestIds, cancellationToken);
             if (filled > 0)
             {
                 await db.SaveChangesAsync(cancellationToken);
@@ -344,6 +504,167 @@ public sealed class CertificateSyncService : BackgroundService
         return new CertificateSyncResult(totalSynced, totalCreated, totalUpdated, DateTime.UtcNow);
     }
 
+    /// <summary>
+    /// Clears <see cref="AcmeCertificate.RevokedAt"/> on certificates the CA has
+    /// released from CertificateHold (issue #375).
+    ///
+    /// <para>
+    /// Revocation was terminal in the ACME half of the data model: every writer
+    /// only ever stamps that column, so a certificate revoked with reason 6 and
+    /// later released at the CA kept answering a renew now window on
+    /// <c>renewalInfo</c> for the rest of its life, and revoke-cert kept refusing
+    /// as <c>alreadyRevoked</c>. The inventory row healed on the next sync, in
+    /// <see cref="UpdateEntity"/>; nothing healed this one, which
+    /// <c>CertificateRevocationService.RecordRevocationAsync</c> said in as many
+    /// words.
+    /// </para>
+    ///
+    /// <para>
+    /// The stance the repair takes is that <b>only the CA's own record may clear a
+    /// stamp, and only a reading of it taken after the stamp was written</b>. That
+    /// is sound because the reverse ordering is an invariant of every writer:
+    /// <c>OrderService.RecordRevocationAsync</c> and
+    /// <c>CertificateRevocationService.RecordRevocationAsync</c> both stamp only
+    /// after the CA call has returned, so a stamp implies the CA had already
+    /// revoked. A later CA reading that says otherwise can only be a release.
+    /// </para>
+    ///
+    /// <para>
+    /// One writer, so both symptoms go together and neither reader needs a rule of
+    /// its own to drift from: with the column cleared,
+    /// <c>OrderService.ResolveRevocationInstantAsync</c> falls through to the
+    /// inventory and reports the certificate live, and the
+    /// <c>alreadyRevoked</c> gate in <c>OrderService.RevokeCertificateAsync</c>
+    /// lets a fresh revocation reach the CA.
+    /// </para>
+    ///
+    /// <para>
+    /// Each term of the predicate is load bearing, and every one of them fails in
+    /// the safe direction, because reading a revoked certificate as live is the
+    /// costly mistake and reading a live one as revoked is only an early renewal:
+    /// </para>
+    ///
+    /// <list type="bullet">
+    /// <item><description>
+    /// <c>RevokedAt &lt; passesStartedAt</c> protects a revocation that landed
+    /// while this cycle was running. The CA data in hand was fetched before it,
+    /// so it cannot be evidence about it.
+    /// </description></item>
+    /// <item><description>
+    /// <c>LastSyncedAt &gt;= passesStartedAt</c> requires the inventory row to
+    /// have been seen in <b>this</b> cycle, so a stale row, or one the CA has
+    /// stopped returning, can never clear anything. It also makes the repair
+    /// self gating: when the issued pass fails, no issued row is restamped and
+    /// this matches nothing at all.
+    /// </description></item>
+    /// <item><description>
+    /// <c>Status == Issued</c> is an allow list, not <c>!= Revoked</c>. Pending,
+    /// Denied and Failed rows carry no live certificate, and a disposition added
+    /// later must not start clearing revocations on its own.
+    /// </description></item>
+    /// <item><description>
+    /// <c>AdcsRequestId &gt; 0</c> is the same identity guard
+    /// <c>OrderService.StampInventoryRowAsync</c> applies to the same bridge in
+    /// the other direction: an unset key selects by an unset value rather than by
+    /// identity, and un-revoking on a guess is not something to do.
+    /// </description></item>
+    /// </list>
+    ///
+    /// <para>
+    /// Written as one set based statement rather than from a Revoked to Issued
+    /// transition spotted in the pass loop. A transition fires once, so a
+    /// database whose inventory healed before this repair existed would never be
+    /// repaired at all, and the stuck row it left is the one an operator would
+    /// actually report.
+    /// </para>
+    ///
+    /// <para>
+    /// It costs one statement per cycle. The outer filter is a scan of
+    /// <c>AcmeCertificates</c>, which has no index on
+    /// <see cref="AcmeCertificate.RevokedAt"/> and does not want one: the table
+    /// holds a row per ACME issued certificate, the scan runs once every sync
+    /// interval, and the revoked rows it keeps are a small fraction of it. Only
+    /// those reach the subquery, which is a point lookup on the unique index over
+    /// <see cref="SyncedCertificate.RequestId"/>.
+    /// </para>
+    /// </summary>
+    /// <returns>The number of stamps cleared.</returns>
+    private static async Task<int> ClearReleasedRevocationStampsAsync(
+        CertusDbContext db, DateTime passesStartedAt, CancellationToken cancellationToken)
+    {
+        // Hoisted so the comparison is a constant in the expression tree.
+        var issued = nameof(CertificateStatus.Issued);
+
+        // ExecuteUpdate goes round the change tracker, which normally leaves the
+        // caller owing a ReloadAsync. Nothing here re-reads these rows: the sync
+        // never loads an AcmeCertificate, and the tracker was cleared at the end
+        // of the last batch.
+        return await db.AcmeCertificates
+            .Where(a => a.RevokedAt != null
+                     && a.RevokedAt < passesStartedAt
+                     && a.AdcsRequestId > 0
+                     && db.SyncedCertificates.Any(s =>
+                            s.RequestId == a.AdcsRequestId
+                            && s.Status == issued
+                            && s.RevokedAt == null
+                            && s.LastSyncedAt >= passesStartedAt))
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(a => a.RevokedAt, (DateTime?)null)
+                .SetProperty(a => a.RevokedReason, (int?)null),
+                cancellationToken);
+    }
+
+    /// <summary>
+    /// Request ids whose stored row already holds everything a parse of the
+    /// certificate's own DER would produce, so the CA client can skip that parse
+    /// (issue #184). One projected read of integers: no blob, no tracking.
+    ///
+    /// The predicate is derived from what the parse actually feeds, not from a
+    /// single sentinel, and each term is load bearing:
+    ///
+    /// RawCertificate is the strictest of the three, because it is the one
+    /// written once and never reassigned, and because the crypto columns and this
+    /// one arrived in separate migrations four days apart. A database that synced
+    /// between them holds crypto detail and a null blob, and the only thing that
+    /// ever fills that blob is the write in UpdateEntity. Skipping such a row on
+    /// the strength of its crypto columns alone would strand it with no
+    /// certificate to download, permanently, with nothing to say why.
+    ///
+    /// Sha256Thumbprint stands for the crypto block. Every other member of
+    /// CertificateCryptoDetail is legitimately null on a perfectly good
+    /// certificate (no EKU extension, no key usage extension, an algorithm whose
+    /// strength is not a bit count, an empty algorithm OID), so none of them can
+    /// tell "not parsed" from "parsed, nothing to record". The thumbprint is null
+    /// only when the certificate did not decode at all.
+    ///
+    /// A blank Subject keeps a row out of the set because the parsed subject is
+    /// the last link in the fallback chain that fills it. It also means every row
+    /// the ACME backfill cares about stays on the path that loads it. Comparing
+    /// against the empty string rather than testing for whitespace is exact here,
+    /// and not merely what translates to SQL: the column is declared required, and
+    /// every writer that can reach it goes through CertificateTextSanitizer, which
+    /// trims and answers null for a value that is nothing but whitespace. So the
+    /// stored value is either empty or genuinely a name.
+    ///
+    /// SubjectAlternativeNames is deliberately absent. Null is an ordinary answer
+    /// for a certificate with no SAN extension, or one whose names are of a kind
+    /// the stored "dns:"/"ip:" format does not spell, such as a device leaf
+    /// carrying only a PermanentIdentifier. Requiring it would exclude those rows
+    /// from the skip for ever; omitting it costs nothing, because the write is
+    /// guarded on null and a skipped pass therefore cannot blank the column.
+    /// </summary>
+    private static async Task<IReadOnlySet<int>> ReadAlreadyDetailedAsync(
+        CertusDbContext db, CancellationToken ct)
+    {
+        var ids = await db.SyncedCertificates
+            .Where(c => c.RawCertificate != null
+                     && c.Sha256Thumbprint != null
+                     && c.Subject != "")
+            .Select(c => c.RequestId)
+            .ToListAsync(ct);
+        return ids.ToHashSet();
+    }
+
     private static SyncedCertificate MapToEntity(CertificateInfo cert)
     {
         return new SyncedCertificate
@@ -357,7 +678,11 @@ public sealed class CertificateSyncService : BackgroundService
             // MockAdcsClient signs the CSR subject verbatim (issue #224).
             Subject = CertificateTextSanitizer.SanitizeSubject(cert.Subject) ?? "",
             SubjectAlternativeNames = cert.SubjectAlternativeNames,
-            TemplateName = cert.TemplateName,
+            // Sanitized at the writer for the same reason the subject above is,
+            // and it is the same guard: the CA authors this and the real client
+            // strips it, but doing it here is what makes the guard hold for every
+            // IAdcsClient rather than only that one (issue #378).
+            TemplateName = CertificateTextSanitizer.SanitizeTemplateName(cert.TemplateName) ?? "",
             NotBefore = cert.NotBefore,
             NotAfter = cert.NotAfter,
             Status = cert.Status.ToString(),
@@ -396,7 +721,11 @@ public sealed class CertificateSyncService : BackgroundService
             entity.Subject = subject;
         if (cert.SubjectAlternativeNames != null)
             entity.SubjectAlternativeNames = cert.SubjectAlternativeNames;
-        entity.TemplateName = cert.TemplateName;
+        // Unconditional, unlike the subject above, because there is no fallback
+        // chain to protect: a blank template is the CA saying it recorded none,
+        // not a pass that had nothing to say, so keeping a previous value would
+        // be inventing one.
+        entity.TemplateName = CertificateTextSanitizer.SanitizeTemplateName(cert.TemplateName) ?? "";
         entity.NotBefore = cert.NotBefore;
         entity.NotAfter = cert.NotAfter;
         entity.Status = cert.Status.ToString();
@@ -451,6 +780,109 @@ public sealed class CertificateSyncService : BackgroundService
     }
 
     /// <summary>
+    /// Every column <see cref="UpdateEntity"/> can write, read straight out of
+    /// the database without the certificate blob. RawCertificate is present only
+    /// as <see cref="HasRawCertificate"/>, because the update reads it for one
+    /// thing, the write once test, and the bytes are the expensive part of the row.
+    /// </summary>
+    private sealed record StoredRowState(
+        int RequestId,
+        string SerialNumber,
+        string Subject,
+        string? SubjectAlternativeNames,
+        string TemplateName,
+        DateTime NotBefore,
+        DateTime NotAfter,
+        string Status,
+        string? Requestor,
+        DateTime RequestDate,
+        DateTime? RevokedAt,
+        int? RevokedReason,
+        string? KeyAlgorithm,
+        int? KeySizeBits,
+        string? SignatureAlgorithmOid,
+        string? Sha256Thumbprint,
+        string? ExtendedKeyUsageOids,
+        int? KeyUsage,
+        bool HasRawCertificate,
+        string? DispositionMessage,
+        int? StatusCode);
+
+    /// <summary>
+    /// Whether <see cref="UpdateEntity"/> would change nothing but LastSyncedAt
+    /// if it ran against this row with this CA reading. The partner of that method
+    /// and deliberately adjacent to it: this is the one place in the product where
+    /// the same rules are written twice, so the two move together or not at all.
+    ///
+    /// The pairing is held by a test rather than by care. CertificateSyncServiceTests
+    /// varies one mirrored column at a time and asserts a full cycle still writes
+    /// it through, so a column added to UpdateEntity and forgotten here fails there
+    /// rather than going quietly unsynced. Getting it wrong in this direction is
+    /// the dangerous one: a false "unchanged" drops a real update from the CA.
+    ///
+    /// Each clause below mirrors one write in UpdateEntity, in the same order,
+    /// including its guard. Where the write is guarded, "unchanged" means either
+    /// the guard refuses the write or the value it would write is already there.
+    /// </summary>
+    private static bool IsUnchanged(StoredRowState state, CertificateInfo cert)
+    {
+        if (state.SerialNumber != cert.SerialNumber)
+            return false;
+
+        var subject = CertificateTextSanitizer.SanitizeSubject(cert.Subject);
+        if (!string.IsNullOrWhiteSpace(subject) && state.Subject != subject)
+            return false;
+
+        if (cert.SubjectAlternativeNames != null &&
+            state.SubjectAlternativeNames != cert.SubjectAlternativeNames)
+            return false;
+
+        // Compared sanitized against sanitized, the way the subject above is.
+        // The stored value went through the strip on its way in, so comparing it
+        // against a raw incoming one would call every row changed on every cycle
+        // and rewrite the whole inventory each time, which is exactly the cost
+        // issue #184 removed.
+        if (state.TemplateName != (CertificateTextSanitizer.SanitizeTemplateName(cert.TemplateName) ?? "") ||
+            state.NotBefore != cert.NotBefore ||
+            state.NotAfter != cert.NotAfter ||
+            state.Status != cert.Status.ToString() ||
+            state.Requestor != cert.Requestor ||
+            state.RequestDate != cert.RequestDate ||
+            state.RevokedAt != cert.RevokedWhen ||
+            state.RevokedReason != cert.RevokedReason)
+            return false;
+
+        if (cert.CryptoDetail is { } crypto &&
+            (state.KeyAlgorithm != crypto.KeyAlgorithm ||
+             state.KeySizeBits != crypto.KeySizeBits ||
+             state.SignatureAlgorithmOid != crypto.SignatureAlgorithmOid ||
+             state.Sha256Thumbprint != crypto.Sha256Thumbprint ||
+             state.ExtendedKeyUsageOids != crypto.ExtendedKeyUsageOids ||
+             state.KeyUsage != crypto.KeyUsage))
+            return false;
+
+        // The write once column. A row that has no blob and is being handed one
+        // has changed, however identical everything else is; a row that has one
+        // is never handed another.
+        if (!state.HasRawCertificate && cert.RawCertificate != null)
+            return false;
+
+        var carriesExplanation = cert.Status is CertificateStatus.Pending
+            or CertificateStatus.Denied
+            or CertificateStatus.Failed;
+
+        if ((!carriesExplanation || cert.DispositionMessage != null) &&
+            state.DispositionMessage != cert.DispositionMessage)
+            return false;
+
+        if ((!carriesExplanation || cert.StatusCode != null) &&
+            state.StatusCode != cert.StatusCode)
+            return false;
+
+        return true;
+    }
+
+    /// <summary>
     /// Resolves display names for synced rows whose subject is empty, from what
     /// this proxy already knows about the requests it submitted itself. Two
     /// disjoint lookups, because a row reaches this point for one of two
@@ -458,10 +890,30 @@ public sealed class CertificateSyncService : BackgroundService
     /// usable subject anywhere, or it is a request that never became a
     /// certificate at all. Mutates the tracked entities and returns how many
     /// were filled; the caller saves.
+    ///
+    /// Takes request ids and loads the rows itself rather than being handed
+    /// entities the disposition passes tracked (issue #184). Those passes no
+    /// longer keep every row attached, so a reference captured there would be
+    /// detached by now and the writes below would be dropped silently.
     /// </summary>
     private static async Task<int> BackfillSubjectsFromAcmeStoreAsync(
-        CertusDbContext db, List<SyncedCertificate> emptyRows, CancellationToken ct)
+        CertusDbContext db, List<int> emptyRequestIds, CancellationToken ct)
     {
+        // Chunked for the same reason SupersessionLinker chunks: EF turns a
+        // Contains over a list into one parameter per element and SQLite's older
+        // default ceiling is 999. A first sync over an inventory the CA cannot
+        // name is the run that reaches those numbers.
+        var emptyRows = new List<SyncedCertificate>(emptyRequestIds.Count);
+        foreach (var chunk in emptyRequestIds.Distinct().Chunk(BackfillChunkSize))
+        {
+            emptyRows.AddRange(await db.SyncedCertificates
+                .Where(s => chunk.Contains(s.RequestId))
+                .ToListAsync(ct));
+        }
+
+        if (emptyRows.Count == 0)
+            return 0;
+
         var filled = await BackfillFromIssuedCertificatesAsync(db, emptyRows, ct);
         filled += await BackfillFromPendingOrdersAsync(db, emptyRows, ct);
         return filled;
@@ -565,11 +1017,13 @@ public sealed class CertificateSyncService : BackgroundService
         var filled = 0;
         foreach (var order in orders)
         {
-            // Sanitized despite being a name this server validated. The dns
-            // identifier checks are strict, but a permanent-identifier value only
-            // has to clear PermanentIdentifierValue, which refuses control
-            // characters and says nothing about the format class the bidirectional
-            // overrides live in.
+            // Sanitized despite being a name this server validated. Both
+            // identifier guards now refuse the deceptive character classes
+            // outright (issue #234 brought PermanentIdentifierValue into line
+            // with the rest), so this is no longer the only thing standing
+            // between a bidirectional override and the Subject column. It stays
+            // because it also bounds the value to MaxSubjectLength before the
+            // write, and that bound is not optional.
             var name = CertificateTextSanitizer.SanitizeSubject(
                 FirstIdentifier(order.IdentifiersJson));
             if (string.IsNullOrWhiteSpace(name))

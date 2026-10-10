@@ -34,7 +34,7 @@ export interface SetupConfigResponse {
   /**
    * The URL the wizard seeds the Server URL field with when nothing was
    * saved before: the machine's DNS name plus the port the service listens
-   * on, e.g. "https://certus.home.local:5001".
+   * on, e.g. "https://certus.corp.example.com:5001".
    */
   suggestedExternalUrl?: string;
   /** The domain restriction recorded in the wizard file (draft or completed). */
@@ -59,6 +59,18 @@ export interface DiscoveredCa {
   connectionString: string;
 }
 
+/**
+ * Why a connectivity test failed, so the wizard can give the hint that fits
+ * (issue #440). An access denial means a right is missing, which no firewall or
+ * DNS check would fix.
+ */
+export type ConnectivityFailureKind =
+  | 'accessDenied'
+  | 'unavailable'
+  | 'componentsMissing'
+  | 'notAccessible'
+  | 'other';
+
 /** CA connectivity test result. */
 export interface ConnectivityTestResult {
   success: boolean;
@@ -66,6 +78,7 @@ export interface ConnectivityTestResult {
   caDnsName?: string;
   caDisplayName?: string;
   errorMessage?: string;
+  failureKind?: ConnectivityFailureKind | null;
 }
 
 /**
@@ -85,6 +98,23 @@ export interface TemplateAcmeViability {
   minimalKeySize?: number | null;
 }
 
+/**
+ * Why one of a template's published values does not read, or cannot be used, as
+ * published. The class as the noun the checklist puts in its sentence, plus the
+ * position and code point an operator can look up. Deliberately not the value
+ * and not the character: a bidirectional override in a JSON body would reorder
+ * the page reporting it, which is the fault this warning exists to report.
+ *
+ * Named for the display name it was written for, and since issue #292 it also
+ * carries the template OID. The three members are right for both.
+ */
+export interface SetupTemplateNameWarning {
+  /** "control", "line separator", or "formatting". */
+  kind: string;
+  position: number;
+  codePoint: number;
+}
+
 /** Template from CA, as offered by the setup wizard. */
 export interface SetupTemplate {
   name: string;
@@ -99,6 +129,20 @@ export interface SetupTemplate {
   ekuVerified: boolean;
   /** Null when the template's AD object could not be read at all. */
   viability?: TemplateAcmeViability | null;
+  /**
+   * Set when the AD display name carries a character the server refuses in a URL
+   * path, so a client configured with the display name gets a 400 (issue #235).
+   * The programmatic name is always clean here: a template whose programmatic
+   * name carries one is not listed at all.
+   */
+  displayNameWarning?: SetupTemplateNameWarning | null;
+  /**
+   * Set when the template OID carries such a character (issue #292). Unlike the
+   * display name warning nothing is refused: the template issues and is
+   * addressed exactly as before. It is here because the wizard prints the OID
+   * on every row, where an override in it reorders the line around it.
+   */
+  oidWarning?: SetupTemplateNameWarning | null;
 }
 
 /** Outcome of the server side reachability probe of the external URL. */
@@ -106,7 +150,7 @@ export interface UrlProbeResult {
   /** False when the probe was skipped (demo walkthrough with the mock CA). */
   attempted: boolean;
   reachable: boolean;
-  /** The host and port the server dialed, for example "192.168.2.132:443". */
+  /** The host and port the server dialed, for example "203.0.113.10:443". */
   dialedAuthority: string;
   failureKind?: 'connectionRefused' | 'timeout' | 'tlsError' | 'dnsFailure' | 'other' | null;
   failureDetail?: string | null;
@@ -166,6 +210,13 @@ export async function testCaConnection(
 export interface SetupTemplatesResponse {
   templates: SetupTemplate[];
   excludedCount: number;
+  /**
+   * The subset of excludedCount hidden because the programmatic name itself
+   * carries a control, line separator, or formatting character, so nothing can
+   * be enrolled against the template on any path. Held apart because its fix is
+   * a different one: a programmatic name is fixed when the template is created.
+   */
+  unusableNameCount: number;
 }
 
 /** List available templates from a candidate CA. */

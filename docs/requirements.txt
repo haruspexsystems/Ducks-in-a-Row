@@ -1,0 +1,10 @@
+# Toolchain for docs/generate_guide.py, which builds
+# Ducks-in-a-Row-Installation-Guide.pdf from the markdown in this folder.
+#
+# Install with:  pip install -r docs/requirements.txt
+#
+# ReportLab was an undeclared ambient dependency until this file existed,
+# so regenerating the guide worked only on a machine that happened to
+# have it. The markdown parser is hand rolled on purpose, to keep this
+# list to one entry.
+reportlab>=4.0,<6.0

@@ -188,7 +188,13 @@ public static class CertificateDerParser
     /// A short stable token for the subject public key algorithm ("RSA",
     /// "ECDSA", ...), or the raw algorithm OID when it is not one we name.
     /// </summary>
-    private static string? ReadKeyAlgorithm(X509Certificate2 cert)
+    /// <remarks>
+    /// Internal rather than private because the HTTPS self enrollment path
+    /// compares an issued leaf against the key it generated and wants the same
+    /// vocabulary in its message; see
+    /// <c>TlsCertificateEnroller.DescribeLeafKey</c>.
+    /// </remarks>
+    internal static string? ReadKeyAlgorithm(X509Certificate2 cert)
     {
         try
         {
@@ -219,7 +225,7 @@ public static class CertificateDerParser
     /// answer for an algorithm whose strength is not expressed as a modulus or
     /// curve size (ML-DSA names its parameter set instead).
     /// </summary>
-    private static int? ReadKeySizeBits(X509Certificate2 cert)
+    internal static int? ReadKeySizeBits(X509Certificate2 cert)
     {
         try
         {

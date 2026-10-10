@@ -17,6 +17,12 @@ public sealed class AcmeDirectory
     [JsonPropertyName("newOrder")]
     public string NewOrder { get; set; } = string.Empty;
 
+    // RFC 9773 §3, a top level member and not part of meta: the base URL for
+    // ACME Renewal Information; the client appends "/{certID}" (§4.1).
+    [JsonPropertyName("renewalInfo")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? RenewalInfo { get; set; }
+
     [JsonPropertyName("revokeCert")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? RevokeCert { get; set; }

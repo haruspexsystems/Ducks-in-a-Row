@@ -35,8 +35,6 @@ export interface AlertSmtpConfig {
    * the dropdown always shows what a send would use.
    */
   tlsMode: SmtpTlsModeName;
-  /** The relay account name. An empty string means anonymous. */
-  username: string;
   /**
    * Whether a sender address is set (issue #209). The code default makes this
    * true unless appsettings.json explicitly blanks Smtp:FromAddress, and the
@@ -48,6 +46,12 @@ export interface AlertSmtpConfig {
   /** The sender display name. */
   fromName: string;
   recipients: string[];
+  /**
+   * Whether a relay account name is stored. Presence is all the backend says
+   * about it since issue #261; the name itself is never returned, the same way
+   * the password never is. The card drives the username field's placeholder and
+   * its remove control off this.
+   */
   hasCredentials: boolean;
   /**
    * Whether a password is stored, from either source: the protected value
@@ -141,12 +145,17 @@ export async function fetchAlertConfig(): Promise<AlertConfig> {
  * The writable alert settings, as the card sends them.
  *
  * The webhook block has no field here at all, mirroring the request type on
- * the backend, which rejects it with a 400 rather than ignoring it. The SMTP
- * password is write only with three states: a non-empty `password` sets a new
- * one (protected before storage), `clearPassword` removes the stored one, and
- * neither keeps it. Nothing about the password ever comes back.
+ * the backend, which rejects it with a 400 rather than ignoring it.
  *
- * A PUT replaces the whole writable set, so every field is sent on every save.
+ * Both halves of the SMTP credential are write only with the same three
+ * states: a non-empty value sets a new one (the password protected before
+ * storage), the matching `clear` flag removes the stored one, and neither keeps
+ * what is stored. Nothing about either ever comes back.
+ *
+ * A PUT replaces the whole writable set, so every field is sent on every save
+ * except those two. They must be omitted when untouched: the card renders an
+ * empty username box because it has nothing to render, and sending that empty
+ * string would blank the stored account name on an ordinary edit (issue #261).
  */
 export interface AlertConfigUpdate {
   enabled: boolean;
@@ -156,7 +165,8 @@ export interface AlertConfigUpdate {
     host: string;
     port: number;
     tlsMode: SmtpTlsModeName;
-    username: string;
+    username?: string;
+    clearUsername?: boolean;
     password?: string;
     clearPassword?: boolean;
     fromAddress: string;
@@ -428,14 +438,17 @@ export type AlertTestOutcome =
 
 /**
  * The SMTP values a test send should prove instead of the running ones: the
- * form's current state. `password` is included only when one was typed this
- * session; omitted, the server authenticates with the stored password.
+ * form's current state. Both credential fields are included only when typed
+ * this session; omitted, the server authenticates with what is stored. That is
+ * the only sound reading now that the card cannot see the saved username
+ * (issue #261): testing anonymously because the box was empty would report a
+ * pass for a transport the real configuration does not use.
  */
 export interface TestSmtpCandidate {
   host: string;
   port: number;
   tlsMode: SmtpTlsModeName;
-  username: string;
+  username?: string;
   password?: string;
   fromAddress: string;
   fromName: string;

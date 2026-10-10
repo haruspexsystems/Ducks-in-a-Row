@@ -2,7 +2,9 @@
 
 Thanks for your interest. Ducks in a Row is **source available** under the
 [Business Source License 1.1](LICENSE), not OSI open source. You are welcome to
-read the source, file issues, and propose changes within that license.
+read the source, build it, and run it within the terms of that license.
+
+**Pull requests are not accepted.**
 
 ## Ways to help
 
@@ -12,19 +14,9 @@ read the source, file issues, and propose changes within that license.
   not just the solution you have in mind.
 - **Report a vulnerability** — do not open an issue. Follow
   [SECURITY.md](SECURITY.md) and email security@haruspex.systems.
-- **Send a pull request** — see below, but read the note first.
 
-## Contributor License Agreement
-
-Ducks in a Row is an open core product. To keep the project relicensable and
-commercially viable, every contributor will need to agree to our
-[Contributor License Agreement](CLA.md) before we can merge their work.
-
-**Code contributions (pull requests) are not yet being accepted** while the CLA
-is under legal review by Haruspex Systems B.V. Bug reports and feature
-discussion are welcome any time — see [SUPPORT.md](SUPPORT.md). Once the CLA is
-finalized, we'll enable the CLA Assistant bot and start merging pull requests;
-this note will be removed at that point.
+Questions and general discussion go through the channels in
+[SUPPORT.md](SUPPORT.md).
 
 ## Development setup
 
@@ -38,14 +30,6 @@ dotnet build
 dotnet test
 dotnet run --project src/Certus.Web
 ```
-
-## Pull request expectations
-
-- Keep each pull request focused on one change.
-- All existing tests must pass, and new behaviour should come with tests.
-- The frontend must build cleanly if you touch it.
-- CI must be green before we review.
-- Match the style of the surrounding code; `.editorconfig` covers formatting.
 
 ## ADCS COM interop
 

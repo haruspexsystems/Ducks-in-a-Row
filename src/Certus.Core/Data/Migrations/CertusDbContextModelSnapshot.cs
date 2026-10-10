@@ -288,6 +288,10 @@ namespace Certus.Core.Data.Migrations
                         .HasMaxLength(64)
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("ReplacesCertificateId")
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("Status")
                         .IsRequired()
                         .ValueGeneratedOnAdd()
@@ -304,6 +308,9 @@ namespace Certus.Core.Data.Migrations
 
                     b.HasIndex("OrderId")
                         .IsUnique();
+
+                    b.HasIndex("ReplacesCertificateId")
+                        .HasFilter("\"ReplacesCertificateId\" IS NOT NULL");
 
                     b.HasIndex("AccountId", "CreatedAt");
 
@@ -384,6 +391,65 @@ namespace Certus.Core.Data.Migrations
                         .IsUnique();
 
                     b.ToTable("AttestationTrustAnchors");
+                });
+
+            modelBuilder.Entity("Certus.Core.Data.Entities.CrlAlertSent", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Channels")
+                        .IsRequired()
+                        .HasMaxLength(50)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ErrorMessage")
+                        .HasMaxLength(1000)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("InstanceKey")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("IssuerKeyId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("IssuerName")
+                        .IsRequired()
+                        .HasMaxLength(512)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Kind")
+                        .IsRequired()
+                        .HasMaxLength(10)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("NextUpdate")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("SentAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Stage")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("TEXT");
+
+                    b.Property<bool>("Success")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("SentAt");
+
+                    b.HasIndex("IssuerKeyId", "Kind", "InstanceKey", "Stage")
+                        .IsUnique();
+
+                    b.ToTable("CrlAlertsSent");
                 });
 
             modelBuilder.Entity("Certus.Core.Data.Entities.DeviceAllowlistEntry", b =>
@@ -568,6 +634,89 @@ namespace Certus.Core.Data.Migrations
                         .IsUnique();
 
                     b.ToTable("EabCredentials");
+                });
+
+            modelBuilder.Entity("Certus.Core.Data.Entities.MonitoredCrl", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<bool>("AutoPublished")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("CrlNumber")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ETag")
+                        .HasMaxLength(200)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("InstanceKey")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("IssuerKeyId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("IssuerName")
+                        .IsRequired()
+                        .HasMaxLength(512)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Kind")
+                        .IsRequired()
+                        .HasMaxLength(10)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("LastCheckedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("LastError")
+                        .HasMaxLength(500)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("LastModified")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("LastReadAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("NextPublish")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("NextUpdate")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int?>("PublishFlags")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Scope")
+                        .IsRequired()
+                        .HasMaxLength(10)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("SignatureStatus")
+                        .HasMaxLength(20)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Source")
+                        .IsRequired()
+                        .HasMaxLength(512)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("ThisUpdate")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Scope", "IssuerKeyId", "Kind", "Source")
+                        .IsUnique();
+
+                    b.ToTable("MonitoredCrls");
                 });
 
             modelBuilder.Entity("Certus.Core.Data.Entities.SyncedCertificate", b =>

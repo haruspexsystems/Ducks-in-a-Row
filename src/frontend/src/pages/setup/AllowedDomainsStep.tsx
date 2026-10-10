@@ -84,8 +84,9 @@ export function AllowedDomainsStep({ state, onUpdate }: AllowedDomainsStepProps)
 
       <div className="bg-sunken border border-hairline rounded-lg p-3">
         <p className="text-xs text-muted">
-          An entry covers the domain and all of its subdomains: home.local
-          also allows web.home.local, so wildcard entries are not needed.
+          An entry covers the domain and all of its subdomains:
+          corp.example.com also allows web.corp.example.com, so wildcard
+          entries are not needed.
           This restricts issuance through Ducks in a Row only; the
           certificate authority itself can still issue for any name through
           its own tools. You can change the list later on the Settings page,

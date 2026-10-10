@@ -4,6 +4,8 @@ using Certus.Core.Adcs;
 using Certus.Core.Configuration;
 using Certus.Core.Services;
 using Certus.Core.Setup;
+using Certus.Core.Tests.Security;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using NSubstitute;
@@ -63,12 +65,17 @@ public class SetupServiceTests : IDisposable
 
     private SetupService CreateSut(CertusOptions options)
     {
+        return CreateSut(options, NullLogger<SetupService>.Instance);
+    }
+
+    private SetupService CreateSut(CertusOptions options, ILogger<SetupService> logger)
+    {
         return new SetupService(
             _clientFactory,
             _caDiscovery,
             _probe,
             Options.Create(options),
-            NullLogger<SetupService>.Instance);
+            logger);
     }
 
     private const string TestCa = "ca.contoso.com\\Contoso-CA";
@@ -132,6 +139,72 @@ public class SetupServiceTests : IDisposable
 
         result.Success.Should().BeFalse();
         result.ErrorMessage.Should().Contain("DCOM connection refused");
+        result.FailureKind.Should().Be(ConnectivityFailureKind.Other);
+    }
+
+    [Fact]
+    public async Task TestConnectivity_CaNotAccessible_SaysSoByKind()
+    {
+        _mockClient.GetCaInfoAsync(Arg.Any<CancellationToken>())
+            .Returns(new CaInfo("Contoso-CA", "ca.contoso.com", null, false));
+
+        var result = await _sut.TestConnectivityAsync(TestCa);
+
+        result.FailureKind.Should().Be(ConnectivityFailureKind.NotAccessible);
+    }
+
+    [Fact]
+    public async Task TestConnectivity_CaRefusesTheAccount_NamesTheRightRatherThanTheNetwork()
+    {
+        // Issue #440: the CA answered and refused, which no firewall or DNS
+        // check would ever fix, so the wizard must not send the operator there.
+        _mockClient.GetCaInfoAsync(Arg.Any<CancellationToken>())
+            .Returns<CaInfo>(_ => throw new CaAccessDeniedException(
+                CaAccessDeniedException.ConnectPermissionMessage,
+                new UnauthorizedAccessException()));
+
+        var result = await _sut.TestConnectivityAsync(TestCa);
+
+        result.Success.Should().BeFalse();
+        result.FailureKind.Should().Be(ConnectivityFailureKind.AccessDenied);
+        result.ErrorMessage.Should().Contain("Request Certificates");
+    }
+
+    [Fact]
+    public async Task TestConnectivity_CaUnreachable_GivesTheRpcHint()
+    {
+        _mockClient.GetCaInfoAsync(Arg.Any<CancellationToken>())
+            .Returns<CaInfo>(_ => throw new CaUnavailableException("unreachable"));
+
+        var result = await _sut.TestConnectivityAsync(TestCa);
+
+        result.Success.Should().BeFalse();
+        result.FailureKind.Should().Be(ConnectivityFailureKind.Unavailable);
+        result.ErrorMessage.Should().Contain("TCP 135");
+    }
+
+    [Theory]
+    [InlineData(unchecked((int)0x80040154))]
+    [InlineData(unchecked((int)0x80020003))]
+    public async Task TestConnectivity_ComponentsMissing_NamesRsat(int hresult)
+    {
+        _mockClient.GetCaInfoAsync(Arg.Any<CancellationToken>())
+            .Returns<CaInfo>(_ => throw new System.Runtime.InteropServices.COMException("missing", hresult));
+
+        var result = await _sut.TestConnectivityAsync(TestCa);
+
+        result.Success.Should().BeFalse();
+        result.FailureKind.Should().Be(ConnectivityFailureKind.ComponentsMissing);
+        result.ErrorMessage.Should().Contain("RSAT-ADCS-Mgmt");
+    }
+
+    [Fact]
+    public async Task TestConnectivity_Passing_CarriesNoFailureKind()
+    {
+        var result = await _sut.TestConnectivityAsync(TestCa);
+
+        result.Success.Should().BeTrue();
+        result.FailureKind.Should().BeNull();
     }
 
     [Fact]
@@ -231,6 +304,194 @@ public class SetupServiceTests : IDisposable
         result.Templates.Should().OnlyContain(t => !t.EkuVerified);
         result.Templates.Should().OnlyContain(t => !t.HasServerAuthEku);
         result.ExcludedCount.Should().Be(0);
+    }
+
+    // Built from a numeric code point, never written literally: a soft hyphen
+    // pasted into source is invisible to the next reader of this file too.
+    private const int SoftHyphen = 0x00AD;
+
+    private static string With(int codePoint, string before, string after) =>
+        before + char.ConvertFromUtf32(codePoint) + after;
+
+    [Fact]
+    public async Task GetSetupTemplates_DisplayNameCarriesASoftHyphen_IsStillListedWithAWarning()
+    {
+        // The template enrolls perfectly well. Only the ACME addressing form
+        // issue #17 added is lost, so hiding it would take away a working
+        // template (issue #235).
+        _mockClient.GetTemplatesAsync(Arg.Any<CancellationToken>())
+            .Returns(new List<TemplateInfo>
+            {
+                new("WebServer", With(SoftHyphen, "Web", " Server"), "oid1",
+                    new[] { SetupService.ServerAuthEku }),
+            });
+
+        var result = await _sut.GetSetupTemplatesAsync(TestCa);
+
+        result.Templates.Should().ContainSingle();
+        result.ExcludedCount.Should().Be(0);
+        result.UnusableNameCount.Should().Be(0);
+
+        var warning = result.Templates[0].DisplayNameWarning;
+        warning.Should().NotBeNull();
+        warning!.Kind.Should().Be("formatting");
+        warning.CodePoint.Should().Be(SoftHyphen);
+        warning.Position.Should().Be(3);
+    }
+
+    [Fact]
+    public async Task GetSetupTemplates_CleanTemplate_CarriesNoNameWarning()
+    {
+        _mockClient.GetTemplatesAsync(Arg.Any<CancellationToken>())
+            .Returns(new List<TemplateInfo>
+            {
+                new("WebServer", "Web Server", "oid1", new[] { SetupService.ServerAuthEku }),
+            });
+
+        var result = await _sut.GetSetupTemplatesAsync(TestCa);
+
+        result.Templates[0].DisplayNameWarning.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task GetSetupTemplates_ProgrammaticNameCarriesAControlCharacter_IsHiddenAndCounted()
+    {
+        // AdcsRequestAttributes refuses to build a request attribute string
+        // from such a name, so nothing can be enrolled against this template on
+        // any path, and completion would refuse to record it at the last click.
+        _mockClient.GetTemplatesAsync(Arg.Any<CancellationToken>())
+            .Returns(new List<TemplateInfo>
+            {
+                new("WebServer", "Web Server", "oid1", new[] { SetupService.ServerAuthEku }),
+                new(With(0x0A, "Web", "Server2"), "Web Server 2", "oid2",
+                    new[] { SetupService.ServerAuthEku }),
+            });
+
+        var result = await _sut.GetSetupTemplatesAsync(TestCa);
+
+        result.Templates.Should().ContainSingle();
+        result.Templates[0].Name.Should().Be("WebServer");
+        result.ExcludedCount.Should().Be(1);
+        result.UnusableNameCount.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task GetSetupTemplates_ProgrammaticNameFault_IsHiddenEvenWhenNoEkuCouldBeVerified()
+    {
+        // The unverified fallback exists because AD could not be read. The
+        // programmatic name comes from the CA's own published list, so "could
+        // not be checked" never applies to it and the fallback must not carry
+        // an unenrollable template through.
+        _mockClient.GetTemplatesAsync(Arg.Any<CancellationToken>())
+            .Returns(new List<TemplateInfo>
+            {
+                new("WebServer", "Web Server", "oid1"),
+                new(With(SoftHyphen, "Web", "Server2"), "Web Server 2", "oid2"),
+            });
+
+        var result = await _sut.GetSetupTemplatesAsync(TestCa);
+
+        result.Templates.Should().ContainSingle();
+        result.Templates.Should().OnlyContain(t => !t.EkuVerified);
+        result.ExcludedCount.Should().Be(1);
+        result.UnusableNameCount.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task GetSetupTemplates_DisplayNameEqualsProgrammaticName_IsNotCountedTwice()
+    {
+        // The shape AdcsClient leaves behind when the AD lookup could not run.
+        var name = With(SoftHyphen, "Web", "Server");
+        _mockClient.GetTemplatesAsync(Arg.Any<CancellationToken>())
+            .Returns(new List<TemplateInfo> { new(name, name, "oid1") });
+
+        var result = await _sut.GetSetupTemplatesAsync(TestCa);
+
+        result.Templates.Should().BeEmpty();
+        result.UnusableNameCount.Should().Be(1);
+        result.ExcludedCount.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task GetSetupTemplates_DisplayNameWarning_CarriesNoNameText()
+    {
+        // The warning travels into a browser. Carrying the name would hand the
+        // very characters the guard refuses to the page that reports them.
+        var displayName = With(SoftHyphen, "Web", " Server");
+        _mockClient.GetTemplatesAsync(Arg.Any<CancellationToken>())
+            .Returns(new List<TemplateInfo>
+            {
+                new("WebServer", displayName, "oid1", new[] { SetupService.ServerAuthEku }),
+            });
+
+        var result = await _sut.GetSetupTemplatesAsync(TestCa);
+
+        var warning = result.Templates[0].DisplayNameWarning!;
+        warning.Kind.Should().NotContain(displayName);
+        warning.ToString().Should().NotContain(displayName);
+    }
+
+    [Fact]
+    public async Task GetSetupTemplates_OidCarriesASoftHyphen_IsListedUnchangedWithANote()
+    {
+        // Weaker than the display name case above, deliberately. Nothing routes
+        // on the OID, so this template is not hidden, not counted, and not
+        // limited in any way: the note exists only because the wizard prints
+        // the OID on the row (issue #292).
+        _mockClient.GetTemplatesAsync(Arg.Any<CancellationToken>())
+            .Returns(new List<TemplateInfo>
+            {
+                new("WebServer", "Web Server", With(SoftHyphen, "1.3.6", ".1"),
+                    new[] { SetupService.ServerAuthEku }),
+            });
+
+        var result = await _sut.GetSetupTemplatesAsync(TestCa);
+
+        result.Templates.Should().ContainSingle();
+        result.ExcludedCount.Should().Be(0);
+        result.UnusableNameCount.Should().Be(
+            0, "a deceptive OID is not a reason to withhold a template that issues");
+        result.Templates[0].DisplayNameWarning.Should().BeNull();
+
+        var warning = result.Templates[0].OidWarning;
+        warning.Should().NotBeNull();
+        warning!.Kind.Should().Be("formatting");
+        warning.CodePoint.Should().Be(SoftHyphen);
+        warning.Position.Should().Be(5);
+    }
+
+    [Fact]
+    public async Task GetSetupTemplates_CleanTemplate_CarriesNoOidWarning()
+    {
+        _mockClient.GetTemplatesAsync(Arg.Any<CancellationToken>())
+            .Returns(new List<TemplateInfo>
+            {
+                new("WebServer", "Web Server", "1.3.6.1", new[] { SetupService.ServerAuthEku }),
+            });
+
+        var result = await _sut.GetSetupTemplatesAsync(TestCa);
+
+        result.Templates[0].OidWarning.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task GetSetupTemplates_OidWarning_CarriesNoOidText()
+    {
+        // Same reason as the display name warning: it travels into a browser,
+        // and handing it the value would put the characters it reports on into
+        // the page reporting them.
+        var oid = With(SoftHyphen, "1.3.6.1.4.1.311", ".21.8.99999");
+        _mockClient.GetTemplatesAsync(Arg.Any<CancellationToken>())
+            .Returns(new List<TemplateInfo>
+            {
+                new("WebServer", "Web Server", oid, new[] { SetupService.ServerAuthEku }),
+            });
+
+        var result = await _sut.GetSetupTemplatesAsync(TestCa);
+
+        var warning = result.Templates[0].OidWarning!;
+        warning.ToString().Should().NotContain(oid);
+        warning.ToString().Should().NotContain("21.8.99999");
     }
 
     [Fact]
@@ -476,6 +737,52 @@ public class SetupServiceTests : IDisposable
 
         status.EabEnforcement.Should().Be("required");
         _sut.GetStatus().EabEnforcement.Should().Be("required");
+    }
+
+    [Fact]
+    public void CompleteSetup_UntrustedPriorStatusFile_WarnsRatherThanResettingSilently()
+    {
+        // Issue #489: an untrusted ducks-setup.json reads as absent, so the EAB mode
+        // and revocation scope reset to their defaults on a wizard re-run. That reset
+        // must not be silent, the same invariant the unreadable arm protects. A box
+        // compromised before the fix is exactly this: the status file is writable by a
+        // standard user, so it is not trusted.
+        _sut.CompleteSetup(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"));
+        _sut.UpdateEabEnforcement(EabEnforcementMode.Required).Should().BeTrue();
+        FileAcl.GrantEveryoneWrite(_sut.GetSetupStatusPath());
+
+        var logger = new CapturingLogger();
+        var sut = CreateSut(
+            new CertusOptions { DatabasePath = Path.Combine(_tempDir, "certus.db"), SettingsOverlayPath = _overlayPath },
+            logger);
+        var status = sut.CompleteSetup(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"));
+
+        // The reset happened (the untrusted "required" could not be carried forward)...
+        status.EabEnforcement.Should().BeNull();
+        // ...but it was not silent.
+        logger.Warnings.Should().ContainMatch("*not trusted*carried forward*");
+    }
+
+    [Fact]
+    public void CompleteSetup_TrustedCarryForward_DoesNotWarn()
+    {
+        // The control: a trusted prior file carries forward with no warning, so the
+        // warning above is the untrusted case and not noise on every re-run.
+        _sut.CompleteSetup(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"));
+        _sut.UpdateEabEnforcement(EabEnforcementMode.Required).Should().BeTrue();
+
+        var logger = new CapturingLogger();
+        var sut = CreateSut(
+            new CertusOptions { DatabasePath = Path.Combine(_tempDir, "certus.db"), SettingsOverlayPath = _overlayPath },
+            logger);
+        var status = sut.CompleteSetup(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"));
+
+        status.EabEnforcement.Should().Be("required");
+        logger.Warnings.Should().NotContainMatch("*not trusted*");
     }
 
     [Fact]
@@ -804,6 +1111,45 @@ public class SetupServiceTests : IDisposable
         overlay.HttpsCertificateTemplate.Should().Be("WebServerV2");
     }
 
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void SetHttpsCertificateThumbprint_BlankThumbprint_ThrowsAndWritesNothing(string? blank)
+    {
+        // A blank thumbprint would persist as an empty overlay value, which
+        // every reader treats as no certificate configured, so the next start
+        // would quietly serve the self signed certificate instead. Refusing it
+        // must also leave the recorded certificate alone: a guard that threw
+        // after writing would be worse than no guard at all.
+        _sut.SetHttpsCertificateThumbprint("AA11BB22", "WebServerV2");
+
+        var act = () => _sut.SetHttpsCertificateThumbprint(blank!, "WebServerV2");
+
+        act.Should().Throw<ArgumentException>().WithParameterName("thumbprint");
+        var overlay = SettingsOverlay.Load(_overlayPath);
+        overlay.HttpsCertificateThumbprint.Should().Be("AA11BB22");
+        overlay.HttpsCertificateTemplate.Should().Be("WebServerV2");
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void SetHttpsCertificateThumbprint_BlankTemplate_KeepsTheRecordedOne(string blank)
+    {
+        // The empty string counterpart of the null case above. It matters on
+        // its own: renewal reads the recorded template ?? the first enabled
+        // one, so an empty string is not null, the fallback never runs, and
+        // the install blocks on NoTemplate instead of renewing.
+        _sut.SetHttpsCertificateThumbprint("AA11BB22", "WebServerV2");
+
+        _sut.SetHttpsCertificateThumbprint("CC33DD44", blank);
+
+        var overlay = SettingsOverlay.Load(_overlayPath);
+        overlay.HttpsCertificateThumbprint.Should().Be("CC33DD44");
+        overlay.HttpsCertificateTemplate.Should().Be("WebServerV2");
+    }
+
     [Fact]
     public async Task GetSetupTemplates_CarriesTheViabilitySignals()
     {
@@ -913,5 +1259,23 @@ public class SetupServiceTests : IDisposable
     {
         try { Directory.Delete(_tempDir, true); }
         catch { /* cleanup best effort */ }
+    }
+
+    /// <summary>Records the rendered text of every warning, so a test can assert one fired.</summary>
+    private sealed class CapturingLogger : ILogger<SetupService>
+    {
+        public List<string> Warnings { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (logLevel == LogLevel.Warning)
+                Warnings.Add(formatter(state, exception));
+        }
     }
 }

@@ -1,7 +1,7 @@
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
-using System.Threading.RateLimiting;
 using Certus.Adcs;
+using Certus.Adcs.ServiceRights;
 using Certus.Core.Acme.Attestation;
 using Certus.Core.Acme.Crypto;
 using Certus.Core.ActiveDirectory;
@@ -9,11 +9,14 @@ using Certus.Core.Adcs;
 using Certus.Core.Acme.Services;
 using Certus.Core.Alerts;
 using Certus.Core.Configuration;
+using Certus.Core.Crl;
 using Certus.Core.Data;
 using Certus.Core.Health;
 using Certus.Core.Security;
+using Certus.Web.Security;
 using Certus.Core.Services;
 using Certus.Core.Setup;
+using Certus.Core.ServiceRights;
 using Certus.Service;
 using Certus.Web;
 using Certus.Web.Authentication;
@@ -47,11 +50,20 @@ try
     // Windows Service support
     builder.Host.UseWindowsService();
 
+    // Lock the data folder down before anything reads or writes it (issue #489).
+    // The installer does this too, but on a server first installed by a version
+    // before the fix its folder, and the files already in it, carry the old
+    // permissive entries; enforcing here re-propagates the protected DACL to every
+    // child. On a fresh install it is a no-op.
+    ProtectedFolder.EnsureProtected(CertusPaths.DataDirectory);
+
     // Runtime settings overlay (settings.json in the data directory), written
     // by the setup wizard: CA connection string and external URL. It lives in
     // the data directory so MSI upgrades cannot overwrite it, and is inserted
     // after appsettings so environment variables and command line still win.
-    builder.Configuration.AddSettingsOverlay(CertusPaths.DataDirectory);
+    // An overlay the service cannot trust is not added; the verdict is logged
+    // once the file logger exists, after Build (issue #489).
+    var overlayTrust = builder.Configuration.AddSettingsOverlay(CertusPaths.DataDirectory);
 
     // HTTPS: resolve the certificate for the Kestrel HTTPS endpoint.
     // Precedence: an explicit Kestrel certificate path, then the CA issued
@@ -119,7 +131,7 @@ try
     {
         // Generate a self-signed certificate for lab/development use
         var dataDir = CertusPaths.DataDirectory;
-        Directory.CreateDirectory(dataDir);
+        ProtectedFolder.EnsureExists(dataDir);
         var selfSignedPath = Path.Combine(dataDir, "ducks-selfsigned.pfx");
         const string selfSignedPassword = "certus-dev";
         const int selfSignedRenewalWindowDays = 30;
@@ -218,6 +230,17 @@ try
     builder.Services.AddDbContext<CertusDbContext>(dbOptions =>
         dbOptions.UseSqlite($"Data Source={certusOptions.DatabasePath}"));
 
+    // Write the write ahead log back into the database when the host stops
+    // (issue #215). Registered before the other AddHostedService calls in this
+    // file on purpose: hosted services stop in reverse registration order, so
+    // first here means this one stops after the certificate sync, the expiry
+    // monitor, and the challenge validation worker have finished writing.
+    // Moving this line below any of them would checkpoint while they are still
+    // committing. It orders this against those workers only; the framework
+    // registers its own hosted services elsewhere, and a late write from one of
+    // them would simply be checkpointed at process exit instead.
+    builder.Services.AddHostedService<SqliteShutdownCheckpoint>();
+
     // ADCS client — tri state. Real COM interop when a CA is configured; the
     // mock only when explicitly requested; otherwise an unconfigured client
     // whose operations surface as 503 ca-unavailable until the setup wizard
@@ -229,9 +252,11 @@ try
     if (certusOptions.UseMockCa)
     {
         builder.Services.AddMockAdcsClient();
+        builder.Services.AddSingleton<ICaCrlReader>(new MockCrlReader());
         builder.Services.AddSingleton<IAdcsClientFactory, MockAdcsClientFactory>();
         builder.Services.AddSingleton<ICaDiscoveryService, MockCaDiscoveryService>();
         builder.Services.AddSingleton<IAdPrincipalLookup, MockAdPrincipalLookup>();
+        builder.Services.AddSingleton<IServiceRightsProbe, MockServiceRightsProbe>();
         Log.Warning(
             "Certus:UseMockCa=true — using the mock ADCS client. Certificates are fake; " +
             "never use this in production");
@@ -241,15 +266,20 @@ try
         builder.Services.AddSingleton<IAdcsClientFactory, AdcsClientFactory>();
         builder.Services.AddSingleton<ICaDiscoveryService, AdcsCaDiscoveryService>();
         builder.Services.AddSingleton<IAdPrincipalLookup, AdPrincipalLookup>();
+        // Above the configured/unconfigured split, like the probe factory: the
+        // wizard checks the service's rights before any CA is configured.
+        builder.Services.AddSingleton<IServiceRightsProbe, AdcsServiceRightsProbe>();
 
         if (!string.IsNullOrEmpty(certusOptions.CaConnectionString))
         {
             builder.Services.AddAdcsClient();
+            builder.Services.AddAdcsCrlReader();
             Log.Information("Using real ADCS client for CA: {Ca}", certusOptions.CaConnectionString);
         }
         else
         {
             builder.Services.AddUnconfiguredAdcsClient();
+            builder.Services.AddSingleton<ICaCrlReader, UnconfiguredCrlReader>();
             Log.Warning(
                 "No CA connection string configured — the service is unconfigured and CA " +
                 "operations return 503 until setup completes");
@@ -261,6 +291,9 @@ try
         builder.Configuration.GetSection(AcmeOptions.SectionName));
     builder.Services.AddSingleton<NonceService>();
     builder.Services.AddSingleton<JwsService>();
+    // Backs the "up" link target of a certificate download (RFC 8555 §7.4.2).
+    // Singleton because the whole point is caching the CA chain across requests.
+    builder.Services.AddSingleton<AcmeIssuerChainCache>();
     builder.Services.AddScoped<AccountService>();
     builder.Services.AddScoped<OrderService>();
     builder.Services.AddSingleton<EnabledTemplatesPolicy>();
@@ -287,6 +320,12 @@ try
     builder.Services.AddSingleton<IHttpsCertificateStore, MachineHttpsCertificateStore>();
     builder.Services.AddScoped<TlsCertificateEnroller>();
     builder.Services.AddScoped<SetupService>();
+
+    // The service rights check (issue #440): the wizard's and the Settings
+    // page's answer to what this server's account may do on the CA. The probe
+    // is registered with the ADCS client tri state above.
+    builder.Services.AddScoped<ServiceRightsCheck>();
+    builder.Services.AddSingleton<ServiceRightsReportCache>();
 
     // Automatic renewal of the server's own HTTPS certificate (issue #105).
     // The renewal core is shared with the settings page button. The hosted
@@ -386,6 +425,27 @@ try
     builder.Services.AddSingleton<AlertTestThrottle>();
     builder.Services.AddScoped<AlertTestService>();
 
+    // CRL monitoring (issue #447). It reads the CA's own CRLs over COM and the
+    // rest from the distribution points named in the chain, so the fetcher needs
+    // both halves: the typed HttpClient here and the directory reader that
+    // AddAdcsCrlReader bound above. Registered whether or not a channel is
+    // configured, because the card it fills is the whole feature on a free
+    // install with no SMTP.
+    builder.Services.AddHttpClient<HttpCrlFetcher>((sp, client) =>
+    {
+        var alerts = sp.GetRequiredService<IOptions<AlertOptions>>().Value;
+        client.Timeout = TimeSpan.FromSeconds(Math.Max(1, alerts.Crl.FetchTimeoutSeconds));
+    });
+    builder.Services.AddScoped<ICrlDistributionPointFetcher>(sp =>
+    {
+        var alerts = sp.GetRequiredService<IOptions<AlertOptions>>().Value;
+        return new CrlDistributionPointFetcher(
+            sp.GetRequiredService<HttpCrlFetcher>(),
+            alerts.Crl.MaxCrlBytes,
+            sp.GetService<ILdapCrlFetcher>());
+    });
+    builder.Services.AddHostedService<CrlMonitorService>();
+
     // Challenge validators — HTTP-01, DNS-01, TLS-ALPN-01.
     // Egress is screened by AddressGuard so a validator cannot be pointed at loopback,
     // link local, or operator blocked addresses (server side request forgery).
@@ -439,6 +499,17 @@ try
     // Background challenge validation worker
     builder.Services.AddHostedService<ChallengeValidationService>();
 
+    // Background worker for orders the CA holds for manager approval (issue
+    // #319). A template with CT_FLAG_PEND_ALL_REQUESTS answers every finalize
+    // with "pending", and before this worker existed nothing revisited such an
+    // order: the certificate an operator approved was never delivered and the
+    // order never reached a terminal status either. Registered in both hosts
+    // like the challenge worker; the options section is deliberately absent from
+    // appsettings.json so the C# initializer is the default.
+    builder.Services.Configure<PendingIssuanceOptions>(
+        builder.Configuration.GetSection(PendingIssuanceOptions.SectionName));
+    builder.Services.AddHostedService<PendingIssuanceService>();
+
     // MVC controllers — discover from both Service and Web assemblies
     builder.Services.AddControllers()
         .AddApplicationPart(typeof(Certus.Web.Controllers.Acme.DirectoryController).Assembly);
@@ -450,57 +521,11 @@ try
     // Security: startup validator
     builder.Services.AddSingleton<StartupValidator>();
 
-    // Rate limiting for ACME endpoints. Bind the options so StartupValidator can
-    // warn on a non positive limit or window; the local copy below gates the
-    // pipeline at build time.
-    builder.Services.Configure<AcmeRateLimitOptions>(
-        builder.Configuration.GetSection(AcmeRateLimitOptions.SectionName));
-
-    var rateLimitOptions = builder.Configuration
-        .GetSection(AcmeRateLimitOptions.SectionName)
-        .Get<AcmeRateLimitOptions>() ?? new AcmeRateLimitOptions();
-
-    if (rateLimitOptions.Enabled)
-    {
-        builder.Services.AddRateLimiter(rlOptions =>
-        {
-            rlOptions.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
-
-            // A bare 429 tells an ACME client nothing; RFC 8555 §6.6 has an
-            // error code for exactly this, and §6.6 asks for Retry-After.
-            rlOptions.OnRejected = AcmeProblemResults.OnRateLimitRejected;
-
-            rlOptions.AddPolicy("acme-new-account", httpContext =>
-                RateLimitPartition.GetFixedWindowLimiter(
-                    httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
-                    _ => new FixedWindowRateLimiterOptions
-                    {
-                        PermitLimit = rateLimitOptions.NewAccountLimit,
-                        Window = TimeSpan.FromSeconds(rateLimitOptions.WindowSeconds),
-                        QueueLimit = 0
-                    }));
-
-            rlOptions.AddPolicy("acme-new-order", httpContext =>
-                RateLimitPartition.GetFixedWindowLimiter(
-                    httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
-                    _ => new FixedWindowRateLimiterOptions
-                    {
-                        PermitLimit = rateLimitOptions.NewOrderLimit,
-                        Window = TimeSpan.FromSeconds(rateLimitOptions.WindowSeconds),
-                        QueueLimit = 0
-                    }));
-
-            rlOptions.AddPolicy("acme-general", httpContext =>
-                RateLimitPartition.GetFixedWindowLimiter(
-                    httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
-                    _ => new FixedWindowRateLimiterOptions
-                    {
-                        PermitLimit = rateLimitOptions.GeneralLimit,
-                        Window = TimeSpan.FromSeconds(rateLimitOptions.WindowSeconds),
-                        QueueLimit = 0
-                    }));
-        });
-    }
+    // Rate limiting for ACME endpoints. Registered in one place for both hosts:
+    // this block used to be duplicated byte for byte here and in the other host's
+    // Program.cs, so a change made to whichever copy was in front of you could
+    // silently miss the deployed one (issue #263).
+    var rateLimitOptions = builder.Services.AddAcmeRateLimiting(builder.Configuration);
 
     // Health check with database and CA connectivity verification. The CA probe is
     // cached briefly (CaHealthCache) so the anonymous readiness endpoint cannot drive a
@@ -510,6 +535,30 @@ try
         .AddCheck<CertusHealthCheck>("certus", tags: new[] { "ready" });
 
     var app = builder.Build();
+
+    // The two configuration files a standard user could once take over (issue
+    // #489). An untrusted one reads as absent wherever it is read, so the
+    // service runs on without it, unconfigured for the overlay and with no
+    // template exposed for the status file. This is the line that says so,
+    // through the file logger, which did not exist when the overlay was added.
+    var statusPath = SetupStatus.GetStatusPath(certusOptions);
+    foreach (var (path, verdict, consequence) in new[]
+    {
+        (Path.Combine(CertusPaths.DataDirectory, CertusPaths.SettingsOverlayFileName), overlayTrust,
+            "none of its settings, the CA connection string among them, are in force"),
+        (statusPath, TrustedFile.Check(statusPath),
+            "the setup state in it is not in force, so no template is exposed over ACME"),
+    })
+    {
+        if (verdict.IsTrusted)
+            continue;
+        app.Logger.LogCritical(
+            "{Path} is being ignored because it cannot be trusted: {Reason}. Until it is " +
+            "replaced, {Consequence}. Check what it contains, then delete it and run the setup " +
+            "wizard again, or reset its owner and permissions as Troubleshooting describes under " +
+            "\"The service ignores a configuration file\".",
+            path, verdict.Reason, consequence);
+    }
 
     // Startup validation — reject fatal misconfigurations (including the SEC-F1
     // refusal) before any database I/O happens.
@@ -548,7 +597,7 @@ try
     {
         var dbDir = Path.GetDirectoryName(certusOptions.DatabasePath);
         if (!string.IsNullOrEmpty(dbDir))
-            Directory.CreateDirectory(dbDir);
+            ProtectedFolder.EnsureExists(dbDir);
     }
 
     using (var scope = app.Services.CreateScope())
@@ -556,6 +605,28 @@ try
         var db = scope.ServiceProvider.GetRequiredService<CertusDbContext>();
         DatabaseInitializer.Initialize(db, certusOptions.EnableWalMode, app.Logger);
     }
+
+    // Detached on purpose, and after the migration rather than inside the
+    // validation scope above, which is documented as running before any I/O.
+    // This is the one boot line that says a template nobody can address is the
+    // one exposed over ACME (issue #235), and it is the only startup diagnostic
+    // that needs the CA. StartupValidator stays what it is: synchronous, I/O
+    // free, and answerable from configuration alone. Running it detached means
+    // a CA at the end of an RPC timeout costs boot nothing, an unconfigured
+    // install costs nothing, and a healthy install pays only the template cache
+    // fill the first ACME request would have paid anyway.
+    // Both singletons are resolved here rather than inside the lambda. A
+    // resolution failure on the boot thread fails loudly like every other
+    // GetRequiredService in this file; the same failure inside a detached task
+    // would be swallowed as an unobserved exception, and the diagnostic would
+    // silently stop existing with nothing logged at any level.
+    var templateNameReportTemplates = app.Services.GetRequiredService<TemplateService>();
+    var templateNameReportPolicy = app.Services.GetRequiredService<EnabledTemplatesPolicy>();
+    _ = Task.Run(() => TemplateNameStartupReport.LogAsync(
+        templateNameReportTemplates,
+        templateNameReportPolicy,
+        app.Logger,
+        app.Lifetime.ApplicationStopping));
 
     // Forwarded headers — correct RemoteIpAddress from a known reverse proxy
     // before the rate limiter and request logging read it. Does nothing when
@@ -658,12 +729,12 @@ try
         "HTTPS certificate for this boot: {CertSource} thumbprint {Thumbprint} ({CertDetail})",
         httpsCertSelection.Source, httpsCertSelection.Thumbprint ?? "unknown",
         httpsCertSelection.Detail);
-    Log.Information("Certus Service started successfully");
+    Log.Information("Ducks in a Row service started successfully");
     app.Run();
 }
 catch (Exception ex)
 {
-    Log.Fatal(ex, "Certus Service terminated unexpectedly");
+    Log.Fatal(ex, "Ducks in a Row service terminated unexpectedly");
 
     // A fatal startup error (including the SEC-F1 refusal in StartupValidator and
     // the auth guard in UseCertusAuth) must surface as a nonzero exit code so an

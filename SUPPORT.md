@@ -35,5 +35,21 @@ Do not use Discussions or issues for vulnerabilities. Follow
 
 ## Commercial support and licensing
 
-For a commercial license, the paid tier, or a support agreement with a response
-target, contact **licensing@haruspex.systems**.
+A support subscription gives your organisation a direct route to us and a
+response target:
+
+- Email from two named contacts, covering every Ducks in a Row installation
+  your organisation runs for its own infrastructure.
+- A first reply from a person by the end of the next business day, as a
+  response target with no penalties or service credits. Business hours are
+  Monday to Friday, 09:00 to 17:00 Amsterdam time, except Dutch public
+  holidays.
+- Help with the latest release, and with the release before it for 90 days
+  after a new release ships. Fixes of any kind arrive only in a new release.
+
+Security fixes are free to everyone, with or without a subscription. They reach
+you by upgrading to the latest release, as [SECURITY.md](SECURITY.md) describes.
+
+Support for installations you run for other organisations, as a managed service
+provider does, is quoted on request. For that, a support subscription, a
+commercial license, or the paid tier, contact **licensing@haruspex.systems**.

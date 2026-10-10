@@ -87,4 +87,71 @@ public class ResolveTemplateNameTests
 
         AdcsClient.ResolveTemplateName(raw, map).Should().BeEmpty();
     }
+
+    // ---- The resolved name is sanitized (issue #378) ----------------------
+    //
+    // Both values this can return are authored outside Ducks: the CA's own row,
+    // and a directory read. The strip lives here rather than at the row mapper
+    // because that mapper needs a live CA view and no test can reach it.
+
+    [Fact]
+    public void ResolveTemplateName_PoisonedRawToken_IsStripped()
+    {
+        // The unmapped branch, which is the one the issue is about: the map is
+        // best effort and falls back to empty on any failure, so the CA's own
+        // token is what reaches the database whenever it is unavailable.
+        var map = AdcsClient.BuildTemplateDisplayMap(SampleTemplates());
+        var rlo = (char)0x202e;
+
+        AdcsClient.ResolveTemplateName("Web" + rlo + "Server", map)
+            .Should().Be("WebServer");
+    }
+
+    [Fact]
+    public void ResolveTemplateName_PoisonedDisplayName_IsStrippedToo()
+    {
+        // The mapped branch. A display name comes from a directory read, so it
+        // is no more ours than the CA's token is, and a strip that covered only
+        // the fallback would leave the commoner path open.
+        var rlo = (char)0x202e;
+        var map = AdcsClient.BuildTemplateDisplayMap(new[]
+        {
+            new TemplateInfo(
+                Name: "WebServerACME",
+                DisplayName: "Web" + rlo + " Server ACME",
+                Oid: "1.3.6.1.4.1.311.21.8.15853379.1"),
+        });
+
+        AdcsClient.ResolveTemplateName("1.3.6.1.4.1.311.21.8.15853379.1", map)
+            .Should().Be("Web Server ACME");
+    }
+
+    [Fact]
+    public void ResolveTemplateName_LooksUpBeforeStripping()
+    {
+        // The ordering, which is easy to get backwards and silent when wrong.
+        // The map is keyed on exactly what the CA stored, so stripping first
+        // would miss the entry and return the raw token, losing the display name
+        // for precisely the poisoned rows this guards.
+        var zwsp = (char)0x200b;
+        var poisonedKey = "Web" + zwsp + "ServerACME";
+        var map = AdcsClient.BuildTemplateDisplayMap(new[]
+        {
+            new TemplateInfo(
+                Name: poisonedKey,
+                DisplayName: "Web Server ACME",
+                Oid: "1.3.6.1.4.1.311.21.8.15853379.1"),
+        });
+
+        AdcsClient.ResolveTemplateName(poisonedKey, map).Should().Be("Web Server ACME");
+    }
+
+    [Fact]
+    public void ResolveTemplateName_TokenThatSanitizesAwayEntirely_ReturnsEmpty()
+    {
+        // Never null: the caller assigns this straight to a required column.
+        var map = AdcsClient.BuildTemplateDisplayMap(SampleTemplates());
+
+        AdcsClient.ResolveTemplateName("\u202e\u200b\u2028", map).Should().BeEmpty();
+    }
 }

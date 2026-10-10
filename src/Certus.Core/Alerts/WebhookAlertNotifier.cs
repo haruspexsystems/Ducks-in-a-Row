@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Certus.Core.Crl;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -57,6 +58,43 @@ public sealed class WebhookAlertNotifier : IAlertNotifier
         };
 
         return await PostAsync(payload, $"server certificate renewal ({alert.Outcome})", cancellationToken);
+    }
+
+    /// <summary>
+    /// The CRL POST (issue #447).
+    ///
+    /// A distinct event per stage rather than one event with a field, matching
+    /// the two events already here: a receiver routes on the event name, and
+    /// "this CRL expired an hour ago" and "this CRL expires in thirty days" are
+    /// not the same page of a runbook.
+    /// </summary>
+    public async Task<AlertNotificationResult> SendCrlAlertAsync(
+        CrlAlert alert,
+        CancellationToken cancellationToken = default)
+    {
+        var payload = new CrlWebhookPayload
+        {
+            Event = alert.Stage switch
+            {
+                CrlAlertRules.ExpiredStage => "crl.expired",
+                CrlAlertRules.OverdueStage => "crl.overdue",
+                _ => "crl.expiring",
+            },
+            Stage = alert.Stage,
+            IssuerName = alert.IssuerName,
+            Kind = alert.Kind,
+            Scope = alert.Scope,
+            CrlNumber = alert.CrlNumber,
+            NewerCrlNumber = alert.NewerCrlNumber,
+            NextUpdate = alert.NextUpdate,
+            HoursRemaining = Math.Round(alert.HoursRemaining, 1),
+            Sources = [.. alert.Sources],
+            LastReadAt = alert.LastReadAt,
+            Timestamp = DateTime.UtcNow,
+        };
+
+        return await PostAsync(
+            payload, $"the {alert.Stage} CRL warning for {alert.IssuerName}", cancellationToken);
     }
 
     /// <summary>
@@ -207,6 +245,33 @@ internal sealed class ServerCertificateWebhookPayload
     public string? Detail { get; set; }
     public string? TemplateName { get; set; }
     public int? DaysRemaining { get; set; }
+    public DateTime Timestamp { get; set; }
+}
+
+/// <summary>
+/// The CRL payload. Like the server certificate one, its subject is not a row in
+/// the certificate inventory, so it carries no certificate id and no serial: a
+/// CRL is identified by who signed it and by its own number.
+///
+/// <see cref="Sources"/> is the list of places this CRL is served from, and
+/// <see cref="NewerCrlNumber"/> is set when a newer one is being served
+/// somewhere else. Together they are what tells a receiver that a renewal
+/// reached one location and not another, which is the commonest way a root CRL
+/// renewal goes wrong.
+/// </summary>
+internal sealed class CrlWebhookPayload
+{
+    public string Event { get; set; } = string.Empty;
+    public string Stage { get; set; } = string.Empty;
+    public string IssuerName { get; set; } = string.Empty;
+    public string Kind { get; set; } = string.Empty;
+    public string Scope { get; set; } = string.Empty;
+    public string? CrlNumber { get; set; }
+    public string? NewerCrlNumber { get; set; }
+    public DateTime NextUpdate { get; set; }
+    public double HoursRemaining { get; set; }
+    public List<string> Sources { get; set; } = [];
+    public DateTime? LastReadAt { get; set; }
     public DateTime Timestamp { get; set; }
 }
 

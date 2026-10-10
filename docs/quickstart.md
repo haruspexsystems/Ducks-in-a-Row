@@ -34,12 +34,24 @@ You need:
 
 ## 1. Install
 
-Download the installer from the
-[latest release](https://github.com/haruspexsystems/Ducks-in-a-Row/releases) and run
-it on the server. This is a beta and the installer is not code signed, so
-Windows SmartScreen and Defender will warn you when you run it; verify the
-download against the SHA256 checksum on the release page first. The install
-wizard lets you:
+Download from the
+[latest release](https://github.com/haruspexsystems/Ducks-in-a-Row/releases) and
+run it on the server. There are two downloads and you almost certainly want the
+first:
+
+- **`Ducks-in-a-Row-Setup.exe`** carries the ASP.NET Core 10 runtime inside it,
+  so it installs on a server with no internet access from the one file. It skips
+  the runtime install when one is already present, and never removes it on
+  uninstall.
+- **`Ducks-in-a-Row.msi`** is the application alone, for deployment systems that
+  manage the runtime themselves. Without the runtime the service fails before it
+  can log anything and the installer reports a misleading **Error 1920**.
+
+Both installers are code signed by Haruspex Systems B.V. Check the signature and
+the SHA256 checksum on the release page before you run either one, as
+[checking the download](installation.md#check-the-download) describes. Windows
+SmartScreen may still warn about a new release; if it does, **More info** should
+name Haruspex Systems B.V. as the publisher. The install wizard lets you:
 
 - choose the destination folder (default `C:\Program Files\Ducks in a Row\`),
 - choose the data folder for the database, logs, and runtime configuration
@@ -79,8 +91,8 @@ The "open the setup page" prompt only appears in the interactive wizard, so a
 Open the dashboard in a browser on `https://your-server:5001` (or
 `http://your-server:5000`). You must sign in as a member of the administrator
 group. By default that is the server's built in Administrators group; set
-`Auth:AdminGroup` in `appsettings.json` to delegate to a specific Windows or
-Active Directory group.
+`Auth:AdminGroup` in `settings.json` in the data folder to delegate to a
+specific Windows or Active Directory group.
 
 > The HTTPS endpoint uses a self signed certificate out of the box (generated in
 > the data folder as `ducks-selfsigned.pfx`), so your browser will warn on
@@ -93,15 +105,20 @@ Until setup completes the service is **unconfigured**: it serves the wizard and
 the dashboard shell, and every CA operation answers 503. It never falls back to
 a fake CA on its own.
 
-On first run you are taken to the setup wizard. It walks you through five short
-steps.
+On first run you are taken to the setup wizard. It walks you through six short
+steps. It remembers where you were, so a service restart in the middle of it
+does not send you back to the beginning.
 
 ![Setup wizard welcome step listing what you need before you start](images/setup-01-welcome.png)
 
 1. **Welcome.** A short checklist of what you need before you start.
 2. **Connect a CA.** The wizard discovers the CAs published in Active Directory
    and lets you pick one, or enter `CAHOST\CA Name` by hand. It then tests the
-   connection through the same DCOM path the service uses in production.
+   connection through the same DCOM path the service uses in production. A pass
+   proves that the service's account holds Request Certificates on the CA, and
+   the wizard then checks the service's other rights. The Review step runs the
+   full check, template permissions included, and says plainly what is not
+   proven yet. See [the service's rights](verifying.md#the-services-rights).
 
    ![Setup wizard connection step showing a discovered CA and the test connection button](images/setup-02-connection.png)
 
@@ -112,20 +129,37 @@ steps.
 
    ![Setup wizard templates step showing the ACME readiness checklist](images/setup-03-templates.png)
 
-4. **Set the external URL.** This is the address clients will use to reach the
+4. **Allowed domains.** Choose which domains this server may issue certificates
+   for. On a domain joined server the wizard arrives here with the restriction
+   already on and your Active Directory domain filled in. An entry covers the
+   domain and all of its subdomains, so `corp.example.com` also covers
+   `web.corp.example.com`; wildcard entries are not needed and are not accepted.
+
+   You can turn the restriction off, but leaving it on is the recommendation.
+   It restricts issuance **through Ducks in a Row only**: the CA itself can
+   still issue for any name through its own tools, so this complements CA side
+   controls like name constraints rather than replacing them.
+
+   ![Setup wizard allowed domains step with the restriction enabled and one domain listed](images/setup-04-domains.png)
+
+5. **Set the external URL.** This is the address clients will use to reach the
    server. It comes prefilled with a suggestion and is checked for you. On this
    step the wizard can also enrol an HTTPS certificate for the server from your
    CA in one click, so clients trust the connection (see
    [Giving clients a TLS certificate they trust](#giving-clients-a-tls-certificate-they-trust)).
 
-   ![Setup wizard external URL step showing the prefilled URL and the one-click TLS certificate button](images/setup-04-external-url.png)
+   ![Setup wizard external URL step showing the server URL and the directory URL clients will use](images/setup-05-external-url.png)
 
-5. **Review and apply.** Your choices are saved to `settings.json` in the data
+6. **Review and apply.** The step summarises your choices and runs the rights
+   check again, with a row for each template you chose. Unless step 5 enrolled
+   an HTTPS certificate for the server, Complete Setup waits for you to tick a
+   box naming the rights that are not proven yet. It never refuses because a
+   right is missing. Your choices are then saved to `settings.json` in the data
    folder and the service restarts itself to load them. The wizard waits for the
    service to come back, then shows a ready to run certbot command and opens the
    dashboard.
 
-   ![Setup wizard review step showing the pre-filled certbot command](images/setup-05-review.png)
+   ![Setup wizard review step summarising the CA, the template, the allowed domains and the external URL](images/setup-06-review.png)
 
 To point an existing install at a different CA later, you have two options.
 Either edit `Certus:CaConnectionString` in `settings.json` in the data folder
@@ -142,7 +176,10 @@ https://your-server:5001/acme/<template>/directory
 ```
 
 `<template>` is the template's programmatic name (its AD `cn`) or its display
-name. Display names with spaces work; the client URL encodes them.
+name. Display names with spaces work; the client URL encodes them. A display
+name carrying an invisible character, such as a soft hyphen left behind by a
+paste from a word processor, is refused with a 400; use the programmatic name
+and see [Troubleshooting](troubleshooting.md).
 
 Point any standard ACME client at that directory URL and request a certificate.
 A quick test with certbot:
@@ -155,15 +192,26 @@ certbot certonly --standalone \
   --key-type rsa --rsa-key-size 2048
 ```
 
-> **Key type.** If your ADCS template uses an RSA CSP (the default
-> `Web Server ACME` template does), your ACME client must request an RSA key.
-> Most modern clients default to elliptic curve keys, which the CA policy
-> module rejects at finalize with `Denied by Policy Module`. The last line
-> above forces RSA for certbot. Other clients: lego `--key-type rsa2048`,
-> acme.sh `--keylength 2048`, dehydrated `KEY_ALGO="rsa"`.
+> [!WARNING]
+> **Match the key type to the template.** Your client must ask for the key type
+> the template wants, and templates differ. An RSA template needs an RSA key; an
+> `ECDSA_P256` template needs a key on that curve. Ask for the wrong one and the
+> CA policy module refuses at finalize with `Denied by Policy Module`.
+>
+> You do not have to work this out yourself. The wizard's template step reports
+> the key algorithm it read from the template, and the **Client setup** snippets
+> on the dashboard's ACME page arrive with the right flags already filled in.
+> Copy them from there rather than from memory.
+>
+> The stock `Web Server ACME` template is RSA, which is why the command above
+> forces RSA: most clients default to an elliptic curve key. See
+> [connecting ACME clients](acme-clients.md#key-type) for the per client flags.
 
-No account pre-registration or external account binding is needed. The client
-creates an account from its own key on first use.
+Out of the box no account pre-registration is needed and no external account
+binding is required: the client creates an account from its own key the first
+time it connects. If an administrator has set EAB enforcement to Optional or
+Required, the client needs a credential as well. See
+[external account binding](external-account-binding.md).
 
 See [Connecting ACME clients](acme-clients.md) for certbot, win-acme, Caddy,
 Traefik, and Posh-ACME.
@@ -185,6 +233,10 @@ If anything misbehaves, see [Troubleshooting](troubleshooting.md).
 
 ## Configuration reference
 
+The settings below are the ones a first install usually touches.
+[Configuration](configuration.md) is the complete list, including alerting, rate
+limiting, challenge egress and the keys that ship as an explicit null.
+
 Configuration is layered. Shipped defaults live in `appsettings.json` in the
 installation folder; the setup wizard writes instance settings (CA connection
 string, external URL) to `settings.json` in the **data folder**, which
@@ -199,6 +251,7 @@ Restart the service after editing either file.
 | `Certus:SyncIntervalMinutes` | `5` | How often the dashboard syncs from the CA |
 | `Certus:RequestHistoryDays` | `30` | How far back the sync reaches for pending, denied, and failed requests, so their detail pages can show the CA's own explanation. Issued and revoked certificates are always synced in full. Set to `0` to skip those three passes entirely, which also empties the Pending, Denied, and Failed filters on the certificate list |
 | `Certus:Acme:ExposeAllTemplates` | `false` | Break glass override: expose every CA published template over ACME, ignoring the wizard's template selection. Leave it `false`; the open posture is logged as a warning at startup |
+| `Certus:EnableWalMode` | `true` | SQLite write ahead logging, for better concurrent read and write performance. Set it to `false` on a filesystem that cannot support WAL, or when a backup or replication tool needs a single database file with no `-wal` and `-shm` sidecars. Applied in both directions on every start, so changing it converts the existing database. See [Troubleshooting](troubleshooting.md#the-database-journal-mode-does-not-match-enablewalmode) before moving the data folder to a network share |
 | `Auth:Mode` | `Negotiate` | Windows Integrated Authentication for the dashboard |
 | `Auth:AdminGroup` | `null` (built in Administrators) | Group allowed into the dashboard and setup |
 | `Auth:RequireHttps` | `true` | HSTS and HTTP to HTTPS redirect outside development |

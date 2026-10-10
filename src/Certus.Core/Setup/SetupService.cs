@@ -34,6 +34,13 @@ public sealed class SetupService
     /// <summary>HRESULT for "class not registered" COM activation failures.</summary>
     private const int RegdbClassNotRegistered = unchecked((int)0x80040154);
 
+    /// <summary>
+    /// DISP_E_MEMBERNOTFOUND, which the troubleshooting guide reports for a
+    /// server without RSAT-ADCS-Mgmt, where a class activates and then cannot
+    /// resolve its methods.
+    /// </summary>
+    private const int DispMemberNotFound = unchecked((int)0x80020003);
+
     public SetupService(
         IAdcsClientFactory clientFactory,
         ICaDiscoveryService caDiscovery,
@@ -129,23 +136,46 @@ public sealed class SetupService
                 CaName: caInfo.Name,
                 CaDnsName: caInfo.DnsName,
                 CaDisplayName: caInfo.DisplayName,
-                ErrorMessage: caInfo.IsAccessible ? null : "CA is not accessible");
+                ErrorMessage: caInfo.IsAccessible ? null : "CA is not accessible",
+                FailureKind: caInfo.IsAccessible ? null : ConnectivityFailureKind.NotAccessible);
         }
-        catch (COMException ex) when (ex.HResult == RegdbClassNotRegistered)
+        catch (CaAccessDeniedException ex)
+        {
+            // The CA answered and refused the service's account: a right is
+            // missing, which no firewall or DNS check would ever fix.
+            _logger.LogWarning(ex, "CA connectivity test for {Ca}: the CA refused the service account", caConnectionString);
+            return new ConnectivityTestResult(
+                Success: false,
+                ErrorMessage: ex.Message,
+                FailureKind: ConnectivityFailureKind.AccessDenied);
+        }
+        catch (CaUnavailableException ex)
+        {
+            _logger.LogWarning(ex, "CA connectivity test for {Ca}: the CA could not be reached", caConnectionString);
+            return new ConnectivityTestResult(
+                Success: false,
+                ErrorMessage:
+                    "The CA could not be reached over RPC. Check that CertSvc is running on the CA, and that " +
+                    "TCP 135 and the dynamic RPC range (49152 to 65535) are open from this server to the CA.",
+                FailureKind: ConnectivityFailureKind.Unavailable);
+        }
+        catch (COMException ex) when (ex.HResult is RegdbClassNotRegistered or DispMemberNotFound)
         {
             _logger.LogWarning(ex, "CA connectivity test failed: ADCS COM classes are not registered");
             return new ConnectivityTestResult(
                 Success: false,
                 ErrorMessage:
                     "The ADCS COM classes are not registered on this server. Install the ADCS " +
-                    "Remote Administration Tools (Install-WindowsFeature RSAT-ADCS-Mgmt) and try again.");
+                    "Remote Administration Tools (Install-WindowsFeature RSAT-ADCS-Mgmt) and try again.",
+                FailureKind: ConnectivityFailureKind.ComponentsMissing);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "CA connectivity test failed for {Ca}", caConnectionString);
             return new ConnectivityTestResult(
                 Success: false,
-                ErrorMessage: ex.Message);
+                ErrorMessage: ex.Message,
+                FailureKind: ConnectivityFailureKind.Other);
         }
         finally
         {
@@ -188,6 +218,25 @@ public sealed class SetupService
     /// The wizard's copy for <see cref="SetupTemplatesResult.ExcludedCount"/>
     /// accounts for this by naming "could not be checked" as a third
     /// possible reason, not just the two definite ones.
+    ///
+    /// One further reason hides a template, and unlike the others it applies
+    /// whether or not AD could be read: a programmatic name carrying a control,
+    /// line separator, or formatting character. That name comes from the CA's
+    /// own published list rather than from AD, so "could not be checked" never
+    /// applies to it, and <see cref="AdcsRequestAttributes"/> refuses to build a
+    /// request attribute string from it, so no certificate can be requested
+    /// against the template on any path. Offering it would walk an administrator
+    /// through the rest of the wizard to an opaque refusal at the last click,
+    /// because completion character checks the recorded set as well. Those are
+    /// counted separately in
+    /// <see cref="SetupTemplatesResult.UnusableNameCount"/> so the wizard can
+    /// give the real reason rather than widen its existing disjunction.
+    ///
+    /// A dirty <em>display</em> name does not hide anything. The template still
+    /// enrolls, and only the ACME addressing form issue #17 added is lost, so it
+    /// is reported per template through
+    /// <see cref="SetupTemplateView.DisplayNameWarning"/> and left selectable
+    /// (issue #235).
     /// </summary>
     public async Task<SetupTemplatesResult> GetSetupTemplatesAsync(
         string caConnectionString,
@@ -198,32 +247,57 @@ public sealed class SetupService
         {
             var all = await client.GetTemplatesAsync(cancellationToken);
 
-            var views = all.Select(t => new SetupTemplateView(
-                Name: t.Name,
-                DisplayName: t.DisplayName,
-                Oid: t.Oid,
-                HasServerAuthEku: t.ExtendedKeyUsages?.Contains(ServerAuthEku) == true,
-                EkuVerified: t.ExtendedKeyUsages != null,
-                Viability: t.Viability)).ToList();
+            // Ahead of the EKU branch below, and applying inside both of its
+            // arms, because this does not depend on Active Directory at all.
+            // The programmatic name comes from the CA's own CR_PROP_TEMPLATES,
+            // so the "could not be checked, show it anyway" fallback has nothing
+            // to say about it.
+            var inspected = all
+                .Select(t => (Template: t, Verdict: TemplateNameUsability.Inspect(t)))
+                .ToList();
+
+            // CanEnroll alone, so only the programmatic name can hide a
+            // template. A dirty display name costs one addressing form and a
+            // dirty OID costs nothing at all, and neither is a reason to
+            // withhold a template that issues perfectly well (issues #235,
+            // #292). Both are reported per template instead, below.
+            var enrollable = inspected.Where(pair => pair.Verdict.CanEnroll).ToList();
+            var unusableNames = inspected.Count - enrollable.Count;
+
+            var views = enrollable.Select(pair => new SetupTemplateView(
+                Name: pair.Template.Name,
+                DisplayName: pair.Template.DisplayName,
+                Oid: pair.Template.Oid,
+                HasServerAuthEku: pair.Template.ExtendedKeyUsages?.Contains(ServerAuthEku) == true,
+                EkuVerified: pair.Template.ExtendedKeyUsages != null,
+                Viability: pair.Template.Viability,
+                DisplayNameWarning: SetupTemplateNameWarning.From(pair.Verdict.DisplayFault),
+                OidWarning: SetupTemplateNameWarning.From(pair.Verdict.OidFault))).ToList();
 
             if (!views.Any(v => v.EkuVerified))
-                return new SetupTemplatesResult(views, ExcludedCount: 0);
+                return new SetupTemplatesResult(views, unusableNames, unusableNames);
 
             // The ceiling term catches what HasServerAuthEku alone misses: a
             // template carrying server authentication next to a dangerous
             // usage (code signing, enrollment agent) would mint certificates
             // the finalize leaf guard refuses and revokes, so offering it in
             // the wizard would only set the admin up for failed orders.
+            // Zipped against enrollable, not all: views was built from the
+            // filtered list above, and zipping against the unfiltered one would
+            // pair each view with the wrong template's EKU set.
             var usable = views
-                .Zip(all, (view, template) => (view, template))
+                .Zip(enrollable, (view, pair) => (view, pair.Template))
                 .Where(pair => pair.view.HasServerAuthEku
                     && pair.view.Viability?.SubjectSuppliedInRequest != false
                     && TlsCapabilityCeiling.Evaluate(new CertificateCapability(
-                        pair.template.ExtendedKeyUsages, null, null)).Allowed)
+                        pair.Template.ExtendedKeyUsages, null, null)).Allowed)
                 .Select(pair => pair.view)
                 .ToList();
 
-            return new SetupTemplatesResult(usable, ExcludedCount: views.Count - usable.Count);
+            return new SetupTemplatesResult(
+                usable,
+                ExcludedCount: unusableNames + (views.Count - usable.Count),
+                UnusableNameCount: unusableNames);
         }
         finally
         {
@@ -377,7 +451,8 @@ public sealed class SetupService
         SetupStatus status;
         lock (StatusFileWriteLock)
         {
-            if (!SetupStatus.TryLoad(GetSetupStatusPath(), out var prior))
+            var statusPath = GetSetupStatusPath();
+            if (!SetupStatus.TryLoad(statusPath, out var prior))
             {
                 // Completion cannot be refused for a transient read failure,
                 // but resetting these must never be silent. Both reset to
@@ -388,6 +463,21 @@ public sealed class SetupService
                     "the EAB enforcement mode and the revocation scope could not be " +
                     "carried forward and read as their defaults until an administrator " +
                     "sets them again");
+            }
+            else if (File.Exists(statusPath) && !TrustedFile.Check(statusPath).IsTrusted)
+            {
+                // Present but not trusted (issue #489): TryLoad reads an untrusted
+                // file as absent, so prior reads as empty and the EAB enforcement
+                // mode and the revocation scope are being dropped to their defaults.
+                // That reset must not be silent either, the same reason the
+                // unreadable arm above warns. An absent file, the ordinary first
+                // run, is not this: TryLoad succeeds and the file does not exist.
+                _logger.LogWarning(
+                    "The wizard status file at {Path} is not trusted while completing " +
+                    "setup, so the EAB enforcement mode and the revocation scope could " +
+                    "not be carried forward and read as their defaults until an " +
+                    "administrator sets them again",
+                    statusPath);
             }
             status = new SetupStatus
             {
@@ -403,7 +493,7 @@ public sealed class SetupService
                 RevocableTemplates = prior.RevocableTemplates.ToList(),
             };
 
-            status.Save(GetSetupStatusPath());
+            status.Save(statusPath);
         }
 
         _logger.LogInformation(
@@ -630,17 +720,39 @@ public sealed class SetupService
     /// thumbprint in the LocalMachine\My store. Read back and merged so the
     /// CA connection string and external URL survive exactly as the overlay
     /// has them. The template the certificate was enrolled with rides along
-    /// so a later renewal can reuse it; a null template keeps whatever the
+    /// so a later renewal can reuse it; a blank template keeps whatever the
     /// overlay already records rather than erasing it. The caller schedules
     /// the restart that applies it.
+    ///
+    /// Neither value may be written blank, and the two fail differently. A
+    /// blank thumbprint is refused outright: an empty string persists where a
+    /// null is stripped by WhenWritingNull, and it then reads as "no
+    /// certificate configured" at every call site, so the next start falls
+    /// back to the self signed certificate with only the generic warning in
+    /// the log. A blank template is treated as "none supplied" instead,
+    /// because an empty string there is worse than no value at all:
+    /// HttpsCertificateRenewalService resolves the template as the recorded
+    /// one ?? the first enabled one, so a stored empty string is not null,
+    /// the fallback never runs, and every renewal blocks on NoTemplate.
     /// </summary>
     public void SetHttpsCertificateThumbprint(string thumbprint, string? templateName = null)
     {
+        if (string.IsNullOrWhiteSpace(thumbprint))
+        {
+            throw new ArgumentException(
+                "The HTTPS certificate thumbprint cannot be blank. A blank value persists in " +
+                "the overlay, reads as no certificate configured everywhere it is used, and " +
+                "silently drops the service back to its self signed certificate at the next start.",
+                nameof(thumbprint));
+        }
+
         var overlayPath = SettingsOverlayPath;
         SettingsOverlay.Mutate(overlayPath, current => current with
         {
             HttpsCertificateThumbprint = thumbprint,
-            HttpsCertificateTemplate = templateName ?? current.HttpsCertificateTemplate,
+            HttpsCertificateTemplate = string.IsNullOrWhiteSpace(templateName)
+                ? current.HttpsCertificateTemplate
+                : templateName,
         });
 
         _logger.LogInformation(
@@ -651,12 +763,40 @@ public sealed class SetupService
 }
 
 /// <summary>Result of a CA connectivity test.</summary>
+/// <param name="FailureKind">
+/// Why the test failed, one of the <see cref="ConnectivityFailureKind"/> names,
+/// so the wizard can give the hint that fits rather than one generic line. Null
+/// when the test passed.
+/// </param>
 public sealed record ConnectivityTestResult(
     bool Success,
     string? CaName = null,
     string? CaDnsName = null,
     string? CaDisplayName = null,
-    string? ErrorMessage = null);
+    string? ErrorMessage = null,
+    string? FailureKind = null);
+
+/// <summary>
+/// The wire names of <see cref="ConnectivityTestResult.FailureKind"/>. Strings
+/// rather than an enum because the API serialises enums as numbers.
+/// </summary>
+public static class ConnectivityFailureKind
+{
+    /// <summary>The CA answered and refused the service's account.</summary>
+    public const string AccessDenied = "accessDenied";
+
+    /// <summary>The CA could not be reached over RPC.</summary>
+    public const string Unavailable = "unavailable";
+
+    /// <summary>The ADCS COM classes are missing on this server (RSAT-ADCS-Mgmt).</summary>
+    public const string ComponentsMissing = "componentsMissing";
+
+    /// <summary>The CA answered with some other failure.</summary>
+    public const string NotAccessible = "notAccessible";
+
+    /// <summary>Anything else.</summary>
+    public const string Other = "other";
+}
 
 /// <summary>
 /// Result of validating an external URL. <see cref="Probe"/> is present when
@@ -691,13 +831,61 @@ public sealed record SetupConfiguration(
 /// template's AD object could not be read; individual members are null when only
 /// that attribute was missing. Advisory only — never gates the wizard.
 /// </param>
+/// <param name="DisplayNameWarning">
+/// Set when the display name carries a character the URL guard refuses, so an
+/// ACME client addressing this template by its display name is refused with a
+/// 400 before routing (issue #235). Null on a clean template.
+///
+/// There is deliberately no matching member for the programmatic name. A
+/// template whose programmatic name carries one is never listed at all, so such
+/// a member could not be anything but null on the wire.
+/// </param>
+/// <param name="OidWarning">
+/// Set when the template OID carries such a character (issue #292). Unlike the
+/// other two this costs nothing: the template issues and is addressed exactly
+/// as before, and it is reported only because the wizard prints the OID on
+/// every template row, where an override in it reorders the text around it.
+/// Null on a clean template.
+/// </param>
 public sealed record SetupTemplateView(
     string Name,
     string DisplayName,
     string Oid,
     bool HasServerAuthEku,
     bool EkuVerified,
-    TemplateAcmeViability? Viability = null);
+    TemplateAcmeViability? Viability = null,
+    SetupTemplateNameWarning? DisplayNameWarning = null,
+    SetupTemplateNameWarning? OidWarning = null);
+
+/// <summary>
+/// Why one of a template's values cannot be shown or used as published, for a
+/// surface that has to explain it. The class as the noun the sentence needs,
+/// plus the position and code point an operator can look up. Never the value
+/// and never the character: a bidirectional override in a JSON body would
+/// reorder the page reporting it, which is the fault this exists to report.
+///
+/// Named for the two names it was written for, and since issue #292 it carries
+/// the template OID as well. The shape is right for all three, and a second
+/// record with the same three members would only give the frontend a second
+/// key layout to keep straight.
+/// </summary>
+public sealed record SetupTemplateNameWarning(string Kind, int Position, int CodePoint)
+{
+    /// <summary>
+    /// Projects a fault onto the wire. Carries the class as its noun rather
+    /// than as an enum, so a caller composes its sentence without learning a
+    /// numeric value, and carries no template text at all.
+    ///
+    /// It lives here rather than on the one service that first needed it
+    /// because the setup wizard and the dashboard's template endpoint both
+    /// report a fault now, and one composer is what stops the two wire shapes
+    /// drifting apart.
+    /// </summary>
+    public static SetupTemplateNameWarning? From(TemplateNameFault? fault) =>
+        fault is { } f
+            ? new SetupTemplateNameWarning(f.ClassNoun, f.Character.Position, f.Character.CodePoint)
+            : null;
+}
 
 /// <summary>
 /// The setup wizard's template listing: the templates worth offering, plus
@@ -705,6 +893,15 @@ public sealed record SetupTemplateView(
 /// usable ACME server certificate (no server authentication EKU, or the
 /// subject is built from AD instead of the request).
 /// </summary>
+/// <param name="UnusableNameCount">
+/// The subset of <paramref name="ExcludedCount"/> hidden because the
+/// programmatic name itself carries a control, line separator, or formatting
+/// character, so nothing can be enrolled against the template on any path. Held
+/// apart from the rest because its fix is a different one: the programmatic
+/// name is fixed when a template is created, so the template has to be
+/// duplicated under a clean name.
+/// </param>
 public sealed record SetupTemplatesResult(
     IReadOnlyList<SetupTemplateView> Templates,
-    int ExcludedCount);
+    int ExcludedCount,
+    int UnusableNameCount = 0);

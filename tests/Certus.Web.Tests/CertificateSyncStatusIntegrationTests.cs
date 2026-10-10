@@ -85,6 +85,13 @@ public class SyncStatusNeverSyncedTests : IClassFixture<SyncStatusNeverSyncedTes
             return Array.Empty<CertificateInfo>();
         }
 
+        public async Task<CaRequestStatus?> GetRequestStatusAsync(
+            int requestId, CancellationToken cancellationToken = default)
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            return null;
+        }
+
         public Task<IReadOnlyList<TemplateInfo>> GetTemplatesAsync(CancellationToken cancellationToken = default)
             => throw new NotSupportedException("not used by this fixture");
 

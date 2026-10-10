@@ -2,6 +2,7 @@ using System.Text.Json;
 using Certus.Core.Acme.Crypto;
 using Certus.Core.Acme.Models;
 using Certus.Core.Acme.Services;
+using Certus.Core.Security;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 
@@ -12,7 +13,7 @@ namespace Certus.Web.Controllers.Acme;
 /// RFC 8555 §7.5.1
 /// </summary>
 [ApiController]
-[EnableRateLimiting("acme-general")]
+[EnableRateLimiting(AcmeRateLimitPolicies.General)]
 public sealed class ChallengeController : AcmeControllerBase
 {
     /// <summary>
@@ -98,6 +99,20 @@ public sealed class ChallengeController : AcmeControllerBase
             if (intakeError != null)
                 return intakeError;
         }
+
+        // RFC 8555 §7.5.2: the client has said it no longer holds this authorization,
+        // so it may not put the authorization's challenges back to work. Without this
+        // a client could deactivate an authorization and then still drive its pending
+        // challenge to "processing", where the background validator would set the
+        // authorization back to "valid" and undo the deactivation.
+        //
+        // Placed here rather than beside the ownership check on purpose: reading a
+        // challenge under a deactivated authorization stays a 200, matching how the
+        // authorization resource itself still reads back. Only the state change is
+        // refused. GetChallengeAsync already includes the authorization, so this is free.
+        if (string.Equals(challenge.Authorization.Status, "deactivated", StringComparison.Ordinal))
+            return AcmeError(403, AcmeErrorType.Unauthorized,
+                "The authorization for this challenge has been deactivated.");
 
         // Transition to "processing" — the background validation service will pick it up
         var moved = await _orderService.RespondToChallengeAsync(challengeId, attestationObject, ct);

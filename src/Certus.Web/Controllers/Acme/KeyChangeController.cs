@@ -2,6 +2,7 @@ using System.Text.Json;
 using Certus.Core.Acme.Crypto;
 using Certus.Core.Acme.Models;
 using Certus.Core.Acme.Services;
+using Certus.Core.Security;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 
@@ -14,7 +15,7 @@ namespace Certus.Web.Controllers.Acme;
 /// possession of the new key. RFC 8555 §7.3.5
 /// </summary>
 [ApiController]
-[EnableRateLimiting("acme-general")]
+[EnableRateLimiting(AcmeRateLimitPolicies.General)]
 public sealed class KeyChangeController : AcmeControllerBase
 {
     private readonly AccountService _accountService;

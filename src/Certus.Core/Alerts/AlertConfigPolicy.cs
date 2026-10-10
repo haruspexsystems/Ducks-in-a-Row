@@ -64,12 +64,17 @@ public static class AlertConfigPolicy
     /// comes from the webhook notifier rather than from the input, because the
     /// webhook is not writable here and yet decides whether an empty recipient
     /// list actually silences anything. <paramref name="hasStoredPassword"/>
-    /// comes from the overlay and the bound options, because whether
-    /// authentication will actually happen depends on a value this input only
-    /// carries when it is being changed.
+    /// and <paramref name="hasStoredUsername"/> come from the overlay and the
+    /// bound options, because whether authentication will actually happen
+    /// depends on two values this input only carries when they are being
+    /// changed. The username joined the password in that position in issue
+    /// #261, when the config endpoint stopped returning it.
     /// </summary>
     public static AlertConfigValidation Validate(
-        AlertConfigInput input, bool webhookDeliverable, bool hasStoredPassword = false)
+        AlertConfigInput input,
+        bool webhookDeliverable,
+        bool hasStoredPassword = false,
+        bool hasStoredUsername = false)
     {
         var errors = new List<string>();
         var warnings = new List<string>();
@@ -88,9 +93,9 @@ public static class AlertConfigPolicy
         var recipients = NormalizeRecipients(input.SmtpRecipients, errors);
         var port = NormalizePort(input.SmtpPort, errors);
         var tlsMode = NormalizeTlsMode(input.SmtpTlsMode, errors);
-        var username = NormalizeUsername(input.SmtpUsername, errors);
         var fromName = NormalizeFromName(input.SmtpFromName, errors);
         ValidatePasswordChange(input, errors);
+        ValidateUsernameChange(input, errors);
 
         // A blank sender is legitimate only when email is switched off entirely.
         // With a relay host set it would break alerting: every save writes this
@@ -115,8 +120,16 @@ public static class AlertConfigPolicy
         var passwordAfterSave = input.SmtpClearPassword
             ? false
             : !string.IsNullOrEmpty(input.SmtpPassword) || hasStoredPassword;
+
+        // The same three arms as the password, and for the same reason: the
+        // request carries a username only when it is being changed, so what
+        // will be in force afterwards is a question about the stored value too.
+        var usernameAfterSave = input.SmtpClearUsername
+            ? false
+            : !string.IsNullOrWhiteSpace(input.SmtpUsername) || hasStoredUsername;
+
         AddWarnings(input, host, recipients, webhookDeliverable, warnings);
-        AddCredentialWarnings(username, passwordAfterSave, warnings);
+        AddCredentialWarnings(usernameAfterSave, passwordAfterSave, warnings);
 
         // Every writable field is written on every save, so the overlay always
         // holds the complete writable set once an administrator has saved once.
@@ -124,14 +137,20 @@ public static class AlertConfigPolicy
         // and others from here, which is exactly the split the ownership report
         // exists to make legible; keeping it whole keeps that report simple.
         //
-        // The transport fields (port, TLS mode, username, from name) are the
-        // exception, written only when the request carries them: a stale
-        // dashboard from before they were writable omits them, and turning
-        // that omission into "reset to defaults" would rewrite a transport the
-        // operator configured in the file. The current dashboard always sends
-        // all of them. PasswordProtected is not decided here at all; the
-        // caller resolves it with ResolvePasswordBlob and lays it onto this
-        // record, because protecting a secret is not a pure computation.
+        // The transport fields (port, TLS mode, from name) are the exception,
+        // written only when the request carries them: a stale dashboard from
+        // before they were writable omits them, and turning that omission into
+        // "reset to defaults" would rewrite a transport the operator configured
+        // in the file. The current dashboard always sends those three.
+        //
+        // Neither half of the credential is decided here. PasswordProtected
+        // never was, because protecting a secret is not a pure computation, and
+        // since issue #261 the username is resolved the same way: the caller
+        // lays both onto this record from inside the store's locked mutate,
+        // with ResolvePasswordBlob and ResolveUsername. Both need the value on
+        // disk at write time rather than a snapshot, and a null here would be
+        // written as "the dashboard does not manage this field", which for a
+        // username an administrator saved is a wipe, not a carry forward.
         var normalized = new SettingsOverlay.AlertOverlaySettings(
             Enabled: input.Enabled,
             CheckIntervalMinutes: input.CheckIntervalMinutes,
@@ -142,7 +161,7 @@ public static class AlertConfigPolicy
                 Recipients: recipients,
                 Port: port,
                 TlsMode: tlsMode,
-                Username: username,
+                Username: null,
                 FromName: fromName));
 
         return new AlertConfigValidation(errors, warnings, normalized);
@@ -150,12 +169,35 @@ public static class AlertConfigPolicy
 
     /// <summary>
     /// What the overlay's password blob should hold after this save: the newly
-    /// protected value when one was typed, nothing when the operator cleared
-    /// it, and otherwise whatever is stored today. The carry forward arm is
-    /// the load bearing one: every save rewrites the whole alert block, so
+    /// protected value when one was typed, an empty string when the operator
+    /// removed it, and otherwise whatever is stored today. The carry forward arm
+    /// is the load bearing one: every save rewrites the whole alert block, so
     /// forgetting it would wipe the saved password on any ordinary edit of an
     /// unrelated field. <paramref name="protect"/> is a delegate so this stays
     /// pure and testable; the caller passes ISecretProtector.Protect.
+    ///
+    /// <para>
+    /// An explicit removal stores an empty string rather than null, the same
+    /// three state vocabulary <see cref="ResolveUsername"/> uses: empty means
+    /// the dashboard owns this field and holds no password, while null means
+    /// the dashboard does not own it at all and appsettings.json decides.
+    /// Returning null for a removal made the two indistinguishable, and every
+    /// reader that falls back to the in force value when the overlay is silent
+    /// then honoured a removal for the username and ignored it for the password
+    /// (issue #286). The empty blob is inert everywhere it lands:
+    /// <c>EmailAlertNotifier.TryResolvePassword</c> and every presence check
+    /// guard with IsNullOrEmpty, so it reads as no password rather than as a
+    /// blob that will not decrypt.
+    /// </para>
+    ///
+    /// <para>
+    /// What a removal does not touch is a plaintext
+    /// <c>Certus:Alerts:Smtp:Password</c> from appsettings.json or the
+    /// environment. <c>AlertOptions.ApplyOverlay</c> writes only the blob, so
+    /// after a restart the file's password still authenticates, exactly as
+    /// before. The dashboard has never owned that key and removing its own
+    /// saved secret is not a claim about the file's.
+    /// </para>
     /// </summary>
     public static string? ResolvePasswordBlob(
         string? requestPassword,
@@ -164,7 +206,7 @@ public static class AlertConfigPolicy
         Func<string, string> protect)
     {
         if (clearPassword)
-            return null;
+            return string.Empty;
         if (!string.IsNullOrEmpty(requestPassword))
             return protect(requestPassword);
         return currentBlob;
@@ -292,20 +334,54 @@ public static class AlertConfigPolicy
     }
 
     /// <summary>
-    /// The relay account name. An empty value is stored as empty and means the
-    /// relay is contacted anonymously; null means the request did not carry
-    /// the field and nothing is stored.
+    /// What the overlay's username should hold after this save, resolved the
+    /// way <see cref="ResolvePasswordBlob"/> resolves the password: the newly
+    /// typed name when one arrived, an empty string when the operator removed
+    /// it, and otherwise whatever is stored today.
+    ///
+    /// <para>
+    /// The carry forward arm is the load bearing one, for the same reason it is
+    /// on the password: every save rewrites the whole alert block, and the
+    /// overlay writer omits nulls, so returning null on an ordinary edit of an
+    /// unrelated field would drop the saved username out of the file entirely.
+    /// Before issue #261 the form could post the value back unchanged because
+    /// the config endpoint returned it. It no longer does, so the server has to
+    /// remember it instead.
+    /// </para>
+    ///
+    /// <para>
+    /// An explicit removal stores an empty string rather than null. The two are
+    /// different states: empty means the dashboard owns this field and the
+    /// relay is contacted anonymously, while null means the dashboard does not
+    /// own it at all and appsettings.json decides.
+    /// </para>
     /// </summary>
-    private static string? NormalizeUsername(string? username, List<string> errors)
+    public static string? ResolveUsername(
+        string? requestUsername, bool clearUsername, string? currentUsername)
     {
-        if (username == null)
-            return null;
+        if (clearUsername)
+            return string.Empty;
+        if (!string.IsNullOrWhiteSpace(requestUsername))
+            return requestUsername.Trim();
+        return currentUsername;
+    }
 
-        var trimmed = username.Trim();
-        if (trimmed.Length > MaxUsernameLength)
+    /// <summary>
+    /// A username change request must be one thing at a time, exactly like the
+    /// password: typing a new name and ticking "remove the saved username" in
+    /// the same save has no single honest reading, so it is refused rather than
+    /// ranked.
+    /// </summary>
+    private static void ValidateUsernameChange(AlertConfigInput input, List<string> errors)
+    {
+        if (input.SmtpClearUsername && !string.IsNullOrWhiteSpace(input.SmtpUsername))
+        {
+            errors.Add(
+                "Choose one: set a new SMTP username or remove the saved one, not both.");
+        }
+
+        if (input.SmtpUsername is { } username && username.Trim().Length > MaxUsernameLength)
             errors.Add($"The SMTP username is limited to {MaxUsernameLength} characters.");
-
-        return trimmed;
     }
 
     private static string? NormalizeFromName(string? fromName, List<string> errors)
@@ -347,18 +423,28 @@ public static class AlertConfigPolicy
     /// Authentication happens only when both halves are present; a save that
     /// leaves exactly one configured contacts the relay anonymously, which is
     /// legal but almost never what was meant.
+    ///
+    /// <para>
+    /// Both arms describe the state after the save rather than what the request
+    /// carried. They used to differ: the username arm was suppressed unless the
+    /// request actually sent the field, so a stale dashboard that omitted it was
+    /// not scolded for a value it never touched. Since issue #261 omitting the
+    /// username is the normal case rather than the stale one, so that guard
+    /// would have silenced the warning almost always. Reporting the effective
+    /// state is both simpler and the honest answer: the relay either will
+    /// authenticate after this save or it will not.
+    /// </para>
     /// </summary>
     private static void AddCredentialWarnings(
-        string? username, bool passwordAfterSave, List<string> warnings)
+        bool usernameAfterSave, bool passwordAfterSave, List<string> warnings)
     {
-        var hasUsername = !string.IsNullOrEmpty(username);
-        if (hasUsername && !passwordAfterSave)
+        if (usernameAfterSave && !passwordAfterSave)
         {
             warnings.Add(
                 "A username is set but no password is stored, so the relay will be " +
                 "contacted without authentication. Set a password to authenticate.");
         }
-        else if (!hasUsername && passwordAfterSave && username != null)
+        else if (!usernameAfterSave && passwordAfterSave)
         {
             warnings.Add(
                 "A password is stored but the username is blank, so the relay will be " +
@@ -446,10 +532,18 @@ public static class AlertConfigPolicy
 /// One save of the writable alert settings. The webhook block is absent from
 /// this type entirely rather than present and ignored, so there is no shape in
 /// which a webhook URL could reach the overlay through this path.
-/// <see cref="SmtpPassword"/> is write only: it arrives here to be protected
-/// and stored, and no read path ever carries it back out. The nullable
-/// transport fields mean "the request did not carry this field" (a stale
-/// dashboard), and nothing is stored for them.
+/// <see cref="SmtpPassword"/> and <see cref="SmtpUsername"/> are both write
+/// only: they arrive here to be stored, and since issue #261 no read path
+/// carries either back out. The nullable transport fields mean "the request did
+/// not carry this field" (a stale dashboard), and nothing is stored for them.
+///
+/// <para>
+/// The two credential fields read that absence differently from the rest. For
+/// them a blank or missing value means "leave what is stored alone", and the
+/// matching <see cref="SmtpClearPassword"/> and <see cref="SmtpClearUsername"/>
+/// flags are the only way to empty one. A form that cannot show a value must
+/// not be able to destroy it by submitting the blank box it had to render.
+/// </para>
 /// </summary>
 public sealed record AlertConfigInput(
     bool Enabled,
@@ -463,7 +557,8 @@ public sealed record AlertConfigInput(
     string? SmtpUsername = null,
     string? SmtpFromName = null,
     string? SmtpPassword = null,
-    bool SmtpClearPassword = false);
+    bool SmtpClearPassword = false,
+    bool SmtpClearUsername = false);
 
 /// <summary>
 /// The verdict on one save. <see cref="Normalized"/> is null exactly when

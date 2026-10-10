@@ -163,6 +163,52 @@ export interface CertificateTemplate {
   tlsCapable?: boolean | null;
   /** The guardrail's sentence when tlsCapable is false. */
   tlsBlockedReason?: string | null;
+  /**
+   * The ACME viability signals read off the template's AD object. The server
+   * has always returned these here; the type used to omit them, so every
+   * caller of /api/templates silently dropped the key requirements and had to
+   * assume RSA (issue #213). Same shape as the setup wizard's copy in
+   * `api/setup.ts`; these DTOs are hand written, there is no codegen.
+   */
+  viability?: TemplateAcmeViability | null;
+  /**
+   * Set when the template OID as published carries a control, line separator,
+   * or formatting character (issue #292). Nothing is refused: the template
+   * issues and is addressed exactly as before, and this is here so a surface
+   * that renders the OID can say why it may not read as it looks. Same shape as
+   * `SetupTemplateNameWarning` in `api/setup.ts`; these DTOs are hand written,
+   * there is no codegen.
+   */
+  oidWarning?: TemplateValueWarning | null;
+}
+
+/**
+ * Why one of a template's published values does not read as published: the
+ * character class as a noun, and the position and code point an operator can
+ * look up. Never the value itself, which is the text this exists to report on.
+ */
+export interface TemplateValueWarning {
+  /** "control", "line separator", or "formatting". */
+  kind: string;
+  position: number;
+  codePoint: number;
+}
+
+/**
+ * Whether a template's AD configuration lets ACME issuance run unattended.
+ * Every member is nullable and null means the attribute behind it could not be
+ * read, which is shown as "could not verify" rather than as a verdict.
+ */
+export interface TemplateAcmeViability {
+  requiresManagerApproval?: boolean | null;
+  requiresRaSignatures?: boolean | null;
+  subjectSuppliedInRequest?: boolean | null;
+  /**
+   * The algorithm the template requires ("RSA", "ECDSA_P256", ...), or null
+   * when it could not be determined. Null must not be read as RSA.
+   */
+  keyAlgorithm?: string | null;
+  minimalKeySize?: number | null;
 }
 
 /**
@@ -515,14 +561,26 @@ export function daysUntilExpiry(notAfter: string): number {
  * A deliberate mirror of DistinguishedNameParser in
  * src/Certus.Core/Adcs/DistinguishedNameParser.cs, which carries the full
  * reasoning. Keep the two in step: the same subject has to read the same way in
- * the activity feed, the inventory, and the lineage key, and a fourth answer is
- * exactly the defect issue #231 closed.
+ * the activity feed, the inventory, the lineage key, and the CA certificates
+ * card on the settings page, and a surface answering differently is exactly the
+ * defect issue #231 closed. The card was the last one still splitting on the
+ * first comma for itself, which issue #294 corrected.
  *
  * Reading up to the first comma is what this used to do, and it cut a common
  * name carrying a quoted comma in half. A comma is legal inside a CN value, and
- * the encoders escape it rather than dropping it: Windows CertNameToStr wraps
- * the value in double quotes and doubles any quote inside it, and the RFC 4514
- * form puts a backslash in front of it.
+ * the encoder does not drop it: Windows CertNameToStr wraps the value in double
+ * quotes and doubles any quote inside it.
+ *
+ * Quoting is the only escaping form this grammar knows (issue #296).
+ * CertNameToStr has no backslash escape in either direction, so every backslash
+ * that reaches this reader is a literal character of the name and is written
+ * back out as one. The grammar used to read the RFC 4514 backslash dialect too,
+ * because MockAdcsClient rendered through BouncyCastle; PR #293 retired that
+ * producer, and reading both dialects was never free. Resolving the character
+ * after a backslash dropped it from ordinary names like "CORP\svc" and decoded
+ * "\74\72\75\73\74\65\64" into "trusted" (issue #238), and stepping over a
+ * backslash sitting in front of a separator swallowed the component boundary, so
+ * "CN=CORP\, O=Example" read back as "CORP, O=Example" (issue #296).
  *
  * The fallback is reached often rather than rarely. A SAN only certificate is
  * stored with a bare name and no "CN=" at all, and that name is shown verbatim.
@@ -545,7 +603,7 @@ export function extractCN(subject: string): string {
 
     // A "CN=" with nothing after it is skipped so a real one later in the same
     // subject is still found.
-    const value = unescapeValue(text.slice(equals + 1));
+    const value = decodeValue(text.slice(equals + 1));
     if (value.trim()) return value;
   }
 
@@ -554,25 +612,21 @@ export function extractCN(subject: string): string {
 
 /**
  * The index one past the end of the component starting at `start`: the next
- * separator that is neither quoted nor escaped, or the end of the subject.
+ * separator that is not quoted, or the end of the subject.
  *
  * Comma and semicolon both separate relative distinguished names in the X.500
  * string form. Plus separates the parts of a multi-valued one, and counts here
  * too, because a CN sitting after one is still a CN.
+ *
+ * A backslash is not consulted, which is what makes a value ending in one safe
+ * (issue #296). A backslash in front of a separator is two characters, the last
+ * of the value and the start of the next component, and stepping over the pair
+ * merged them.
  */
 function componentEnd(subject: string, start: number): number {
   let quoted = false;
   for (let i = start; i < subject.length; i++) {
     const ch = subject[i];
-
-    // A backslash escapes only outside quotes, and only in front of a character
-    // RFC 4514 lets it escape. Inside a quoted value the only thing that is
-    // special is the doubled quote. The isEscapable test must match the one in
-    // unescapeValue, or the two disagree about where a component ends.
-    if (ch === '\\' && !quoted && isEscapable(subject[i + 1])) {
-      i++;
-      continue;
-    }
 
     if (ch === '"') {
       // A doubled quote inside a quoted value is one literal quote and does not
@@ -593,18 +647,13 @@ function componentEnd(subject: string, start: number): number {
 
 /**
  * The index of the equals sign separating the attribute type from its value, or
- * -1 when the component carries none. Quote and escape aware for the same reason
- * the boundary scan is: an equals sign inside a value is part of the name.
+ * -1 when the component carries none. Quote aware for the same reason the
+ * boundary scan is: an equals sign inside a value is part of the name.
  */
 function valueStart(component: string): number {
   let quoted = false;
   for (let i = 0; i < component.length; i++) {
     const ch = component[i];
-
-    if (ch === '\\' && !quoted && isEscapable(component[i + 1])) {
-      i++;
-      continue;
-    }
 
     if (ch === '"') {
       if (quoted && component[i + 1] === '"') {
@@ -622,14 +671,15 @@ function valueStart(component: string): number {
 }
 
 /**
- * The decoded value: surrounding quotes removed, doubled quotes collapsed to
- * one, and backslash escapes resolved.
+ * The decoded value: surrounding quotes removed and doubled quotes collapsed to
+ * one. A backslash is copied through untouched, because CertNameToStr never
+ * wrote one as an escape.
  *
  * Trimmed before decoding and not after, so a quoted value keeps whatever it
  * chose to keep. Quoting is how CertNameToStr preserves a leading or trailing
  * space in a name, and trimming afterwards would undo the reason for the quotes.
  */
-function unescapeValue(raw: string): string {
+function decodeValue(raw: string): string {
   const value = raw.trim();
   if (!value) return '';
 
@@ -638,12 +688,6 @@ function unescapeValue(raw: string): string {
 
   for (let i = 0; i < value.length; i++) {
     const ch = value[i];
-
-    if (ch === '\\' && !quoted && isEscapable(value[i + 1])) {
-      out += value[i + 1];
-      i++;
-      continue;
-    }
 
     if (ch === '"') {
       if (quoted && value[i + 1] === '"') {
@@ -659,39 +703,6 @@ function unescapeValue(raw: string): string {
   }
 
   return out;
-}
-
-/**
- * Whether a backslash in front of this character is an escape rather than two
- * literal characters. RFC 4514 section 3 lists exactly these. Declared optional
- * because every caller reads one character past the backslash and may be at the
- * end of the string, where there is nothing to escape.
- *
- * The restriction is load bearing, and the reason is that only one of the two
- * encoders escapes at all. CertNameToStr quotes instead, and it does not treat a
- * backslash as special in either direction: a name holding one is rendered with
- * the backslash intact and no quotes around it. So in the Windows form every
- * backslash is literal, and resolving the character after it unconditionally
- * rewrites names that were never escaped: "CORP\svc" read back as "CORPsvc".
- *
- * Hex escapes are not decoded at all, which this predicate enforces by leaving
- * the digits out. RFC 4514 does define the "\hh" byte form, but no encoder that
- * reaches this parser emits it, so decoding it served no real input and forged
- * names out of ones the certificate did carry: a requester may put the literal
- * text "\74\72\75\73\74\65\64" in a common name and Windows stores it verbatim.
- * Read as hex it spells "trusted".
- *
- * It also mangled any ordinary name whose backslash happened to be followed by
- * two hex digits, which "CORP\ab-server" is. That decoded to the single byte
- * 0xAB, which is not valid UTF-8 on its own, so the name came back as "CORP",
- * the replacement character, then "-server".
- *
- * Keep in step with IsEscapable in DistinguishedNameParser.cs.
- */
-function isEscapable(ch: string | undefined): boolean {
-  if (ch === undefined) return false;
-  return ch === ',' || ch === '+' || ch === '"' || ch === '\\'
-    || ch === '<' || ch === '>' || ch === ';' || ch === '=' || ch === '#' || ch === ' ';
 }
 
 /**

@@ -66,6 +66,24 @@ public class AdcsCaConnectionStringTests
         error.Should().Contain("control character");
     }
 
+    // Zl and Zp. Neither is Control nor Format, so both passed this guard until
+    // issue #234, even though the connection string is written verbatim into the
+    // service log on every CA operation.
+    [Theory]
+    [InlineData((char)0x2028)] // LINE SEPARATOR
+    [InlineData((char)0x2029)] // PARAGRAPH SEPARATOR
+    public void TryValidate_AnyLineSeparator_IsRefused(char separator)
+    {
+        var valid = AdcsCaConnectionString.TryValidate(
+            $"ca01.contoso.local\\Contoso-CA{separator}FATAL Certificate issued", out var error);
+
+        valid.Should().BeFalse();
+        error.Should().Contain("line separator character");
+        error.Should().Contain($"U+{(int)separator:X4}");
+        error.Should().NotContain(
+            "control character", "U+2028 is not a control character and the refusal must not say it is");
+    }
+
     [Theory]
     [InlineData((char)0x200B)] // zero width space
     [InlineData((char)0x200E)] // left to right mark

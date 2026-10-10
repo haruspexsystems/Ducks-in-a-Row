@@ -132,16 +132,50 @@ public class SupersessionLinkerTests : IDisposable
     }
 
     [Fact]
-    public void KeyFor_EscapedAndQuotedSpellingsOfOneNameKeyTogether()
+    public void KeyFor_ANameEndingInABackslashDoesNotShareALineageWithAQuotedName()
     {
-        // The two encoders spell the same name differently, and a certificate
-        // does not change identity because of which one rendered it.
+        // The inverse of what this test asserted before issue #296, and the third
+        // instance of the collision the two tests above describe.
+        //
+        // It used to read these as two spellings of one name, on the premise that
+        // either encoder might have rendered the row. Only one does: PR #293 moved
+        // MockAdcsClient onto X509Certificate2, so every subject that reaches the
+        // reader is the Windows form, and in that form a backslash is a literal
+        // character of the name. So the first string names a certificate whose
+        // common name is "host.example.com, O=Team", and the second names an
+        // unrelated one whose common name is "host.example.com\" that happens to
+        // sit in an organisation called Team.
+        //
+        // Keying them together was not a harmless generosity. The lineage is what
+        // the dashboard uses to say one certificate replaced another, so a shared
+        // key between two unrelated certificates is a false supersession claim,
+        // and a requester on a template with enrollee supplies subject picks the
+        // name that produces it.
         var quoted = SupersessionLinker.KeyFor(
             "WebServer", "CN=\"host.example.com, O=Team\", O=Example", null);
-        var escaped = SupersessionLinker.KeyFor(
+        var trailingBackslash = SupersessionLinker.KeyFor(
             "WebServer", "CN=host.example.com\\, O=Team, O=Example", null);
 
-        quoted.Should().Be(escaped);
+        quoted.Should().NotBeNull();
+        trailingBackslash.Should().NotBeNull();
+        quoted.Should().NotBe(trailingBackslash);
+    }
+
+    [Fact]
+    public void KeyFor_ANameEndingInABackslashKeysOnTheNameItActuallyCarries()
+    {
+        // The positive half: the same certificate keys the same way however much
+        // of the subject follows it, which is what makes a renewal of a name
+        // ending in a backslash link to its predecessor at all. Before issue #296
+        // the key absorbed whatever components came after the common name, so two
+        // renewals of one name into different organisational units keyed apart
+        // and neither superseded the other.
+        var withOrg = SupersessionLinker.KeyFor(
+            "WebServer", "CN=CORP\\, OU=Sales, O=Example", null);
+        var withDifferentOrg = SupersessionLinker.KeyFor(
+            "WebServer", "CN=CORP\\, OU=Support, O=Example", null);
+
+        withOrg.Should().Be(withDifferentOrg);
     }
 
     [Fact]

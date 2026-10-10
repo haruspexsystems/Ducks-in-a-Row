@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Certus.Core.Security;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Configuration.Json;
 using Microsoft.Extensions.FileProviders;
@@ -25,12 +26,25 @@ public static class SettingsOverlay
     /// ReloadOnChange stays off on purpose: a service restart is the apply
     /// mechanism for setup changes, and no file watcher should sit on the data
     /// directory.
+    ///
+    /// An overlay the service cannot trust (<see cref="TrustedFile"/>) is not
+    /// added at all, and the verdict is returned so the host can log it once its
+    /// file logger exists (issue #489). The overlay is the administrator's
+    /// configuration file, so every key in it is honoured, Auth:AdminGroup
+    /// included; what protects it is who may write it. The check and the load
+    /// are two separate opens of the file, which matters only if someone could
+    /// swap the file in between, and in the protected data folder only SYSTEM
+    /// and Administrators can.
     /// </summary>
-    public static void AddSettingsOverlay(this IConfigurationBuilder builder, string dataDirectory)
+    public static FileTrust AddSettingsOverlay(this IConfigurationBuilder builder, string dataDirectory)
     {
         // The file provider needs an existing root; the data directory is also
         // created by the hosts, but the overlay is inserted first.
-        Directory.CreateDirectory(dataDirectory);
+        ProtectedFolder.EnsureExists(dataDirectory);
+
+        var trust = TrustedFile.Check(Path.Combine(dataDirectory, CertusPaths.SettingsOverlayFileName));
+        if (!trust.IsTrusted)
+            return trust;
 
         var source = new JsonConfigurationSource
         {
@@ -45,6 +59,8 @@ public static class SettingsOverlay
             builder.Sources.Insert(index + 1, source);
         else
             builder.Add(source);
+
+        return trust;
     }
 
     /// <summary>
@@ -173,10 +189,15 @@ public static class SettingsOverlay
     /// Inside the Certus section only the keys of <see cref="OverlaySettings"/>
     /// survive a <see cref="Load"/> then <see cref="Save"/> round trip; any
     /// other key a hand edit added there is dropped.
+    ///
+    /// An overlay the service cannot trust reads as absent, as it does at
+    /// startup (issue #489). So the next <see cref="Mutate"/> writes a fresh,
+    /// trusted file holding only what that change sets, which is how an
+    /// administrator recovers by saving from the wizard or the settings page.
     /// </summary>
     public static OverlaySettings Load(string overlayPath)
     {
-        if (!File.Exists(overlayPath))
+        if (!File.Exists(overlayPath) || !TrustedFile.Check(overlayPath).IsTrusted)
             return new OverlaySettings(null, null);
 
         using var document = JsonDocument.Parse(File.ReadAllText(overlayPath));
@@ -200,10 +221,11 @@ public static class SettingsOverlay
     }
 
     /// <summary>
-    /// Persist the overlay to <paramref name="overlayPath"/>. Written to a
-    /// temporary file first and moved into place, so a crash mid write cannot
-    /// leave a torn settings.json that would stop the next start (a malformed
-    /// optional JSON source still fails configuration build).
+    /// Persist the overlay to <paramref name="overlayPath"/> through
+    /// <see cref="AtomicFile"/>, so a crash mid write cannot leave a torn
+    /// settings.json that would stop the next start (a malformed optional JSON
+    /// source still fails configuration build), and no one can stage the write
+    /// for the service (issue #489).
     /// </summary>
     public static void Save(OverlaySettings settings, string overlayPath)
     {
@@ -211,17 +233,13 @@ public static class SettingsOverlay
         {
             var directory = Path.GetDirectoryName(overlayPath);
             if (!string.IsNullOrEmpty(directory))
-                Directory.CreateDirectory(directory);
+                ProtectedFolder.EnsureExists(directory);
 
             var payload = new Dictionary<string, OverlaySettings>
             {
                 [CertusOptions.SectionName] = settings,
             };
-            var json = JsonSerializer.Serialize(payload, WriteOptions);
-
-            var tempPath = overlayPath + ".tmp";
-            File.WriteAllText(tempPath, json);
-            File.Move(tempPath, overlayPath, overwrite: true);
+            AtomicFile.WriteAllText(overlayPath, JsonSerializer.Serialize(payload, WriteOptions));
         }
     }
 
@@ -230,9 +248,8 @@ public static class SettingsOverlay
     /// <c>SetupService.StatusFileWriteLock</c> plays for the wizard status file.
     /// <see cref="Mutate"/> holds it across the whole read, modify, write, so
     /// two writers cannot both load the file, each change their own field, and
-    /// have the later save drop the earlier change. It also keeps them off the
-    /// single shared ".tmp" path <see cref="Save"/> stages through. Monitor is
-    /// reentrant, so <see cref="Mutate"/> calling <see cref="Save"/> is fine.
+    /// have the later save drop the earlier change. Monitor is reentrant, so
+    /// <see cref="Mutate"/> calling <see cref="Save"/> is fine.
     /// </summary>
     private static readonly object WriteLock = new();
 

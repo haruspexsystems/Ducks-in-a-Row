@@ -70,4 +70,23 @@ public class ParseTemplateStringTests
         result[0].Name.Should().Be("WebServer");
         result[0].Oid.Should().Be("1.3.6.1.4.1.311.21.8.1");
     }
+    [Fact]
+    public void ParseTemplateString_OidCarriesAFormatCharacter_PassesItThroughUntouched()
+    {
+        // The policy for the OID is report, never strip (issue #292). The
+        // scan lives in TemplateNameUsability and each surface decides what to
+        // say; sanitizing here instead would leave every one of them reporting
+        // a value the CA never published, and disagreeing with what certutil
+        // shows for the same template.
+        //
+        // Trim() would not have caught it in any case: a formatting character
+        // is not whitespace, and this one is not at an end.
+        var softHyphen = char.ConvertFromUtf32(0x00AD);
+        var raw = "Contoso\n1.3.6" + softHyphen + ".1.4.1\n";
+
+        var result = AdcsClient.ParseTemplateString(raw);
+
+        result.Should().ContainSingle();
+        result[0].Oid.Should().Be("1.3.6" + softHyphen + ".1.4.1");
+    }
 }

@@ -1,4 +1,5 @@
 using Certus.Core.Acme.Services;
+using Certus.Core.Security;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 
@@ -9,7 +10,7 @@ namespace Certus.Web.Controllers.Acme;
 /// RFC 8555 §7.2 — clients get a fresh nonce before each POST.
 /// </summary>
 [ApiController]
-[EnableRateLimiting("acme-general")]
+[EnableRateLimiting(AcmeRateLimitPolicies.General)]
 public sealed class NonceController : AcmeControllerBase
 {
     private readonly NonceService _nonceService;

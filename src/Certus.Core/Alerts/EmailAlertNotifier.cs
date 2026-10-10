@@ -1,4 +1,5 @@
 using System.Text;
+using Certus.Core.Crl;
 using Certus.Core.Security;
 using MailKit.Net.Smtp;
 using MailKit.Security;
@@ -97,6 +98,26 @@ public sealed class EmailAlertNotifier : IAlertNotifier
         return await SendAsync(
             () => BuildServerCertificateMessage(alert, smtp, recipients), smtp,
             $"the server certificate renewal outcome '{alert.Outcome}'", recipients.Count, cancellationToken);
+    }
+
+    public async Task<AlertNotificationResult> SendCrlAlertAsync(
+        CrlAlert alert,
+        CancellationToken cancellationToken = default)
+    {
+        var smtp = _options.Smtp;
+        if (smtp == null || !IsEnabled)
+            return new AlertNotificationResult(false, "SMTP not configured");
+
+        var recipients = ParseRecipients(smtp.Recipients, out _);
+        if (recipients.Count == 0)
+        {
+            _logger.LogError("No valid recipient addresses are configured for email alerts");
+            return new AlertNotificationResult(false, "No valid recipient addresses");
+        }
+
+        return await SendAsync(
+            () => BuildCrlMessage(alert, smtp, recipients), smtp,
+            $"the {alert.Stage} CRL warning for {alert.IssuerName}", recipients.Count, cancellationToken);
     }
 
     public async Task<AlertNotificationResult> SendTestAlertAsync(
@@ -335,6 +356,100 @@ public sealed class EmailAlertNotifier : IAlertNotifier
         message.Body = new TextPart("plain") { Text = body.ToString() };
         return message;
     }
+
+    /// <summary>
+    /// The CRL mail (issue #447).
+    ///
+    /// It says what lapses, not just that something expires, because the whole
+    /// reason this feature exists is that the consequence is not obvious: a
+    /// lapsed CRL does not break the CA, it breaks revocation checking for every
+    /// certificate that CA ever signed, all at once, on clients that were
+    /// working a minute earlier. And it names the remedy, because the outages
+    /// this was reported from happened at a client where, in the words of the
+    /// report, nobody knew how to renew the root CRL.
+    /// </summary>
+    internal static MimeMessage BuildCrlMessage(
+        CrlAlert alert, SmtpOptions smtp, List<MailboxAddress> recipients)
+    {
+        var message = new MimeMessage();
+        message.From.Add(new MailboxAddress(smtp.FromName, smtp.FromAddress));
+        message.To.AddRange(recipients);
+
+        var urgency = alert.Stage == CrlAlertRules.ExpiredStage ? "CRITICAL"
+            : alert.HoursRemaining <= 24 ? "CRITICAL"
+            : alert.HoursRemaining <= 7 * 24 ? "WARNING"
+            : "NOTICE";
+
+        message.Subject = alert.Stage switch
+        {
+            CrlAlertRules.ExpiredStage =>
+                $"[Ducks in a Row {urgency}] The CRL from {alert.IssuerName} has EXPIRED",
+            CrlAlertRules.OverdueStage =>
+                $"[Ducks in a Row {urgency}] {alert.IssuerName} has not published a new CRL on schedule",
+            _ =>
+                $"[Ducks in a Row {urgency}] The CRL from {alert.IssuerName} expires in {DescribeRemaining(alert.HoursRemaining)}",
+        };
+
+        var body = new StringBuilder();
+        body.AppendLine("Ducks in a Row Certificate Revocation List Alert");
+        body.AppendLine(new string('=', 50));
+        body.AppendLine();
+        body.AppendLine($"Issuer:     {alert.IssuerName}");
+        body.AppendLine($"CRL:        {alert.Kind}{(alert.CrlNumber is null ? "" : $", number {alert.CrlNumber}")}");
+        body.AppendLine($"Expires:    {alert.NextUpdate:yyyy-MM-dd HH:mm} UTC"
+            + (alert.HoursRemaining < 0
+                ? $" ({DescribeRemaining(-alert.HoursRemaining)} ago)"
+                : $" (in {DescribeRemaining(alert.HoursRemaining)})"));
+        body.AppendLine("Published:  " + string.Join(", ", alert.Sources));
+        if (alert.NewerCrlNumber is not null)
+            body.AppendLine($"Newer CRL:  number {alert.NewerCrlNumber} is already published elsewhere");
+        if (alert.LastReadAt is not null)
+            body.AppendLine($"Last read:  {alert.LastReadAt:yyyy-MM-dd HH:mm} UTC");
+        body.AppendLine();
+
+        body.AppendLine("What happens when it lapses:");
+        body.AppendLine(new string('-', 50));
+        body.AppendLine("Every certificate this CA signed stops validating on any client that");
+        body.AppendLine("checks revocation, all at once. That includes domain controllers, VPN and");
+        body.AppendLine("wireless authentication, and the certificate authority's own service.");
+        body.AppendLine();
+
+        body.AppendLine("What to do:");
+        body.AppendLine(new string('-', 50));
+        if (alert.NewerCrlNumber is not null)
+        {
+            body.AppendLine("A newer CRL exists already, so this location was missed when it was");
+            body.AppendLine("published. Copy the current CRL to it.");
+        }
+        else if (alert.Scope == "parent")
+        {
+            body.AppendLine("This CRL is published by a CA above the one Ducks in a Row is connected");
+            body.AppendLine("to, which on most estates is an offline root. Start it, publish a fresh");
+            body.AppendLine("CRL with 'certutil -crl', then copy the new file to every location the");
+            body.AppendLine("line above names, including 'certutil -dspublish -f <file> <CA name>'");
+            body.AppendLine("for a directory location.");
+        }
+        else
+        {
+            body.AppendLine("This CRL is published by the certificate authority Ducks in a Row is");
+            body.AppendLine("connected to, which normally replaces it on a timer. Check that the");
+            body.AppendLine("Active Directory Certificate Services service is running, and that it");
+            body.AppendLine("can write to every location it publishes to.");
+        }
+
+        body.AppendLine();
+        body.AppendLine(new string('-', 50));
+        body.AppendLine("This alert was sent by Ducks in a Row.");
+
+        message.Body = new TextPart("plain") { Text = body.ToString() };
+        return message;
+    }
+
+    /// <summary>Hours, or days once there are enough of them to be worth rounding.</summary>
+    private static string DescribeRemaining(double hours) =>
+        hours >= 48
+            ? $"{(int)Math.Floor(hours / 24)} days"
+            : $"{(int)Math.Floor(hours)} hours";
 
     /// <summary>
     /// The operator triggered test mail (issue #161).

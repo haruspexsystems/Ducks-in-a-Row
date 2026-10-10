@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
+using Certus.Core.Adcs;
 using Certus.Core.Data;
 using Certus.Core.Data.Entities;
 using Microsoft.EntityFrameworkCore;
@@ -262,7 +263,7 @@ public class DashboardCertificateDownloadIntegrationTests
 
         var problem = await ParseJsonAsync(pem);
         problem.GetProperty("type").GetString()
-            .Should().Be("https://ducksinarow.app/problems/certificate-unavailable");
+            .Should().Be("https://ducksinarow.dev/problems/certificate-unavailable");
     }
 
     [Fact]
@@ -361,5 +362,122 @@ public class DashboardCertificateDownloadIntegrationTests
 
         response.StatusCode.Should().Be(HttpStatusCode.OK);
         response.Content.Headers.ContentDisposition!.FileName.Should().Contain(sanName);
+    }
+
+    /// <summary>
+    /// Seeds a certificate whose common name is whatever is handed in, and
+    /// returns its internal id.
+    ///
+    /// The subject is built through <see cref="X500DistinguishedNameBuilder"/>
+    /// rather than the "CN=..." string constructor on purpose: these names carry
+    /// characters that distinguished name parsing may quote, escape, or refuse,
+    /// and the point of the test is what the certificate encodes, not what the
+    /// parser makes of a string.
+    /// </summary>
+    private async Task<int> SeedWithCommonNameAsync(int requestId, string commonName, string? dnsName)
+    {
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<CertusDbContext>();
+
+        var existing = await db.SyncedCertificates.FirstOrDefaultAsync(c => c.RequestId == requestId);
+        if (existing != null)
+            return existing.Id;
+
+        var subject = new X500DistinguishedNameBuilder();
+        subject.AddCommonName(commonName);
+
+        using var rsa = RSA.Create(2048);
+        var request = new CertificateRequest(
+            subject.Build(), rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+
+        if (dnsName != null)
+        {
+            var sanBuilder = new SubjectAlternativeNameBuilder();
+            sanBuilder.AddDnsName(dnsName);
+            request.CertificateExtensions.Add(sanBuilder.Build());
+        }
+
+        using var certificate = request.CreateSelfSigned(
+            DateTimeOffset.UtcNow.AddDays(-SeededAgeDays), DateTimeOffset.UtcNow.AddDays(165));
+
+        var entity = new SyncedCertificate
+        {
+            RequestId = requestId,
+            SerialNumber = certificate.SerialNumber,
+            // Stored through the sanitizer, exactly as the sync writes it. The
+            // download name is built from the DER instead, which is the whole
+            // reason this path needed its own guard (issue #232). A subject made
+            // only of format characters sanitizes away to nothing, and the column
+            // is not nullable, so it lands empty.
+            Subject = CertificateTextSanitizer.SanitizeSubject(certificate.Subject) ?? string.Empty,
+            SubjectAlternativeNames = dnsName == null ? null : $"dns:{dnsName}",
+            TemplateName = "WebServer",
+            NotBefore = certificate.NotBefore.ToUniversalTime(),
+            NotAfter = certificate.NotAfter.ToUniversalTime(),
+            Status = "Issued",
+            RequestDate = DateTime.UtcNow.AddDays(-SeededAgeDays),
+            RawCertificate = certificate.RawData,
+        };
+
+        db.SyncedCertificates.Add(entity);
+        await db.SaveChangesAsync();
+        return entity.Id;
+    }
+
+    /// <summary>
+    /// The spoof issue #232 reports: a bidirectional override in a requester
+    /// controlled common name reaching the browser's download bar, so the file an
+    /// operator saves reads as a host they never asked for.
+    ///
+    /// Asserted on FileNameStar rather than FileName. ASP.NET Core writes both:
+    /// filename= with everything outside printable ASCII replaced by an
+    /// underscore, and filename*=UTF-8'' carrying the original percent encoded
+    /// and intact. Browsers prefer the second, so FileName would pass this test
+    /// with or without the fix and prove nothing.
+    /// </summary>
+    [Fact]
+    public async Task DownloadPem_StripsFormatCharactersFromTheFileName()
+    {
+        const int requestId = 5804;
+        var rlo = (char)0x202e;      // RIGHT-TO-LEFT OVERRIDE
+        var zwsp = (char)0x200b;     // ZERO WIDTH SPACE
+
+        var id = await SeedWithCommonNameAsync(
+            requestId, "spoof" + rlo + "moc.live" + zwsp + ".contoso.com", dnsName: null);
+
+        var response = await _client.GetAsync($"/api/certificates/{id}/pem");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var star = response.Content.Headers.ContentDisposition!.FileNameStar;
+        star.Should().NotBeNullOrEmpty(
+            "the encoded parameter is the one browsers prefer, so it is the one that must be clean");
+        star.Should().NotContain(rlo.ToString(), "a bidirectional override reverses how the name reads");
+        star.Should().NotContain(zwsp.ToString());
+        star.Should().Be("spoofmoc.live.contoso.com.pem");
+    }
+
+    /// <summary>
+    /// A common name that renders as nothing at all falls through to the next
+    /// candidate rather than naming the file after an invisible string. Before
+    /// issue #232 the format characters survived, the name was neither empty nor
+    /// whitespace, and the download arrived with no visible name.
+    /// </summary>
+    [Fact]
+    public async Task DownloadPem_FallsThroughToTheSan_WhenTheCommonNameIsOnlyFormatCharacters()
+    {
+        const int requestId = 5805;
+        const string sanName = "fallback.example.com";
+        var rlo = (char)0x202e;
+        var isolate = (char)0x2066;
+
+        var id = await SeedWithCommonNameAsync(
+            requestId, new string([rlo, isolate, (char)0x200b]), sanName);
+
+        var response = await _client.GetAsync($"/api/certificates/{id}/pem");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        response.Content.Headers.ContentDisposition!.FileNameStar
+            .Should().Be(sanName + ".pem");
     }
 }

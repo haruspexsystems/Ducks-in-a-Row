@@ -21,6 +21,16 @@ public class CaAccessDeniedExceptionTests
             "E_ACCESSDENIED (0x80070005) is the access-denied HRESULT the CA returns");
     }
 
+    [Theory]
+    [InlineData(unchecked((int)0x80070005), true)]  // E_ACCESSDENIED
+    [InlineData(unchecked((int)0x80094011), true)]  // CERTSRV_E_ENROLL_DENIED, the lab's answer (issue #440)
+    [InlineData(unchecked((int)0x800706BA), false)] // RPC server unavailable, an outage
+    [InlineData(unchecked((int)0x80004005), false)] // E_FAIL
+    public void IsRefusal_IsAccessDeniedOrEnrollDenied(int hresult, bool refused)
+    {
+        CaAccessDeniedException.IsRefusal(new COMException("x", hresult)).Should().Be(refused);
+    }
+
     [Fact]
     public void IsAccessDenied_FalseForOtherHResult()
     {

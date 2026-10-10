@@ -25,6 +25,15 @@ public class RevokeCertIntegrationTests : IDisposable
 {
     private const string RevokePath = "/acme/WebServer/revoke-cert";
 
+    /// <summary>
+    /// CA request ids for the seeded rows, one per row, from a range no mock
+    /// issuance in this host reaches. See the comment at the seed itself.
+    /// Static because xunit builds a fresh instance of this class per test.
+    /// </summary>
+    private static int _nextAdcsRequestId = 7100;
+
+    private static int NextRequestId() => Interlocked.Increment(ref _nextAdcsRequestId);
+
     private readonly CertusWebApplicationFactory _factory;
     private readonly HttpClient _client;
     private readonly List<RSA> _keys = new();
@@ -215,7 +224,20 @@ public class RevokeCertIntegrationTests : IDisposable
             OrderId = order.Id,
             CertificatePem = cert.ExportCertificatePem(),
             SerialNumber = serialOverride ?? cert.SerialNumber,
-            AdcsRequestId = 1,
+            // Distinctive, and one of its own per seeded row. MockAdcsClient
+            // numbers its own requests from 1, so a seeded row claiming request 1
+            // shares that bridge with the first certificate any other test in
+            // this host issues, and
+            // CertificateSyncService.ClearReleasedRevocationStampsAsync reads
+            // exactly that bridge (issue #375): a revoked ACME row whose request
+            // id the inventory reports as issued, in a pass that started after
+            // the stamp, has that stamp cleared. That un-revoked the certificate
+            // under Revoke_AlreadyRevoked_Returns400AlreadyRevoked between its
+            // two calls and answered the second with 200 (issue #432). One id
+            // per row rather than one for the class, because the bridge is
+            // read both ways: OrderService.StampInventoryRowAsync writes the
+            // inventory by the same key.
+            AdcsRequestId = NextRequestId(),
             IssuedAt = DateTime.UtcNow
         });
         await db.SaveChangesAsync();
@@ -396,7 +418,11 @@ public class RevokeCertCaUnavailableTests
             OrderId = order.Id,
             CertificatePem = cert.ExportCertificatePem(),
             SerialNumber = cert.SerialNumber,
-            AdcsRequestId = 1,
+            // Distinctive for the same reason as the helper above, and out of
+            // that helper's range. This factory's CA is unavailable, so no
+            // inventory row can collide today, but the value is not worth leaving
+            // as the one number that would.
+            AdcsRequestId = 7201,
             IssuedAt = DateTime.UtcNow
         });
         await db.SaveChangesAsync();

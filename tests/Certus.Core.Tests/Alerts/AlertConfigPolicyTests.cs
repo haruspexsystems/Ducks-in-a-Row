@@ -99,7 +99,7 @@ public class AlertConfigPolicyTests
     /// alerting there is, so it is refused rather than warned about.
     ///
     /// Every save writes this key, so a blank one overwrites the
-    /// certus@localhost initializer default with an empty string. Nothing
+    /// ducks@localhost initializer default with an empty string. Nothing
     /// downstream objects: EmailAlertNotifier.IsEnabled checks the host and the
     /// recipients but not the sender, so the card reports the channel enabled,
     /// and MimeKit builds "From: &lt;&gt;" without complaint. The failure only
@@ -328,8 +328,23 @@ public class AlertConfigPolicyTests
 
         result.Normalized!.Smtp!.Port.Should().BeNull();
         result.Normalized.Smtp.TlsMode.Should().BeNull();
-        result.Normalized.Smtp.Username.Should().BeNull();
         result.Normalized.Smtp.FromName.Should().BeNull();
+    }
+
+    [Fact]
+    public void Validate_NeverDecidesTheUsername()
+    {
+        // Null whether or not the request carried one, because since issue #261
+        // the username is resolved from the file under the store's lock, the
+        // same way the password blob is. Deciding it here would write a
+        // snapshot and lose a racing save; deciding it here as null would drop
+        // the stored value out of the overlay entirely.
+        AlertConfigPolicy.Validate(Valid(), webhookDeliverable: false)
+            .Normalized!.Smtp!.Username.Should().BeNull();
+
+        AlertConfigPolicy.Validate(
+                Valid() with { SmtpUsername = "svc-ducks" }, webhookDeliverable: false)
+            .Normalized!.Smtp!.Username.Should().BeNull();
     }
 
     [Fact]
@@ -349,8 +364,10 @@ public class AlertConfigPolicyTests
         result.IsValid.Should().BeTrue();
         result.Warnings.Should().BeEmpty();
         result.Normalized!.Smtp!.Port.Should().Be(465);
-        result.Normalized.Smtp.Username.Should().Be("svc-ducks");
         result.Normalized.Smtp.FromName.Should().Be("Certificate Alerts");
+
+        // The username is trimmed by ResolveUsername rather than here; see
+        // ResolveUsername_TrimsANewName.
     }
 
     [Fact]
@@ -413,11 +430,17 @@ public class AlertConfigPolicyTests
     }
 
     [Fact]
-    public void ResolvePasswordBlob_Clear_DropsTheBlob()
+    public void ResolvePasswordBlob_Clear_StoresAnEmptyBlobRatherThanNull()
     {
+        // Empty and null are different overlay states, exactly as they are for
+        // the username: empty means the dashboard owns the field and holds no
+        // password, null means the dashboard does not own it and
+        // appsettings.json wins. Returning null for a removal made a reader that
+        // falls back on the overlay's silence honour the removal for the
+        // username and ignore it for the password (issue #286).
         AlertConfigPolicy.ResolvePasswordBlob(
                 null, clearPassword: true, currentBlob: "old-blob", p => "protected:" + p)
-            .Should().BeNull();
+            .Should().BeEmpty();
     }
 
     [Fact]
@@ -428,5 +451,100 @@ public class AlertConfigPolicyTests
         AlertConfigPolicy.ResolvePasswordBlob(
                 null, clearPassword: false, currentBlob: "old-blob", p => "protected:" + p)
             .Should().Be("old-blob");
+    }
+
+    [Fact]
+    public void ResolvePasswordBlob_WithNothingStored_StaysNull()
+    {
+        // Silence, not a removal. Nothing is written for the field and
+        // appsettings.json keeps deciding.
+        AlertConfigPolicy.ResolvePasswordBlob(
+                null, clearPassword: false, currentBlob: null, p => "protected:" + p)
+            .Should().BeNull();
+    }
+
+    // ── The username resolution (issue #261) ──
+
+    [Fact]
+    public void ResolveUsername_TrimsANewName()
+    {
+        AlertConfigPolicy.ResolveUsername(
+                " svc-ducks ", clearUsername: false, currentUsername: "svc-old")
+            .Should().Be("svc-ducks");
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void ResolveUsername_NoChange_CarriesTheStoredNameForward(string? requested)
+    {
+        // The arm the whole issue turns on. The config endpoint stopped
+        // returning the username, so the card renders an empty box and submits
+        // it on every save. Reading that as "blank the account" would drop
+        // relay authentication on an ordinary edit of an unrelated field, and
+        // the overlay writer omits nulls, so returning null would drop the
+        // saved name out of the file just as completely.
+        AlertConfigPolicy.ResolveUsername(
+                requested, clearUsername: false, currentUsername: "svc-ducks")
+            .Should().Be("svc-ducks");
+    }
+
+    [Fact]
+    public void ResolveUsername_Clear_StoresAnEmptyNameRatherThanNull()
+    {
+        // Empty and null are different overlay states: empty means the
+        // dashboard owns the field and the relay is contacted anonymously,
+        // null means the dashboard does not own it and appsettings.json wins.
+        AlertConfigPolicy.ResolveUsername(
+                null, clearUsername: true, currentUsername: "svc-ducks")
+            .Should().BeEmpty();
+    }
+
+    [Fact]
+    public void ResolveUsername_WithNothingStored_StaysNull()
+    {
+        AlertConfigPolicy.ResolveUsername(null, clearUsername: false, currentUsername: null)
+            .Should().BeNull();
+    }
+
+    [Fact]
+    public void Validate_SettingAndClearingTheUsername_IsRefused()
+    {
+        var result = AlertConfigPolicy.Validate(
+            Valid() with { SmtpUsername = "svc-ducks", SmtpClearUsername = true },
+            webhookDeliverable: false);
+
+        result.IsValid.Should().BeFalse();
+        result.Errors.Should().ContainSingle().Which.Should().Contain("not both");
+    }
+
+    [Fact]
+    public void Validate_ClearingTheUsernameWhileAPasswordStands_Warns()
+    {
+        var result = AlertConfigPolicy.Validate(
+            Valid() with { SmtpClearUsername = true },
+            webhookDeliverable: false,
+            hasStoredPassword: true,
+            hasStoredUsername: true);
+
+        result.IsValid.Should().BeTrue();
+        result.Warnings.Should().ContainSingle()
+            .Which.Should().Contain("username is blank");
+    }
+
+    [Fact]
+    public void Validate_OmittedUsernameWithBothStored_DoesNotWarn()
+    {
+        // The ordinary save after issue #261: the card sends no username
+        // because it has none to send, and both halves are already stored, so
+        // authentication will happen and there is nothing to say.
+        var result = AlertConfigPolicy.Validate(
+            Valid(),
+            webhookDeliverable: false,
+            hasStoredPassword: true,
+            hasStoredUsername: true);
+
+        result.Warnings.Should().BeEmpty();
     }
 }

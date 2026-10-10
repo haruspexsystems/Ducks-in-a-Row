@@ -146,6 +146,77 @@ public class DeviceAttestationPolicyServiceTests : IDisposable
         outcome.Should().Be(DeviceAttestationPolicyOutcome.NoProfile);
     }
 
+    // ---- CheckAgainstAsync: the admission half, asked against a loaded profile ----
+    //
+    // The Check_* tests above stay as they are, and they are what proves the
+    // delegation added for issue #335 did not change what CheckAsync answers.
+    // These add the half the finalize calls directly.
+
+    [Fact]
+    public async Task CheckAgainst_OpenMode_AdmitsUnlistedDevice()
+    {
+        SeedProfile(gateMode: DeviceAttestationGateModes.Open, devices: "OTHER-SN");
+        var profile = (await _sut.GetProfileAsync(TestTemplate))!;
+
+        var outcome = await _sut.CheckAgainstAsync(profile, TestDevice);
+
+        outcome.Should().Be(
+            DeviceAttestationPolicyOutcome.AllowedOpen,
+            "open mode skips the allowlist rather than merely tolerating an empty one");
+    }
+
+    [Fact]
+    public async Task CheckAgainst_AllowlistMode_ListedDevice_IsAdmitted()
+    {
+        SeedProfile(devices: new[] { "OTHER-SN", TestDevice });
+        var profile = (await _sut.GetProfileAsync(TestTemplate))!;
+
+        var outcome = await _sut.CheckAgainstAsync(profile, TestDevice);
+
+        outcome.Should().Be(DeviceAttestationPolicyOutcome.AllowedListed);
+    }
+
+    [Fact]
+    public async Task CheckAgainst_AllowlistMode_UnlistedDevice_Refuses()
+    {
+        SeedProfile(devices: "OTHER-SN");
+        var profile = (await _sut.GetProfileAsync(TestTemplate))!;
+
+        var outcome = await _sut.CheckAgainstAsync(profile, TestDevice);
+
+        outcome.Should().Be(DeviceAttestationPolicyOutcome.NotOnAllowlist);
+    }
+
+    [Fact]
+    public async Task CheckAgainst_SeesAnEntryDeletedSinceTheProfileWasLoaded()
+    {
+        // The whole point of issue #335: the caller holds a profile it loaded
+        // earlier, and the answer must come from the allowlist as it stands now,
+        // not from the entries that profile object was loaded with.
+        SeedProfile(devices: TestDevice);
+        var profile = (await _sut.GetProfileAsync(TestTemplate))!;
+
+        _db.DeviceAllowlistEntries.RemoveRange(_db.DeviceAllowlistEntries);
+        await _db.SaveChangesAsync();
+
+        var outcome = await _sut.CheckAgainstAsync(profile, TestDevice);
+
+        outcome.Should().Be(DeviceAttestationPolicyOutcome.NotOnAllowlist);
+    }
+
+    [Fact]
+    public async Task CheckAgainst_UnknownGateMode_BehavesAsAllowlist()
+    {
+        // The fail closed rule lives in this method now, so it is pinned here as
+        // well as through CheckAsync above.
+        SeedProfile(gateMode: "permissive", devices: "OTHER-SN");
+        var profile = (await _sut.GetProfileAsync(TestTemplate))!;
+
+        var outcome = await _sut.CheckAgainstAsync(profile, TestDevice);
+
+        outcome.Should().Be(DeviceAttestationPolicyOutcome.NotOnAllowlist);
+    }
+
     [Fact]
     public async Task GetProfile_ReturnsProfileForTemplate()
     {
@@ -159,6 +230,49 @@ public class DeviceAttestationPolicyServiceTests : IDisposable
         profile.CsrIdentifierBinding.Should().Be(CsrIdentifierBindingModes.CnOrSan);
 
         (await _sut.GetProfileAsync("Unconfigured")).Should().BeNull();
+    }
+
+    [Fact]
+    public async Task IsOffered_NoProfile_IsFalse()
+    {
+        (await _sut.IsOfferedAsync(TestTemplate)).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task IsOffered_DisabledProfile_IsFalse()
+    {
+        SeedProfile(enabled: false, devices: TestDevice);
+
+        (await _sut.IsOfferedAsync(TestTemplate)).Should().BeFalse(
+            "a disabled profile behaves exactly like no profile");
+    }
+
+    [Fact]
+    public async Task IsOffered_EnabledProfile_IsTrueRegardlessOfGateModeOrAllowlist()
+    {
+        // The question is whether the template takes device orders at all, not
+        // whether this device is admitted. An enabled allowlist profile with an
+        // empty allowlist still offers the identifier type: it just refuses
+        // every device, loudly, at the allowlist check.
+        SeedProfile(gateMode: DeviceAttestationGateModes.Allowlist);
+
+        (await _sut.IsOfferedAsync(TestTemplate)).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task IsOffered_OpenModeProfile_IsTrue()
+    {
+        SeedProfile(gateMode: DeviceAttestationGateModes.Open);
+
+        (await _sut.IsOfferedAsync(TestTemplate)).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task IsOffered_ProfileOnAnotherTemplate_IsFalse()
+    {
+        SeedProfile(templateId: "WebServer", devices: TestDevice);
+
+        (await _sut.IsOfferedAsync(TestTemplate)).Should().BeFalse();
     }
 
     public void Dispose()

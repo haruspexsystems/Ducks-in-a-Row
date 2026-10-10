@@ -508,7 +508,7 @@ public class EabAdminApiIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task Accounts_Deactivate_FlipsAcmeTo403_AndInvalidatesOpenOrders()
+    public async Task Accounts_Deactivate_FlipsAcmeTo401_AndInvalidatesOpenOrders()
     {
         _factory.WriteEabMode("off");
         var account = await RegisterUnboundAccountAsync("mailto:doomed@example.com");
@@ -525,9 +525,10 @@ public class EabAdminApiIntegrationTests : IDisposable
         body.GetProperty("invalidatedOrders").GetInt32().Should().Be(1);
 
         // Every later request the account signs is refused by the existing
-        // kid status check.
+        // kid status check, with the 401 RFC 8555 §7.3.6 names for a request
+        // from a deactivated account.
         var afterOrder = await PostNewOrderAsync(account.Rsa, account.Kid, "late.home.local");
-        afterOrder.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+        afterOrder.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
         (await ReadErrorAsync(afterOrder)).Type.Should().Be(AcmeErrorType.Unauthorized);
 
         using (var scope = _factory.Services.CreateScope())
@@ -558,9 +559,9 @@ public class EabAdminApiIntegrationTests : IDisposable
     public async Task Accounts_Deactivated_AreNeverBoundByAReRegistration()
     {
         // Deactivation is terminal (RFC 8555 §7.3.6). A client re-running
-        // registration for a deactivated account with a valid binding gets
-        // the account back, but the account must not be mutated into a
-        // working looking bound account.
+        // registration for a deactivated account with a valid binding is
+        // refused outright, and in particular the account must not be mutated
+        // into a working looking bound account.
         _factory.WriteEabMode("optional");
         var account = await RegisterUnboundAccountAsync("mailto:gone@example.com");
         var accountRowId = await GetAccountRowIdAsync(account.AccountId);
@@ -573,8 +574,12 @@ public class EabAdminApiIntegrationTests : IDisposable
             BuildEabJws(credential.KeyId, credential.Secret, ExportRsaJwk(account.Rsa)),
             "mailto:gone@example.com");
 
-        response.StatusCode.Should().Be(HttpStatusCode.OK,
-            "the existing account is returned for a known key");
+        // Since #168 new-account carries the same status guard the kid path has,
+        // so a deactivated key is refused here too rather than handed its own
+        // account object back.
+        response.StatusCode.Should().Be(HttpStatusCode.Unauthorized,
+            "a deactivated key can no longer register or re-register");
+        (await ReadErrorAsync(response)).Type.Should().Be(AcmeErrorType.Unauthorized);
 
         using var scope = _factory.Services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<CertusDbContext>();

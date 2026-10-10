@@ -11,8 +11,12 @@ import {
 } from 'lucide-react';
 import type { IconName } from '../data/types';
 
-/** Maps the dashboard's data-driven icon names to lucide-react components. */
-export const ICONS: Record<IconName, LucideIcon> = {
+/**
+ * Maps the dashboard's data-driven icon names to lucide-react components.
+ * Module private: DataIcon below is the only reader, and exporting a
+ * non-component beside one costs this file fast refresh.
+ */
+const ICONS: Record<IconName, LucideIcon> = {
   layers: Layers,
   check: CircleCheck,
   alert: TriangleAlert,

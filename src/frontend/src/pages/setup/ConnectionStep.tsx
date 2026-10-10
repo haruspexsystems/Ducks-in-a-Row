@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { CheckCircle2, XCircle, Loader2, Server, PencilLine } from 'lucide-react';
-import { discoverCas, testCaConnection, type DiscoveredCa } from '@/api/setup';
+import { discoverCas, testCaConnection, type ConnectivityFailureKind, type DiscoveredCa } from '@/api/setup';
+import { ServiceRightsPanel } from '@/components/ServiceRightsReport';
 import type { WizardState } from './SetupWizard';
 
 interface ConnectionStepProps {
@@ -23,6 +24,7 @@ export function ConnectionStep({ state, onUpdate }: ConnectionStepProps) {
   const [manualEntry, setManualEntry] = useState('');
   const [testing, setTesting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [failureKind, setFailureKind] = useState<ConnectivityFailureKind | null>(null);
 
   useEffect(() => {
     discoverCas()
@@ -80,10 +82,12 @@ export function ConnectionStep({ state, onUpdate }: ConnectionStepProps) {
         });
       } else {
         setError(result.errorMessage ?? 'Connection test failed');
+        setFailureKind(result.failureKind ?? 'other');
         onUpdate({ connectionTested: false });
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Connection test failed');
+      setFailureKind('other');
       onUpdate({ connectionTested: false });
     } finally {
       setTesting(false);
@@ -183,10 +187,13 @@ export function ConnectionStep({ state, onUpdate }: ConnectionStepProps) {
 
       <div className="bg-sunken border border-hairline rounded-lg p-4">
         <div className="flex items-start gap-3">
-          <Server className="h-5 w-5 text-faint mt-0.5" />
+          <Server className="h-5 w-5 text-faint mt-0.5 shrink-0" />
           <p className="text-xs text-muted">
-            The service account running Ducks in a Row needs <strong>Request Certificates</strong>{' '}
-            permission on the CA and the relevant templates.
+            The CA sees this server's computer account. It needs <strong>Request Certificates</strong>{' '}
+            on the CA, <strong>Enroll</strong> on each template you expose, <strong>Read</strong> on
+            the CA for the certificate inventory, and <strong>Issue and Manage Certificates</strong>{' '}
+            only if Ducks in a Row should revoke. Test Connection proves the first; once it passes,
+            the rights check below reports on the rest.
           </p>
         </div>
       </div>
@@ -238,6 +245,17 @@ export function ConnectionStep({ state, onUpdate }: ConnectionStepProps) {
         </div>
       )}
 
+      {/* What the service's own account may do on this CA (issue #440). The
+          templates come a step later, so this is the host and CA half. */}
+      {state.connectionTested && (
+        <ServiceRightsPanel
+          key={state.caConnectionString}
+          caConnectionString={state.caConnectionString}
+          templates={[]}
+          groups={['host', 'ca']}
+        />
+      )}
+
       {/* Error */}
       {error && (
         <div className="bg-red-50 dark:bg-red-500/10 border border-red-200 dark:border-red-500/30 rounded-lg p-4">
@@ -246,13 +264,25 @@ export function ConnectionStep({ state, onUpdate }: ConnectionStepProps) {
             <div>
               <h3 className="text-sm font-semibold text-red-900 dark:text-red-200">Connection failed</h3>
               <p className="text-sm text-red-700 dark:text-red-300 mt-1">{error}</p>
-              <p className="text-xs text-red-500 mt-2">
-                Verify that this server is domain joined and the CA is reachable via RPC.
-              </p>
+              <p className="text-xs text-red-500 mt-2">{failureHint(failureKind)}</p>
             </div>
           </div>
         </div>
       )}
     </div>
   );
+}
+
+/** The hint under a failed test, by what the service found. */
+function failureHint(kind: ConnectivityFailureKind | null): string {
+  switch (kind) {
+    case 'accessDenied':
+      return "The CA answered and refused this server's computer account. Ask the CA administrator to grant it Request Certificates on the CA.";
+    case 'unavailable':
+      return 'Verify that CertSvc is running on the CA and that TCP 135 and the dynamic RPC range (49152 to 65535) are open from this server to the CA.';
+    case 'componentsMissing':
+      return 'Install the ADCS Remote Administration Tools on this server (Install-WindowsFeature RSAT-ADCS-Mgmt), then test again.';
+    default:
+      return 'Verify that this server is domain joined and the CA is reachable via RPC.';
+  }
 }

@@ -60,9 +60,27 @@ public class AcmeOrder
     public string? CertificateId { get; set; }
 
     /// <summary>
-    /// ACME error JSON if the order is invalid.
+    /// The serialized <c>AcmeError</c> problem document saying why the order is
+    /// invalid, and null on every order that has not failed. Only ever written
+    /// alongside "invalid" and committed with it.
+    ///
+    /// <c>OrderService.ToResponse</c> projects it into the order object's error
+    /// member (RFC 8555 section 7.1.3), so this is client facing text and not only
+    /// an operator's record. One case is deliberately null: an order invalidated
+    /// because a challenge failed carries its reason on the authorization instead,
+    /// which is where section 7.1.6 sends the client.
     /// </summary>
     public string? ErrorJson { get; set; }
+
+    /// <summary>
+    /// The canonical ARI identifier of the certificate this order replaces
+    /// (RFC 9773 §5), null when the client named none. A string rather than a
+    /// foreign key because the static ToResponse must reflect it with no
+    /// database access, and because it is stored only after
+    /// ResolveReplacesAsync verified it octet for octet against the stored
+    /// leaf, so it is that certificate's stable identity.
+    /// </summary>
+    public string? ReplacesCertificateId { get; set; }
 
     /// <summary>When this order was created.</summary>
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;

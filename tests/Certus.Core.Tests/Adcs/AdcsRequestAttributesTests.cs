@@ -61,6 +61,26 @@ public class AdcsRequestAttributesTests
         error.Should().Contain("control character");
     }
 
+    // U+2028 and U+2029 are categories Zl and Zp, so they are neither Control
+    // nor Format and passed every guard in the product until issue #234. ADCS
+    // does not treat either as a pair separator and neither does .NET's line
+    // reader, but a SIEM's own splitter does, so the name reads as two lines
+    // there and as one line here.
+    [Theory]
+    [InlineData((char)0x2028)] // LINE SEPARATOR
+    [InlineData((char)0x2029)] // PARAGRAPH SEPARATOR
+    public void TryValidateTemplateName_AnyLineSeparator_IsRefused(char separator)
+    {
+        var valid = AdcsRequestAttributes.TryValidateTemplateName(
+            $"WebServer{separator}cdc:evil", out var error);
+
+        valid.Should().BeFalse();
+        error.Should().Contain("line separator character");
+        error.Should().Contain($"U+{(int)separator:X4}");
+        error.Should().NotContain(
+            "control character", "U+2028 is not a control character and the refusal must not say it is");
+    }
+
     // Format characters cannot smuggle an attribute, but the name is logged and
     // shown on the wizard and settings screens, where a bidirectional override
     // makes it read as a different name. Same call CertificateTextSanitizer

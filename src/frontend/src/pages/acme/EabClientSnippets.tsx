@@ -3,6 +3,8 @@ import { useQuery } from '@tanstack/react-query';
 import { AlertTriangle, Download } from 'lucide-react';
 import { fetchSetupConfig } from '@/api/setup';
 import { CopyButton } from '@/components/CopyButton';
+import { useTemplates } from '@/hooks/useCertificates';
+import { resolveTemplateKey } from '@/lib/templateKey';
 import {
   SECRET_PLACEHOLDER,
   buildDirectoryUrl,
@@ -49,14 +51,32 @@ export function EabClientSnippets({
   const externalUrl = savedUrl || window.location.origin;
   const missingExternalUrl = !savedUrl && (isError || config !== undefined);
 
+  // The enabled set is a list of names, so the key requirements come from the
+  // template list, which carries the viability the server read off AD. A
+  // template the list does not cover, or a list that has not loaded, resolves
+  // to "unknown", which hedges to RSA rather than asserting it.
+  const { data: templateDetails } = useTemplates();
+  const templateKey = useMemo(() => {
+    const match = templateDetails?.find(
+      (t) =>
+        t.name.toLowerCase() === template.toLowerCase() ||
+        t.displayName.toLowerCase() === template.toLowerCase(),
+    );
+    return resolveTemplateKey(
+      match?.viability?.keyAlgorithm,
+      match?.viability?.minimalKeySize,
+    );
+  }, [templateDetails, template]);
+
   const snippets = useMemo(
     () =>
       buildEabSnippets(
         buildDirectoryUrl(externalUrl, template),
         keyId,
         secret ?? SECRET_PLACEHOLDER,
+        templateKey,
       ),
-    [externalUrl, template, keyId, secret],
+    [externalUrl, template, keyId, secret, templateKey],
   );
   const [clientChoice, setClientChoice] = useState(snippets[0].id);
   const snippet = snippets.find((s) => s.id === clientChoice) ?? snippets[0];

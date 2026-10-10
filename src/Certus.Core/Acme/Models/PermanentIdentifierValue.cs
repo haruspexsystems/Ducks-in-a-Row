@@ -1,4 +1,5 @@
 using System.Diagnostics.CodeAnalysis;
+using Certus.Core.Security;
 
 namespace Certus.Core.Acme.Models;
 
@@ -36,10 +37,26 @@ public sealed class PermanentIdentifierValue
 
     /// <summary>
     /// Parses and validates a permanent-identifier value. Rejects empty
-    /// values, oversize values, control characters, leading or trailing
+    /// values, oversize values, deceptive characters, leading or trailing
     /// whitespace, an empty device identifier part, and a malformed assigner
     /// OID. Inner spaces are allowed: the draft does not restrict the value
     /// alphabet and asset style identifiers may contain them.
+    ///
+    /// The character scan is <see cref="DeceptiveCharacters"/>, the same one the
+    /// template name and CA connection string guards use. Until issue #234 this
+    /// walked the value a char at a time looking for control characters only,
+    /// which left two gaps. It said nothing about format characters, so a
+    /// bidirectional override in a device serial reached the domain policy audit
+    /// rows and the dashboard that renders them; the sync write path had to
+    /// re-sanitize the value defensively to cover it (see CertificateSyncService).
+    /// And a per char walk cannot see a format character above the BMP at all,
+    /// because a surrogate half reads as Surrogate and never Format, so the tag
+    /// block that encodes arbitrary ASCII invisibly passed as well (the issue
+    /// #228 defect, which never reached this guard's own fix).
+    ///
+    /// The value is client supplied over ACME newOrder, so the error names the
+    /// position and code point and never echoes the value itself, matching the
+    /// other guards.
     /// </summary>
     public static bool TryParse(
         string? raw,
@@ -60,13 +77,23 @@ public sealed class PermanentIdentifierValue
             return false;
         }
 
-        foreach (var c in raw)
+        // Ahead of the whitespace check below, which would otherwise answer for
+        // a trailing U+2028 with the wrong reason: char.IsWhiteSpace is true for
+        // Zl and Zp, so "SN-1<U+2028>" would report leading or trailing
+        // whitespace rather than the line separator it actually carries.
+        if (DeceptiveCharacters.Find(raw) is { } found)
         {
-            if (char.IsControl(c))
+            var kind = found.Class switch
             {
-                error = "The permanent-identifier value contains control characters.";
-                return false;
-            }
+                DeceptiveCharacterClass.Control => "control",
+                DeceptiveCharacterClass.LineSeparator => "line separator",
+                _ => "formatting",
+            };
+
+            error =
+                $"The permanent-identifier value contains a {kind} character " +
+                $"(U+{found.CodePoint:X4}) at position {found.Position}.";
+            return false;
         }
 
         if (char.IsWhiteSpace(raw[0]) || char.IsWhiteSpace(raw[^1]))

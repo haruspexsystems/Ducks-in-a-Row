@@ -15,6 +15,26 @@ public sealed class AddressBlockedException : Exception
         : base($"Validation target '{host}' resolves to a blocked address.")
     {
     }
+
+    /// <summary>
+    /// The target names a port challenge validation never uses. Same class of
+    /// rejection as a blocked address, and permanent for the same reason: no
+    /// amount of retrying turns port 22 into a challenge server.
+    /// </summary>
+    public AddressBlockedException(string host, int port)
+        : base($"Validation target '{host}' names port {port}, which is not permitted.")
+    {
+        Port = port;
+    }
+
+    /// <summary>
+    /// The port that was refused, or null when the address was what policy
+    /// blocked. A caller building a message for a client has to tell the two
+    /// apart: saying a target resolves to a blocked address when the address
+    /// resolved perfectly well sends the reader off to check DNS and firewall
+    /// rules for a problem that is neither.
+    /// </summary>
+    public int? Port { get; }
 }
 
 /// <summary>

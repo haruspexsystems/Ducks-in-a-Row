@@ -153,9 +153,38 @@ public sealed class CertusOptions
     public int RequestHistoryDays { get; set; } = 30;
 
     /// <summary>
-    /// Whether to enable SQLite WAL (Write-Ahead Logging) mode for better
-    /// concurrent read/write performance. Defaults to true.
-    /// Disable only if running on a filesystem that doesn't support WAL (e.g., some network shares).
+    /// Whether the database uses SQLite WAL (Write-Ahead Logging) mode, for
+    /// better concurrent read/write performance. Defaults to true. Turn it off
+    /// on a filesystem that cannot support WAL, which needs shared memory and so
+    /// rules out most network shares, or when a backup agent, scanner, or
+    /// replication tool needs a database with no permanent sidecar files.
+    ///
+    /// Journal mode lives in the database file, not in configuration. This
+    /// option is a request made once per start against a file that already has
+    /// an answer, and it is applied in both directions: turning it off converts
+    /// an existing database back to rollback journalling and removes the
+    /// <c>-wal</c> and <c>-shm</c> sidecars. Before issue #283 only the on
+    /// direction was applied, so turning the option off changed nothing at all
+    /// on an existing install.
+    ///
+    /// Either direction can be refused, because changing journal mode needs the
+    /// database file exclusively and anything else holding it open prevents
+    /// that. A refusal is logged as a warning and retried on the next start; it
+    /// never stops the service. Read <c>SQLite journal mode</c> in the startup
+    /// log for what the database actually is, rather than inferring it from this
+    /// setting: the log line reports the mode the database itself reports.
+    ///
+    /// Moving the data directory to a share needs the conversion to happen
+    /// first, while the database is still somewhere WAL works. A database
+    /// already in WAL mode will not open on a filesystem that cannot support
+    /// WAL, so there is no start on which this option could convert it. The
+    /// order is: set this to false, restart, confirm the logged mode is
+    /// <c>delete</c>, stop the service, move the data directory, start.
+    ///
+    /// The off state is <c>delete</c> specifically, which is SQLite's own
+    /// default, so a converted database is indistinguishable from one created
+    /// with this option already off. A database somebody had deliberately put in
+    /// <c>truncate</c> or <c>persist</c> is converted to <c>delete</c> as well.
     /// </summary>
     public bool EnableWalMode { get; set; } = true;
 }

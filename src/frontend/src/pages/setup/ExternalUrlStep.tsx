@@ -440,9 +440,10 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
             <p className="text-xs text-amber-700 dark:text-amber-300">
               Ducks in a Row can request a certificate for{' '}
               <code className="font-mono">{new URL(state.externalUrl || 'https://x').hostname}</code>{' '}
-              from your CA right now, install it, and restart itself to serve it. This also
-              proves the template works end to end: ACME requests enroll with the same
-              service account.
+              from your CA right now, install it, and restart itself to serve it. This is also
+              the one thing in the wizard that proves this server's Request Certificates on the
+              CA and Enroll on the {selectedTemplate} template, because ACME requests enroll as
+              the same account. Other templates you expose stay unproven until they issue.
             </p>
             <button
               onClick={handleGetCertificate}

@@ -1,6 +1,7 @@
 using Certus.Core.Acme.Crypto;
 using Certus.Core.Acme.Models;
 using Certus.Core.Acme.Services;
+using Certus.Core.Security;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 
@@ -12,7 +13,7 @@ namespace Certus.Web.Controllers.Acme;
 /// RFC 8555 §7.4.2
 /// </summary>
 [ApiController]
-[EnableRateLimiting("acme-general")]
+[EnableRateLimiting(AcmeRateLimitPolicies.General)]
 public sealed class CertificateController : AcmeControllerBase
 {
     private readonly OrderService _orderService;
@@ -55,6 +56,21 @@ public sealed class CertificateController : AcmeControllerBase
         if (cert.Order.AccountId != auth.Account!.Id)
             return AcmeError(403, AcmeErrorType.Unauthorized,
                 "Certificate does not belong to this account.");
+
+        // The order has to agree that this is the certificate it issued, and that it
+        // issued one at all (issue #318). Deliberately after the ownership check, so a
+        // caller who does not own the row never learns anything about its order. See
+        // OrderService.MayServe for why "valid" is the whole set and why this exists
+        // even though no path in the product can currently fail it.
+        if (!OrderService.MayServe(cert))
+            return AcmeError(403, AcmeErrorType.Unauthorized,
+                "The order for this certificate is not valid, so the certificate is " +
+                "not available for download.");
+
+        // RFC 8555 §7.4.2: the response MUST carry at least one "up" link pointing at
+        // where the issuing CA certificate can be retrieved.
+        var issuerUrl = AcmeUrl($"/acme/{template}/issuer-cert");
+        Response.Headers.Append("Link", $"<{issuerUrl}>;rel=\"up\"");
 
         // Return PEM certificate chain
         // Content-Type: application/pem-certificate-chain per RFC 8555

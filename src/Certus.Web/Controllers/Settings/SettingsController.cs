@@ -495,6 +495,14 @@ public sealed class SettingsController : ControllerBase
             _logger.LogWarning(ex, "Certificate renewal: the CA is unavailable");
             return StatusCode(503, new { error = true, message = "The certificate authority is unavailable. Try again shortly." });
         }
+        catch (CaAccessDeniedException ex)
+        {
+            // The renew button's half of issue #336, matching the wizard's arm. An
+            // administrator authenticated surface, so it carries the remediation in
+            // full rather than the generic sentence the ACME wire gets.
+            _logger.LogError(ex, "Certificate renewal: the CA denied access");
+            return StatusCode(503, new { error = true, message = ex.Message });
+        }
 
         switch (result.Outcome)
         {
