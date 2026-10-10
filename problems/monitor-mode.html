@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Not available in monitor mode | Ducks in a Row</title>
+<meta name="description" content="Ducks in a Row problem type monitor-mode: Not available in monitor mode.">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+<header><a class="home" href="/">Ducks in a Row</a></header>
+<main>
+<h1>Not available in monitor mode</h1>
+<p class="meta">HTTP 403 Forbidden, or 404 Not Found on the ACME administration API<br><code>https://ducksinarow.dev/problems/monitor-mode</code></p>
+<h2>What it means</h2>
+<p>This Ducks in a Row server runs in monitor mode. It watches its certification
+authority: it keeps the certificate inventory, warns before certificates expire,
+and watches the CA's revocation lists. It never writes to the CA, so it issues no
+certificates, offers no ACME service, and revokes nothing, from the dashboard or
+any other way.</p>
+<p>The request you made would have written to the CA. It was refused, and nothing
+was sent to the CA.</p>
+<h2>What to do</h2>
+<p>To issue or revoke a certificate, do it at the certification authority, or from
+a Ducks in a Row server in full mode.</p>
+<p>Monitor mode is chosen by a local administrator on the server, never from the
+dashboard. It is the registry value <code>Mode</code> beside
+<code>DataDirectory</code> under
+<code>HKLM\SOFTWARE\Haruspex Systems\Ducks in a Row</code>. To turn issuance on,
+grant the server's computer account the rights issuance needs (Request
+Certificates on the CA and Enroll on each template), set the value to
+<code>full</code>, and restart the service.</p>
+<p class="meta"><a href="/problems/">All problem types</a></p>
+</main>
+<footer>
+  <p>&copy; 2026 Haruspex Systems B.V., Zevenaar, the Netherlands. KVK 42142878.</p>
+  <p>&ldquo;Ducks in a Row&rdquo; is a trademark of Haruspex Systems B.V.</p>
+  <p>Licensing: <a href="mailto:licensing@haruspex.systems">licensing@haruspex.systems</a>.
+     Security: <a href="mailto:security@haruspex.systems">security@haruspex.systems</a>.</p>
+  <p>This site sets no cookies and runs no scripts. <a href="/privacy">Privacy notice</a>.</p>
+</footer>
+</body>
+</html>
