@@ -13,10 +13,14 @@ what is served.
 - **No trackers and no scripts.** The product promises that nothing phones home,
   and its website keeps the same promise. The sign-up form needs no exception: it
   is a plain HTML form that posts to our own list server, `lists.ducksinarow.dev`.
-- **The sign-up form is a contract with the list server.** The two `l` values in
-  `download.html` are the UUIDs of the Security notices and Newsletter lists, and
-  the list server redirects to `next` only when it matches a URL in its Trusted
-  URLs setting exactly. Change any of them on both sides together.
+- **The sign-up forms are a contract with the list server.** `download.html` and
+  `notices.html` carry the same two `l` values, the UUIDs of the Security notices
+  and Newsletter lists. The list server redirects to `next` only when it matches a
+  URL in its Trusted URLs setting exactly: `/download` sends people to `/thanks`,
+  and `/notices` to `/subscribed`. Change any of them on both sides together.
+- **`/notices` is a contract.** Ducks in a Row releases from 1.1.0 on link it from
+  the Setup Complete and Settings pages, so it may be reworded but never renamed
+  or removed.
 - **No prices.** Pricing is shared on request, not published.
 - **Claims follow the release.** Every claim on the home page is true of the latest public
   release, never of the roadmap. The support period sentence is the one in the product's
@@ -34,7 +38,9 @@ what is served.
 | --- | --- |
 | `index.html` | The home page, the product page that launch posts link to |
 | `download.html` | The download page: the sign-up form for the security list, with the newsletter as an unticked option |
-| `thanks.html` | Where the list server sends people after they sign up; it holds the download link and is not indexed |
+| `thanks.html` | Where the list server sends people after they sign up on `/download`; it holds the download link and is not indexed |
+| `notices.html` | The security notices sign up, linked from the product, with the newsletter as an unticked option |
+| `subscribed.html` | Where the list server sends people after they sign up on `/notices`; it says how to confirm and is not indexed |
 | `privacy.html` | The privacy notice, served at `/privacy` and linked from every footer |
 | `problems/index.html` | The list of problem types |
 | `problems/<slug>.html` | One page per problem type, served at `/problems/<slug>` |
