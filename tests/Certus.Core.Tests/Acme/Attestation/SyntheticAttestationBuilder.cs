@@ -62,7 +62,9 @@ internal static class SyntheticAttestationBuilder
     /// are written as the raw extension bytes, the shape the verifier reads.
     /// Pass <paramref name="key"/> (caller owned, not disposed here) when
     /// the test later needs the attested private key, for example to sign
-    /// the finalize CSR with the key the attestation vouched for.
+    /// the finalize CSR with the key the attestation vouched for. Pass
+    /// <paramref name="caIssuersUrl"/> to name the issuer's download address
+    /// in an authority information access extension, as a real leaf may.
     /// </summary>
     public static X509Certificate2 CreateLeaf(
         X509Certificate2 issuer,
@@ -72,7 +74,8 @@ internal static class SyntheticAttestationBuilder
         string? sepOsVersion = null,
         DateTimeOffset? notBefore = null,
         DateTimeOffset? notAfter = null,
-        ECDsa? key = null)
+        ECDsa? key = null,
+        string? caIssuersUrl = null)
     {
         var ownsKey = key == null;
         var leafKey = key ?? ECDsa.Create(ECCurve.NamedCurves.nistP256);
@@ -93,6 +96,9 @@ internal static class SyntheticAttestationBuilder
                     RawExtension(AppleAttestationOids.SepOsVersion, Encoding.UTF8.GetBytes(sepOsVersion)));
             if (nonce is not null)
                 request.CertificateExtensions.Add(RawExtension(AppleAttestationOids.Nonce, nonce));
+            if (caIssuersUrl is not null)
+                request.CertificateExtensions.Add(new X509AuthorityInformationAccessExtension(
+                    ocspUris: null, caIssuersUris: new[] { caIssuersUrl }));
 
             return request.Create(
                 issuer,

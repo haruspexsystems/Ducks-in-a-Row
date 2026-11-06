@@ -31,10 +31,30 @@ export function statusPresentation(status: RightsStatus): StatusPresentation {
 }
 
 /**
- * The wording for a failed optional row. Issue and Manage Certificates is only
- * for revocation, so "Failed" alone would read as more alarming than it is.
+ * True for a row whose right this server never uses: in monitor mode, a right
+ * only issuance or revocation needs (issue #470). The page shows it as not
+ * needed, never as a failure, so nobody is sent to ask for it.
+ */
+export function isNotNeeded(row: ServiceRightsRow): boolean {
+  return row.notNeeded === 'monitorMode';
+}
+
+/**
+ * How one row is shown. A row not needed in this mode reads as such whatever
+ * its status; otherwise the status decides.
+ */
+export function rowPresentation(row: ServiceRightsRow): StatusPresentation {
+  if (isNotNeeded(row)) return { label: 'Not needed in monitor mode', tone: 'skipped' };
+  return statusPresentation(row.status);
+}
+
+/**
+ * The wording for a row. A failed optional row says so: Issue and Manage
+ * Certificates is only for revocation, so "Failed" alone would read as more
+ * alarming than it is.
  */
 export function statusLabel(row: ServiceRightsRow): string {
+  if (isNotNeeded(row)) return rowPresentation(row).label;
   if (row.status === 'failed' && row.optional) return 'Not granted (optional)';
   return statusPresentation(row.status).label;
 }
@@ -59,9 +79,37 @@ export function rowsIn(report: ServiceRightsReport, groups?: RightsGroup[]): Ser
   return groups ? report.rows.filter((r) => groups.includes(r.group)) : report.rows;
 }
 
-/** Every row that is not Proven, which is what the acknowledgement names. */
+/**
+ * The Settings card's line about templates the check left out (issue #478), or
+ * null when it left none out. Those templates have no rows, so without this line
+ * their absence reads as a clean answer. The count is of the names the status file
+ * records, so a template recorded under both of its names can be counted although
+ * it has a row; it can say too many, never too few. Written as "not above zero"
+ * so a payload without the field shows nothing rather than a broken sentence.
+ */
+export function templatesNotCheckedText(report: ServiceRightsReport): string | null {
+  const count = report.templatesNotChecked;
+  if (!(count > 0)) return null;
+  // Monitor mode needs no Enroll at all, which the template rows above already say,
+  // so the line must not read as an open question. A server switched from full mode
+  // keeps the templates it had, which is how a monitor mode check finds any.
+  if (report.rows.some(isNotNeeded)) {
+    return count === 1
+      ? '1 more template enabled for ACME was not checked, because one check reads a limited number of templates. Monitor mode needs no Enroll on it, so this matters only after a switch to full mode.'
+      : `${count} more templates enabled for ACME were not checked, because one check reads a limited number of templates. Monitor mode needs no Enroll on them, so this matters only after a switch to full mode.`;
+  }
+  return count === 1
+    ? '1 more template enabled for ACME was not checked, because one check reads a limited number of templates. Nothing above says whether this server holds Enroll on it.'
+    : `${count} more templates enabled for ACME were not checked, because one check reads a limited number of templates. Nothing above says whether this server holds Enroll on them.`;
+}
+
+/**
+ * Every row that is not Proven and that this server needs, which is what the
+ * acknowledgement names. A right monitor mode never uses is not something to
+ * acknowledge going without.
+ */
 export function rowsNotProven(report: ServiceRightsReport): ServiceRightsRow[] {
-  return report.rows.filter((r) => r.status !== 'proven');
+  return report.rows.filter((r) => r.status !== 'proven' && !isNotNeeded(r));
 }
 
 /**
@@ -83,5 +131,5 @@ export function hasEnrolmentEvidence(report: ServiceRightsReport): boolean {
 export function needsAcknowledgement(report: ServiceRightsReport | null): boolean {
   if (report === null) return true;
   if (hasEnrolmentEvidence(report)) return false;
-  return report.rows.some((r) => r.status === 'unproven' || r.status === 'failed');
+  return report.rows.some((r) => !isNotNeeded(r) && (r.status === 'unproven' || r.status === 'failed'));
 }

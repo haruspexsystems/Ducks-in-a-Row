@@ -529,6 +529,10 @@ public class CrlMonitorServiceTests : IDisposable
             ServerCertificateAlert alert, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
+        public Task<AlertNotificationResult> SendLicenceAlertAsync(
+            LicenceAlert alert, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+
         public Task<AlertNotificationResult> SendTestAlertAsync(
             TestAlert alert, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();

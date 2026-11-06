@@ -1,5 +1,8 @@
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 
 namespace Certus.Core.Acme.Services;
 
@@ -11,6 +14,9 @@ namespace Certus.Core.Acme.Services;
 /// </summary>
 public static class ChallengeHttpHandlerFactory
 {
+    /// <summary>The id-kp-serverAuth extended key usage SslStream asks of a server's chain.</summary>
+    private const string ServerAuthenticationOid = "1.3.6.1.5.5.7.3.1";
+
     public static SocketsHttpHandler Create(AddressGuard guard, ChallengeValidationOptions options)
     {
         return new SocketsHttpHandler
@@ -18,6 +24,19 @@ public static class ChallengeHttpHandlerFactory
             // A challenge server must not be able to bounce the validator at an internal
             // address. Following redirects is opt in via configuration.
             AllowAutoRedirect = options.AllowRedirects,
+            // After a redirect to https, SslStream builds the challenge server's chain. Never let
+            // it download an issuer that chain names: the service calls only systems the
+            // operator configures (#642). The rest is SslStream's own default policy.
+            SslOptions = new SslClientAuthenticationOptions
+            {
+                CertificateChainPolicy = new X509ChainPolicy
+                {
+                    DisableCertificateDownloads = true,
+                    RevocationMode = X509RevocationMode.NoCheck,
+                    RevocationFlag = X509RevocationFlag.ExcludeRoot,
+                    ApplicationPolicy = { new Oid(ServerAuthenticationOid) },
+                },
+            },
             ConnectCallback = async (context, cancellationToken) =>
             {
                 // Vet the port as well as the address (issue #345). The guard

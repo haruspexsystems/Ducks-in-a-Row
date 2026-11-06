@@ -70,6 +70,20 @@ public class AcmeAccount
     /// <summary>When this account was created.</summary>
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 
-    /// <summary>When this account was last updated.</summary>
+    /// <summary>
+    /// When this account was last updated. Deactivation is the last write an
+    /// account ever takes, so on a deactivated account this is the deactivation
+    /// instant, and the retention pass measures the deactivated account period
+    /// from it (issue #637).
+    /// </summary>
     public DateTime? UpdatedAt { get; set; }
+
+    /// <summary>
+    /// When an administrator erased this account's personal data (issue #637):
+    /// its contact addresses, the principal link on its credential, and the
+    /// identifiers its orders carried. Null until then. The record that erasure
+    /// happened is the one thing the erasure keeps, so the dashboard can say
+    /// so and a second request reports it instead of pretending to erase again.
+    /// </summary>
+    public DateTime? ErasedAt { get; set; }
 }

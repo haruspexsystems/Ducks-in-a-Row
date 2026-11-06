@@ -334,8 +334,7 @@ public sealed class ServiceRightsCheck
             return null;
 
         using var certificate = _certificateStore.Find(overlay.HttpsCertificateThumbprint);
-        if (certificate is null
-            || !string.Equals(certificate.FriendlyName, HttpsCertificateFriendlyName, StringComparison.Ordinal))
+        if (certificate is null || !HttpsCertificateOwnership.InstalledByService(certificate))
             return null;
 
         var chain = await WithDeadline(async ct =>
@@ -364,14 +363,6 @@ public sealed class ServiceRightsCheck
 
         return new EnrollmentEvidence(overlay.HttpsCertificateTemplate, new DateTimeOffset(certificate.NotBefore.ToUniversalTime(), TimeSpan.Zero));
     }
-
-    /// <summary>
-    /// The friendly name every HTTPS certificate this product installs carries,
-    /// the value of <c>MachineHttpsCertificateStore.FriendlyName</c>. Repeated
-    /// rather than referenced because that class is Windows only and this
-    /// assembly is not.
-    /// </summary>
-    internal const string HttpsCertificateFriendlyName = "Ducks in a Row HTTPS";
 
     /// <summary>
     /// Runs <paramref name="work"/> with a deadline. Null means the deadline won:

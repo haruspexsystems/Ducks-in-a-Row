@@ -48,8 +48,9 @@ public class AcmeProtocolErrorIntegrationTests
         error.Status.Should().Be(415);
         error.Detail.Should().Contain("application/jose+json");
 
-        response.Headers.Contains("Replay-Nonce").Should().BeTrue(
-            "an ACME protocol response carries a nonce even when it is an error");
+        response.Headers.Contains("Replay-Nonce").Should().BeFalse(
+            "the fallback answered, not a controller action, and a nonce is a stored " +
+            "entry an unauthenticated caller must not be able to mint for free (issue #632)");
     }
 
     [Fact]
@@ -67,8 +68,9 @@ public class AcmeProtocolErrorIntegrationTests
         error.Status.Should().Be(405);
         error.Detail.Should().NotBeNullOrEmpty();
 
-        response.Headers.Contains("Replay-Nonce").Should().BeTrue(
-            "an ACME protocol response carries a nonce even when it is an error");
+        response.Headers.Contains("Replay-Nonce").Should().BeFalse(
+            "the fallback answered, not a controller action, and a nonce is a stored " +
+            "entry an unauthenticated caller must not be able to mint for free (issue #632)");
     }
 
     // ── The rest of the surface behaves the same way ────────────────────
@@ -183,7 +185,8 @@ public class AcmeProtocolErrorIntegrationTests
         error.Type.Should().Be(AcmeErrorType.Malformed);
         error.Status.Should().Be(404);
 
-        response.Headers.Contains("Replay-Nonce").Should().BeTrue();
+        response.Headers.Contains("Replay-Nonce").Should().BeFalse(
+            "an unknown ACME URL is answered by the fallback and stores no nonce (issue #632)");
     }
 
     /// <summary>

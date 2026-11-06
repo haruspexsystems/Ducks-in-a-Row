@@ -1,3 +1,4 @@
+using System.Formats.Asn1;
 using System.Net;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
@@ -226,6 +227,45 @@ public class CertificateDerParserTests
         var capability = CertificateDerParser.ParseCapability(der);
 
         capability!.IsCa.Should().BeTrue();
+    }
+
+    [Fact]
+    public void ParseCapability_ReadsApplicationPolicies()
+    {
+        const string smartCardLogon = "1.3.6.1.4.1.311.20.2.2";
+        var der = CreateRsaCertificate("CN=appol.example.com", sanSetup: null, extensions: request =>
+        {
+            request.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(
+                new OidCollection { new Oid("1.3.6.1.5.5.7.3.1") }, critical: false));
+            request.CertificateExtensions.Add(ApplicationPoliciesExtension(smartCardLogon));
+        });
+
+        var capability = CertificateDerParser.ParseCapability(der);
+
+        capability.Should().NotBeNull();
+        capability!.ApplicationPolicyOids.Should().Equal(smartCardLogon);
+    }
+
+    [Fact]
+    public void ParseCapability_NoApplicationPolicies_ReadsNull()
+    {
+        var der = CreateRsaCertificate("CN=no-appol.example.com", sanSetup: null, extensions: request =>
+            request.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(
+                new OidCollection { new Oid("1.3.6.1.5.5.7.3.1") }, critical: false)));
+
+        var capability = CertificateDerParser.ParseCapability(der);
+
+        capability!.ApplicationPolicyOids.Should().BeNull();
+    }
+
+    private static X509Extension ApplicationPoliciesExtension(params string[] policyOids)
+    {
+        var writer = new AsnWriter(AsnEncodingRules.DER);
+        using (writer.PushSequence())
+            foreach (var oid in policyOids)
+                using (writer.PushSequence())
+                    writer.WriteObjectIdentifier(oid);
+        return new X509Extension("1.3.6.1.4.1.311.21.10", writer.Encode(), critical: false);
     }
 
     [Fact]

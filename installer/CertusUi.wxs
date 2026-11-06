@@ -3,7 +3,7 @@
 <!--
   Ducks in a Row: install wizard dialog set.
 
-  This is a copy of the stock WixUI_InstallDir flow with three deliberate changes:
+  This is a copy of the stock WixUI_InstallDir flow with four deliberate changes:
     1. The license agreement screen is omitted (Welcome goes straight to the
        destination screen). The product ships under BSL 1.1; acceptance is not
        gated in the installer.
@@ -13,12 +13,20 @@
     3. A custom "Service options" screen (ServiceConfigDlg) is inserted between
        the data folder screen and the ready-to-install screen. It carries the
        "Start the service now" checkbox bound to the START_SERVICE property.
+    4. A warning page (ModuleContractDlg, issue #495) shown before Welcome, and
+       only on an upgrade that would leave an installed paid module unable to
+       load. Continue sets ALLOW_INCOMPATIBLE_MODULE=1 and goes on to Welcome;
+       Cancel leaves the installed version as it is. Nothing else leads to it.
 
   The completion screen carries an optional "open the setup page in your browser"
   checkbox, wired to a WixShellExec custom action.
 
   Dialog flow (fresh install):
     WelcomeDlg -> InstallDirDlg -> DataDirDlg -> ServiceConfigDlg -> VerifyReadyDlg -> ProgressDlg -> ExitDialog
+
+  An upgrade across a module contract major with a paid module installed puts
+  ModuleContractDlg in front of WelcomeDlg; see ModuleContractCrossed in
+  Certus.wxs for the condition.
 
   Certus.wxs sets WIXUI_INSTALLDIR=INSTALLFOLDER and WIXUI_DATADIR=DATAFOLDER so
   the destination style dialogs edit our directories. The standard dialogs come
@@ -148,16 +156,28 @@
         <Control Id="Title" Type="Text" X="15" Y="6" Width="220" Height="15" Transparent="yes" NoPrefix="yes"
                  Text="{\WixUI_Font_Title}Service options" />
         <Control Id="Description" Type="Text" X="25" Y="23" Width="290" Height="15" Transparent="yes" NoPrefix="yes"
-                 Text="Choose whether to start the service now" />
+                 Text="Choose when the service starts and what it may do" />
         <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
 
-        <Control Id="InfoText" Type="Text" X="25" Y="60" Width="320" Height="48" NoPrefix="yes"
-                 Text="The Ducks in a Row service is always registered and set to start automatically when Windows starts. You can also start it now, so you can finish configuration without rebooting." />
-        <Control Id="StartNowCheckBox" Type="CheckBox" X="25" Y="116" Width="320" Height="18"
+        <Control Id="InfoText" Type="Text" X="25" Y="52" Width="320" Height="24" NoPrefix="yes"
+                 Text="The service is always registered and starts automatically with Windows. You can also start it now, so you can finish configuration without rebooting." />
+        <Control Id="StartNowCheckBox" Type="CheckBox" X="25" Y="80" Width="320" Height="16"
                  Property="START_SERVICE" CheckBoxValue="1"
                  Text="Start the service now" />
-        <Control Id="HintText" Type="Text" X="40" Y="138" Width="305" Height="60" NoPrefix="yes"
-                 Text="After installation, open http://localhost:5000 to pick your certificate authority and templates in the setup wizard. The service serves the wizard even before a CA is configured." />
+        <Control Id="HintText" Type="Text" X="40" Y="97" Width="305" Height="24" NoPrefix="yes"
+                 Text="Then open http://localhost:5000 to connect your certificate authority in the setup wizard, which the service serves even before a CA is configured." />
+
+        <!--
+          Monitor mode (issue #471), unchecked by default. Bound to MONITOR_ONLY,
+          which an upgrade pre-ticks when the server is already in monitor mode;
+          see the properties in Certus.wxs for why the box is never bound to the
+          remembered value directly.
+        -->
+        <Control Id="MonitorOnlyCheckBox" Type="CheckBox" X="25" Y="128" Width="320" Height="16"
+                 Property="MONITOR_ONLY" CheckBoxValue="1"
+                 Text="Monitor only: watch the CA, never issue or revoke" />
+        <Control Id="MonitorHintText" Type="Text" X="40" Y="145" Width="305" Height="48" NoPrefix="yes"
+                 Text="Monitor mode keeps an inventory of the CA's certificates, watches its revocation lists and sends alerts. It needs only Read on the CA. Only a local administrator can change the mode later, by changing a registry value and restarting the service." />
 
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
         <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)" />
@@ -166,6 +186,48 @@
           <Publish Event="SpawnDialog" Value="CancelDlg" />
         </Control>
       </Dialog>
+
+      <!--
+        The upgrade warning page (issue #495). Its only way in is the Show
+        below; no Publish leads to it, so it can appear only when
+        ModuleContractCrossed (Certus.wxs) is set and no override was given.
+        Continue sets the Secure override, which is what lets the execute
+        sequence's refusal pass, and returns to the sequence, which shows
+        Welcome next. Cancel is the default button, the conservative answer to
+        a warning. The text uses properties, never $(var.*): each source file
+        is preprocessed on its own, so Certus.wxs's fallback defines do not
+        reach this one.
+      -->
+      <Dialog Id="ModuleContractDlg" Width="370" Height="270" Title="Ducks in a Row Setup">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="WixUI_Bmp_Banner" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="220" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="{\WixUI_Font_Title}Paid module" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="290" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="This upgrade leaves the paid module unable to load" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+
+        <Control Id="WarningText" Type="Text" X="25" Y="56" Width="320" Height="60" NoPrefix="yes"
+                 Text="The paid module installed on this server was built for module contract [INSTALLED_MODULE_CONTRACT]. This release carries contract [CertusModuleContract], so after the upgrade the paid module does not load, and paid features stay off until you install the paid module built for this release." />
+        <Control Id="AssuranceText" Type="Text" X="25" Y="122" Width="320" Height="12" NoPrefix="yes"
+                 Text="Certificate issuance and renewal are not affected." />
+        <Control Id="ChoiceText" Type="Text" X="25" Y="142" Width="320" Height="36" NoPrefix="yes"
+                 Text="Choose Continue to upgrade anyway, or Cancel to keep the version installed now. An unattended upgrade goes ahead only with ALLOW_INCOMPATIBLE_MODULE=1." />
+
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Disabled="yes" Text="!(loc.WixUIBack)" />
+        <Control Id="Continue" Type="PushButton" X="236" Y="243" Width="56" Height="17" Text="&amp;Continue">
+          <Publish Property="ALLOW_INCOMPATIBLE_MODULE" Value="1" Order="1" />
+          <Publish Event="EndDialog" Value="Return" Order="2" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Default="yes" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+      </Dialog>
+
+      <InstallUISequence>
+        <Show Dialog="ModuleContractDlg" Before="WelcomeDlg"
+              Condition='NOT Installed AND ModuleContractCrossed AND NOT (ALLOW_INCOMPATIBLE_MODULE = "1")' />
+      </InstallUISequence>
     </UI>
   </Fragment>
 

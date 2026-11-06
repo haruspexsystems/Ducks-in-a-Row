@@ -24,9 +24,10 @@ https://your-server:5001/acme/<template>/directory
   only.
 - Whether registration needs an external account binding credential depends on
   the server's enforcement mode; see
-  [External account binding](#external-account-binding) below. Out of the box
-  the mode is Off and clients register an account from their own key the first
-  time they connect.
+  [External account binding](#external-account-binding) below. A new install
+  requires it, so a client needs a credential from the ACME page before it can
+  register; an install upgraded from a version without the setting stays at
+  Off, where clients register from their own key the first time they connect.
 
 > **Trusting the server's TLS.** ACME clients reject an untrusted TLS
 > certificate on the ACME server itself. Give Ducks in a Row a certificate your
@@ -45,9 +46,9 @@ external account binding (RFC 8555 section 7.3.4):
 
 | Mode | What a registering client needs |
 |---|---|
-| Off (default) | Nothing. A presented binding is ignored. |
+| Off | Nothing. A presented binding is ignored. The default after an upgrade from a version without the setting. |
 | Optional | Nothing, but a presented binding is verified and recorded. |
-| Required | A valid EAB credential; registration without one is refused with `externalAccountRequired`. |
+| Required (new install default) | A valid EAB credential; registration without one is refused with `externalAccountRequired`. |
 
 An administrator creates credentials on the ACME page. Each credential is a
 **key id** plus an **HMAC key** (base64url encoded, sized for HS256, which is
@@ -140,6 +141,13 @@ submitted to the CA:
   against Let's Encrypt needs no change.
 - A CSR with no SAN at all is identified by its subject CN, which then has to
   match the order the same way.
+- The CSR may request only a subject alternative name, a key usage, an
+  extended key usage, basic constraints that ask for an end entity
+  certificate (cA=false), and a subject key identifier of its own key. The
+  clients on this page send nothing else by default. OCSP must staple (the TLS
+  feature extension) is refused, so leave it off: `--must-staple` in certbot
+  and lego, `--ocsp` in acme.sh, `-OCSPMustStaple` in Posh-ACME, and the OCSP
+  must staple option in win-acme.
 
 A CSR that breaks these rules is refused with `badCSR`, and the order stays
 in the ready state so the client can retry with a corrected CSR.
@@ -328,3 +336,37 @@ CA publishes but that was not enabled in the wizard answers
 `403 not enabled for ACME`; if a directory URL returns
 `404 unknown certificate template`, check the name against the templates shown
 in the setup wizard.
+
+### Which URLs check the template
+
+Five URLs check the template name: the directory, `new-account`, `new-order`,
+`issuer-cert` and `renewalInfo`. Each refuses a template that is unknown or not
+enabled for ACME, as described above. The template a certificate is issued from
+is fixed when the order is created.
+
+The other URLs carry a template name but do not check it: the order and its
+`finalize`, an authorization (`authz`), a challenge, the certificate download,
+the account and its list of orders, `key-change`, `revoke-cert`, which finds
+the certificate from the certificate itself, and `new-nonce`, whose nonces are
+accepted on every template's URLs. A signed request is authorized by the key
+that signed it: the account key, or for `revoke-cert` either the account key or
+the certificate's own key. An order is always finalized against the template it
+was created under, whatever name the `finalize` URL carries.
+
+So a request through another template's URL, or through the URL of a template
+that is no longer offered over ACME, is not refused for the name. One thing
+still follows the name in the URL: the certificate download links to the
+issuing CA certificate at `issuer-cert` under the same template name, and that
+URL does check it, so a client that walks the chain should download through the
+URL of an enabled template. The account URLs in a response, such as the
+`Location` header of `key-change`, also carry the template name of the URL the
+request was sent to; they name the same account.
+
+This is deliberate. RFC 8555 does not require these URLs to match the directory
+a client started from, and a client revoking a certificate after a key
+compromise must never be held up by a template setting. See
+[Revocation](revocation.md#acme-clients-revoking-their-own-certificates).
+
+For `key-change`, the inner payload's `account` must be the same URL as the
+`kid` the outer request is signed with, as RFC 8555 section 7.3.5 requires,
+whatever template name the `kid` or the `key-change` URL carries.

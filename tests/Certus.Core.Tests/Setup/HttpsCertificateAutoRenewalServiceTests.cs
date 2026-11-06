@@ -1,9 +1,11 @@
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Text.Json;
 using Certus.Core.Adcs;
 using Certus.Core.Alerts;
 using Certus.Core.Configuration;
 using Certus.Core.Setup;
+using Certus.Core.Tests.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -85,6 +87,7 @@ public class HttpsCertificateAutoRenewalServiceTests : IDisposable
         services.AddScoped<SetupService>();
         services.AddScoped<TlsCertificateEnroller>();
         services.AddScoped<HttpsCertificateRenewalService>();
+        services.AddSingleton(CertusInstanceMode.Full);
         _provider = services.BuildServiceProvider();
     }
 
@@ -101,12 +104,14 @@ public class HttpsCertificateAutoRenewalServiceTests : IDisposable
         }
     }
 
-    private HttpsCertificateAutoRenewalService CreateService() =>
+    private HttpsCertificateAutoRenewalService CreateService(CertusInstanceMode? instanceMode = null) =>
         new(_provider.GetRequiredService<IServiceScopeFactory>(),
             _store,
             new ServerCertificateIdentity(
-                _store, Options.Create(_options), NullLogger<ServerCertificateIdentity>.Instance),
+                _store, Options.Create(_options), instanceMode ?? CertusInstanceMode.Full,
+                NullLogger<ServerCertificateIdentity>.Instance),
             Options.Create(_options),
+            instanceMode ?? CertusInstanceMode.Full,
             NullLogger<HttpsCertificateAutoRenewalService>.Instance);
 
     /// <summary>Wizard state a configured, completed install has.</summary>
@@ -150,8 +155,21 @@ public class HttpsCertificateAutoRenewalServiceTests : IDisposable
         return request.CreateSelfSigned(notAfter.AddDays(-lifetimeDays), notAfter);
     }
 
-    private void StoreHolds(string thumbprint, X509Certificate2 certificate) =>
-        _store.Find(thumbprint).Returns(_ => X509CertificateLoader.LoadCertificate(certificate.RawData));
+    /// <summary>
+    /// The store answers <paramref name="thumbprint"/> with a fresh copy of
+    /// <paramref name="certificate"/> on every call, because the caller disposes what
+    /// it is given. The copy carries the friendly name the service gives every
+    /// certificate it installs unless <paramref name="installedByService"/> is false,
+    /// which is a certificate somebody else put in the store (issue #535).
+    /// </summary>
+    private void StoreHolds(string thumbprint, X509Certificate2 certificate, bool installedByService = true) =>
+        _store.Find(thumbprint).Returns(_ =>
+        {
+            var copy = X509CertificateLoader.LoadCertificate(certificate.RawData);
+            if (installedByService)
+                copy.FriendlyName = HttpsCertificateOwnership.FriendlyName;
+            return copy;
+        });
 
     /// <summary>Sign the captured CSR the way an ADCS CA honoring the request would.</summary>
     private byte[] IssueFromSubmittedCsr()
@@ -194,6 +212,26 @@ public class HttpsCertificateAutoRenewalServiceTests : IDisposable
         overlay.HttpsCertificateTemplate.Should().Be("WebServer");
         overlay.CaConnectionString.Should().Be(TestCa, "the rest of the overlay must survive the swap");
         overlay.ExternalUrl.Should().Be(ExternalUrl);
+    }
+
+    [Fact]
+    public async Task CheckAsync_InsideTheWindow_KeepsTheKeysAnAdministratorAddedByHand()
+    {
+        // The one overlay writer no administrator triggers (issue #550): before the
+        // fix, a renewal on its timer took the admin group, the private range block
+        // and the webhook with it, and the next restart fell back on all three.
+        SeedCompletedSetup();
+        SeedOverlay();
+        HandEditedOverlay.AddTo(_options.SettingsOverlayPath!);
+        using var expiring = MakeCertificate(daysToExpiry: 10);
+        StoreHolds(InstalledThumbprint, expiring);
+
+        var sut = CreateService();
+        await sut.CheckAsync(CancellationToken.None);
+
+        sut.LastAttempt!.Outcome.Should().Be(HttpsCertificateRenewalOutcome.Installed);
+        ReadOverlay().HttpsCertificateThumbprint.Should().Be(RenewedThumbprint);
+        HandEditedOverlay.ShouldStillBeInForce(_options.SettingsOverlayPath!);
     }
 
     [Fact]
@@ -286,6 +324,30 @@ public class HttpsCertificateAutoRenewalServiceTests : IDisposable
             .SubmitCertificateRequestAsync(default!, default!, default);
     }
 
+    /// <summary>
+    /// Issue #470. In monitor mode the loop is not even registered, but the instance is,
+    /// because the settings API reads it: it must report itself off, and a direct call
+    /// must still not enroll, with renewal switched on in the configuration.
+    /// </summary>
+    [Fact]
+    public async Task CheckAsync_MonitorMode_ReportsOffAndDoesNotEnroll()
+    {
+        _options.HttpsCertificateAutoRenewalEnabled = true;
+        SeedCompletedSetup();
+        SeedOverlay();
+        using var expiring = MakeCertificate(daysToExpiry: 3);
+        StoreHolds(InstalledThumbprint, expiring);
+
+        var sut = CreateService(CertusInstanceMode.Monitor);
+        await sut.CheckAsync(CancellationToken.None);
+
+        sut.Enabled.Should().BeFalse();
+        sut.LastAttempt!.Outcome.Should().Be(HttpsCertificateRenewalOutcome.NotApplicable);
+        sut.LastAttempt.Message.Should().Contain("monitor mode");
+        await _client.DidNotReceiveWithAnyArgs()
+            .SubmitCertificateRequestAsync(default!, default!, default);
+    }
+
     [Fact]
     public async Task CheckAsync_MockCa_DoesNotEnroll()
     {
@@ -318,11 +380,80 @@ public class HttpsCertificateAutoRenewalServiceTests : IDisposable
             .SubmitCertificateRequestAsync(default!, default!, default);
     }
 
+    /// <summary>
+    /// Issue #535. The overlay names a certificate this service did not install: in
+    /// monitor mode the wizard offers the certificates already in the store, and the
+    /// usual pick is one Windows autoenrolment renews. After a switch to full mode the
+    /// renewal used to enrol a replacement from the first ACME template, serve it, and
+    /// leave autoenrolment renewing a certificate nothing used. Inside the window is
+    /// the case that matters, because that is where it used to act.
+    /// </summary>
+    [Fact]
+    public async Task CheckAsync_CertificateTheServiceDidNotInstall_LeavesItToWhoeverIssuedIt()
+    {
+        SeedCompletedSetup();
+        SeedOverlay(template: null);
+        using var autoenrolled = MakeCertificate(daysToExpiry: 10);
+        StoreHolds(InstalledThumbprint, autoenrolled, installedByService: false);
+
+        var sut = CreateService();
+        await sut.CheckAsync(CancellationToken.None);
+
+        sut.LastAttempt!.Outcome.Should().Be(HttpsCertificateRenewalOutcome.NotApplicable);
+        sut.LastAttempt.Message.Should().Contain(HttpsCertificateOwnership.FriendlyName,
+            "the friendly name is what an administrator can check, and change, in certlm.msc");
+        sut.LastAttempt.Message.Should().Contain("did not install");
+
+        await _client.DidNotReceiveWithAnyArgs()
+            .SubmitCertificateRequestAsync(default!, default!, default);
+        _store.DidNotReceiveWithAnyArgs().Install(default!);
+        _store.DidNotReceive().Remove(InstalledThumbprint);
+        ReadOverlay().HttpsCertificateThumbprint.Should().Be(InstalledThumbprint);
+        ReadOverlay().HttpsCertificateTemplate.Should().BeNull(
+            "nothing may be recorded against a certificate the service left alone");
+
+        // A routine "nothing to do" pass, not a failure, so no administrator alert.
+        await _notifier.DidNotReceiveWithAnyArgs()
+            .SendServerCertificateAlertAsync(default!, default);
+    }
+
+    /// <summary>
+    /// The friendly name is compared exactly, like the store's own sweep. A near miss
+    /// is somebody else's certificate, and an expired one is no exception: the renewal
+    /// replaces only what the service installed, however urgent.
+    /// </summary>
+    [Theory]
+    [InlineData("ducks in a row https")]
+    [InlineData("Ducks in a Row HTTPS ")]
+    [InlineData("")]
+    public async Task CheckAsync_FriendlyNameThatIsNotExactlyOurs_IsLeftAlone(string friendlyName)
+    {
+        SeedCompletedSetup();
+        SeedOverlay();
+        using var expired = MakeCertificate(daysToExpiry: -1);
+        _store.Find(InstalledThumbprint).Returns(_ =>
+        {
+            var copy = X509CertificateLoader.LoadCertificate(expired.RawData);
+            copy.FriendlyName = friendlyName;
+            return copy;
+        });
+
+        var sut = CreateService();
+        await sut.CheckAsync(CancellationToken.None);
+
+        sut.LastAttempt!.Outcome.Should().Be(HttpsCertificateRenewalOutcome.NotApplicable);
+        await _client.DidNotReceiveWithAnyArgs()
+            .SubmitCertificateRequestAsync(default!, default!, default);
+    }
+
     [Fact]
     public async Task CheckAsync_CertificateMissingFromTheStore_RenewsImmediately()
     {
         // The host is already on the self signed fallback; waiting for a
         // window that can never be measured would leave it there forever.
+        // Who installed it cannot be asked of a certificate that is gone, and
+        // nothing is left to take over, so the issue #535 rule does not stop
+        // this: in full mode it is the only automatic way off the fallback.
         SeedCompletedSetup();
         SeedOverlay();
         _store.Find(InstalledThumbprint).Returns((X509Certificate2?)null);
@@ -393,6 +524,54 @@ public class HttpsCertificateAutoRenewalServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task CheckAsync_Denied_TheWebhookPayloadNamesNoAccount()
+    {
+        // Issue #485. The denial names the computer account and its domain, which is
+        // the fix an administrator needs, so the alert mail keeps it: that goes to the
+        // operator's own recipients. The webhook POSTs to whatever relay the operator
+        // configured, so it carries the reason and the remedy without the account, the
+        // line issue #336 drew for the ACME wire. Driven through the real enroller and
+        // the real webhook notifier, so a change on either side of the alert record
+        // that lets the account back onto the wire fails here.
+        SeedCompletedSetup();
+        SeedOverlay();
+        using var expiring = MakeCertificate(daysToExpiry: 10);
+        StoreHolds(InstalledThumbprint, expiring);
+        _client.SubmitCertificateRequestAsync(
+                Arg.Any<string>(), Arg.Any<byte[]>(), Arg.Any<CancellationToken>())
+            .Returns(new SubmitResult(
+                0, SubmitStatus.Denied, "Denied by Policy Module", CaStatusCode.TemplateDenied));
+        ServerCertificateAlert? raised = null;
+        _notifier.SendServerCertificateAlertAsync(
+                Arg.Do<ServerCertificateAlert>(a => raised = a), Arg.Any<CancellationToken>())
+            .Returns(new AlertNotificationResult(true));
+
+        await CreateService().CheckAsync(CancellationToken.None);
+
+        var captured = new CapturedBody();
+        var webhook = new WebhookAlertNotifier(
+            Options.Create(new AlertOptions
+            {
+                Webhook = new WebhookOptions { Url = "https://hooks.example.com/alerts" },
+            }),
+            new HttpClient(new CapturingHandler(captured)),
+            NullLogger<WebhookAlertNotifier>.Instance);
+        (await webhook.SendServerCertificateAlertAsync(raised!)).Success.Should().BeTrue();
+
+        var account = TlsCertificateEnroller.DescribeServiceAccount();
+        raised!.Detail.Should().Contain(account, "the alert mail is where the operator reads the fix");
+
+        captured.Body.Should().NotContain(Environment.MachineName + "$")
+            .And.NotContain(account);
+        var payload = JsonSerializer.Deserialize<JsonElement>(captured.Body!);
+        payload.GetProperty("event").GetString().Should().Be("server.certificate.renewal_failed");
+        payload.GetProperty("detail").GetString().Should()
+            .Contain("Denied by Policy Module", "the CA's own reason may go on the wire")
+            .And.Contain("Enroll on the Security tab of the WebServer template",
+                "the remedy is still the whole value of the alert");
+    }
+
+    [Fact]
     public async Task CheckAsync_Pending_KeepsTheCurrentCertificateAndAlerts()
     {
         SeedCompletedSetup();
@@ -409,7 +588,9 @@ public class HttpsCertificateAutoRenewalServiceTests : IDisposable
         sut.LastAttempt!.Outcome.Should().Be(HttpsCertificateRenewalOutcome.Pending);
         ReadOverlay().HttpsCertificateThumbprint.Should().Be(InstalledThumbprint);
         await _notifier.Received(1).SendServerCertificateAlertAsync(
-            Arg.Any<ServerCertificateAlert>(), Arg.Any<CancellationToken>());
+            Arg.Is<ServerCertificateAlert>(a =>
+                a.WireDetail != null && a.WireDetail == a.Detail && a.WireDetail.Contains("42")),
+            Arg.Any<CancellationToken>());
     }
 
     [Fact]
@@ -439,7 +620,8 @@ public class HttpsCertificateAutoRenewalServiceTests : IDisposable
         sut.LastAttempt.Message.Should().Contain("unavailable");
         ReadOverlay().HttpsCertificateThumbprint.Should().Be(InstalledThumbprint);
         await _notifier.Received(1).SendServerCertificateAlertAsync(
-            Arg.Any<ServerCertificateAlert>(), Arg.Any<CancellationToken>());
+            Arg.Is<ServerCertificateAlert>(a => a.WireDetail != null && a.WireDetail == a.Detail),
+            Arg.Any<CancellationToken>());
     }
 
     [Fact]
@@ -469,8 +651,121 @@ public class HttpsCertificateAutoRenewalServiceTests : IDisposable
         sut.LastAttempt.Message.Should().Contain("Request Certificates",
             "the alert is read by an administrator and the remediation is its whole value");
         ReadOverlay().HttpsCertificateThumbprint.Should().Be(InstalledThumbprint);
+
+        // The message constant names the right and no account, so the webhook carries
+        // it whole (issue #485); a null here would send the remediation nowhere.
         await _notifier.Received(1).SendServerCertificateAlertAsync(
-            Arg.Any<ServerCertificateAlert>(), Arg.Any<CancellationToken>());
+            Arg.Is<ServerCertificateAlert>(a =>
+                a.WireDetail != null && a.WireDetail == a.Detail
+                && a.WireDetail.Contains("Request Certificates")),
+            Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// The colon form key issue #553 is about, added at the top level of the overlay
+    /// the way docs/hardening.md writes nested keys. Seeded beside a section that
+    /// records no template, so the file itself loads, and the renewal falls back to
+    /// the first enabled template, which it then records, setting the key twice.
+    /// </summary>
+    private void AddColonFormTemplateKey()
+    {
+        var path = _options.SettingsOverlayPath!;
+        var root = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(path))!.AsObject();
+        root["Certus:HttpsCertificateTemplate"] = "WebServer";
+        File.WriteAllText(path, root.ToJsonString());
+    }
+
+    /// <summary>
+    /// Issue #553. The record of a renewed certificate is refused by an overlay that
+    /// would then set a key twice (issue #550). The refusal used to land after the
+    /// enrolment, so every check inside the window had the CA issue a certificate and
+    /// the store install it, with nothing recording it and no alert, because the
+    /// refusal fell to the loop's general catch. It is asked first now, and comes back
+    /// as a failed pass with the alert.
+    /// </summary>
+    [Fact]
+    public async Task CheckAsync_OverlayThatWouldRefuseTheRecord_RefusesBeforeEnrollingAndAlerts()
+    {
+        SeedCompletedSetup();
+        SeedOverlay(template: null);
+        AddColonFormTemplateKey();
+        var before = File.ReadAllText(_options.SettingsOverlayPath!);
+        using var expiring = MakeCertificate(daysToExpiry: 10);
+        StoreHolds(InstalledThumbprint, expiring);
+
+        var sut = CreateService();
+        await sut.CheckAsync(CancellationToken.None);
+
+        await _client.DidNotReceiveWithAnyArgs()
+            .SubmitCertificateRequestAsync(default!, default!, default);
+        _store.DidNotReceiveWithAnyArgs().Install(default!);
+
+        sut.LastAttempt!.Outcome.Should().Be(HttpsCertificateRenewalOutcome.Failed);
+        sut.LastAttempt.Message.Should().Contain("Certus:HttpsCertificateTemplate",
+            "the alert is read by an administrator, and the key is what they have to fix");
+        sut.LastAttempt.Message.Should().Contain("Nothing was enrolled");
+        File.ReadAllText(_options.SettingsOverlayPath!).Should().Be(before);
+
+        await _notifier.Received(1).SendServerCertificateAlertAsync(
+            Arg.Is<ServerCertificateAlert>(a =>
+                a.Outcome == "Failed" && a.DaysRemaining == 9 && a.WireDetail == a.Detail),
+            Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// Issue #553, the Renew button's half: the settings page calls the same renewal,
+    /// and gets the refusal back as a failed outcome whose message it shows, with
+    /// nothing enrolled.
+    /// </summary>
+    [Fact]
+    public async Task RenewAsync_OverlayThatWouldRefuseTheRecord_RefusesBeforeEnrolling()
+    {
+        SeedCompletedSetup();
+        SeedOverlay(template: null);
+        AddColonFormTemplateKey();
+
+        using var scope = _provider.CreateScope();
+        var result = await scope.ServiceProvider.GetRequiredService<HttpsCertificateRenewalService>()
+            .RenewAsync(currentHost: ExternalHost, CancellationToken.None);
+
+        result.Outcome.Should().Be(HttpsCertificateRenewalOutcome.Failed);
+        result.Message.Should().Contain("Certus:HttpsCertificateTemplate");
+        result.Message.Should().Contain(_options.SettingsOverlayPath!);
+        result.PreviousThumbprint.Should().Be(InstalledThumbprint);
+        await _client.DidNotReceiveWithAnyArgs()
+            .SubmitCertificateRequestAsync(default!, default!, default);
+        _store.DidNotReceiveWithAnyArgs().Install(default!);
+    }
+
+    /// <summary>
+    /// What the question asked before the enrolment cannot rule out: a hand edit
+    /// landing while the renewal runs. The record is then refused after the store
+    /// installed the replacement, and that refusal reached the loop's general catch,
+    /// which records it with no alert. It alerts like the CA failures now.
+    /// </summary>
+    [Fact]
+    public async Task CheckAsync_OverlayEditedWhileRenewing_RecordsTheFailureAndAlerts()
+    {
+        SeedCompletedSetup();
+        SeedOverlay(template: null);
+        using var expiring = MakeCertificate(daysToExpiry: 10);
+        StoreHolds(InstalledThumbprint, expiring);
+        _store.Install(Arg.Any<X509Certificate2>()).Returns(_ =>
+        {
+            AddColonFormTemplateKey();
+            return RenewedThumbprint;
+        });
+
+        var sut = CreateService();
+        await sut.CheckAsync(CancellationToken.None);
+
+        sut.LastAttempt!.Outcome.Should().Be(HttpsCertificateRenewalOutcome.Failed);
+        sut.LastAttempt.Message.Should().Contain("Certus:HttpsCertificateTemplate");
+        ReadOverlay().HttpsCertificateThumbprint.Should().Be(InstalledThumbprint);
+        await _notifier.Received(1).SendServerCertificateAlertAsync(
+            Arg.Is<ServerCertificateAlert>(a =>
+                a.Outcome == "Failed" && a.WireDetail != null && a.WireDetail == a.Detail),
+            Arg.Any<CancellationToken>());
     }
 
     /// <summary>
@@ -526,6 +821,59 @@ public class HttpsCertificateAutoRenewalServiceTests : IDisposable
         _store.DidNotReceive().Remove(InstalledThumbprint);
     }
 
+    /// <summary>
+    /// The settings page's Renew button removes the certificate it superseded, because
+    /// it restarts straight away and nothing serves that certificate afterwards. That
+    /// holds for one the service installed.
+    /// </summary>
+    [Fact]
+    public void TryRemoveSuperseded_CertificateTheServiceInstalled_IsRemoved()
+    {
+        using var previous = MakeCertificate(daysToExpiry: 10);
+        StoreHolds(InstalledThumbprint, previous);
+
+        using var scope = _provider.CreateScope();
+        scope.ServiceProvider.GetRequiredService<HttpsCertificateRenewalService>()
+            .TryRemoveSuperseded(InstalledThumbprint);
+
+        _store.Received(1).Remove(InstalledThumbprint);
+    }
+
+    /// <summary>
+    /// Issue #535. Pressing Renew on a certificate somebody else installed hands its
+    /// renewal to the service, by Sean's decision of 2026-10-12, but the certificate
+    /// stays theirs. Before this the button removed it from LocalMachine\My and
+    /// deleted its private key with it.
+    /// </summary>
+    [Fact]
+    public void TryRemoveSuperseded_CertificateSomebodyElseInstalled_StaysInTheStore()
+    {
+        using var previous = MakeCertificate(daysToExpiry: 10);
+        StoreHolds(InstalledThumbprint, previous, installedByService: false);
+
+        using var scope = _provider.CreateScope();
+        scope.ServiceProvider.GetRequiredService<HttpsCertificateRenewalService>()
+            .TryRemoveSuperseded(InstalledThumbprint);
+
+        _store.DidNotReceiveWithAnyArgs().Remove(default!);
+    }
+
+    [Fact]
+    public void TryRemoveSuperseded_StoreCannotBeRead_LeavesTheCertificateAndDoesNotThrow()
+    {
+        // The overlay already names the new certificate by the time this runs, so a
+        // store failure must not stop the restart that applies it.
+        _store.Find(InstalledThumbprint).Returns<X509Certificate2?>(
+            _ => throw new CryptographicException("The store could not be opened"));
+
+        using var scope = _provider.CreateScope();
+        var act = () => scope.ServiceProvider.GetRequiredService<HttpsCertificateRenewalService>()
+            .TryRemoveSuperseded(InstalledThumbprint);
+
+        act.Should().NotThrow();
+        _store.DidNotReceiveWithAnyArgs().Remove(default!);
+    }
+
     /// <summary>Sign the request with the CA's own idea of the subject name.</summary>
     private byte[] IssueWithOverriddenName()
     {
@@ -553,5 +901,23 @@ public class HttpsCertificateAutoRenewalServiceTests : IDisposable
             DateTimeOffset.UtcNow.AddYears(2),
             serial);
         return cert.Export(X509ContentType.Cert);
+    }
+
+    private sealed class CapturedBody
+    {
+        public string? Body { get; set; }
+    }
+
+    /// <summary>Records the body a webhook POSTs and answers 200.</summary>
+    private sealed class CapturingHandler(CapturedBody captured) : HttpMessageHandler
+    {
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            captured.Body = request.Content is null
+                ? null
+                : await request.Content.ReadAsStringAsync(cancellationToken);
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK);
+        }
     }
 }

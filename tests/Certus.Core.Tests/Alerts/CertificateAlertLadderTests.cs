@@ -180,6 +180,27 @@ public class CertificateAlertLadderTests
         rung.ErrorMessage.Should().Be("SMTP host unreachable");
     }
 
+    /// <summary>
+    /// Issue #206: the rung carries which channels delivered, so the page can
+    /// say the email arrived even though the webhook failed. A row written
+    /// before the column carries null, which the page must read as unknown.
+    /// </summary>
+    [Fact]
+    public void Threshold_PartialFailure_CarriesTheDeliveredChannels()
+    {
+        var partial = Row(30, success: false, error: "Webhook returned 500");
+        partial.DeliveredChannels = "email";
+        var older = Row(14, success: false, error: "Webhook returned 500");
+
+        var history = CertificateAlertLadder.Build(
+            Certificate(daysToExpiry: 5), [partial, older], Context(), Now);
+
+        Rung(history, 30).State.Should().Be(AlertThresholdState.Failed);
+        Rung(history, 30).Channels.Should().Be("email,webhook");
+        Rung(history, 30).DeliveredChannels.Should().Be("email");
+        Rung(history, 14).DeliveredChannels.Should().BeNull();
+    }
+
     [Fact]
     public void Threshold_NotYetCrossed_ReadsAsPending()
     {

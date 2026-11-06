@@ -198,6 +198,275 @@ public class CsrHelperIdentityTests
         identity.HasOtherSanEntries.Should().BeTrue();
     }
 
+    // ── Attribute carriers and requested extensions (issue #548) ────────
+
+    [Fact]
+    public void Extract_SanUnderCertExtensions_FlagsUnexpectedAttribute()
+    {
+        // The lab Run 1 shape: a SAN under szOID_CERT_EXTENSIONS, a carrier the
+        // SAN walk never reads, so the name does not even surface, which is
+        // exactly why the attribute itself must be refused.
+        var csr = CarrierCsrBuilder.SanUnderCertExtensions("cn.example.com", "smuggled.example.com");
+
+        var identity = CsrHelper.ExtractCsrIdentity(csr);
+
+        identity.HasUnexpectedCsrAttributes.Should().BeTrue();
+        identity.DnsNames.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Extract_SanViaNameValuePair_FlagsUnexpectedAttribute()
+    {
+        var csr = CarrierCsrBuilder.SanViaNameValuePair("cn.example.com", "SAN", "dns=smuggled.example.com");
+
+        var identity = CsrHelper.ExtractCsrIdentity(csr);
+
+        identity.HasUnexpectedCsrAttributes.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Extract_SecondExtensionRequestValue_FlagsUnexpectedAttribute()
+    {
+        // The product reads only value[0], so the first name surfaces and the
+        // second is invisible; the count mismatch is what refuses the CSR.
+        var csr = CarrierCsrBuilder.SecondExtensionRequestValue(
+            "cn.example.com", "first.example.com", "smuggled.example.com");
+
+        var identity = CsrHelper.ExtractCsrIdentity(csr);
+
+        identity.HasUnexpectedCsrAttributes.Should().BeTrue();
+        identity.DnsNames.Should().Contain("first.example.com");
+        identity.DnsNames.Should().NotContain("smuggled.example.com");
+    }
+
+    [Fact]
+    public void Extract_TwoExtensionRequestAttributes_FlagsUnexpectedAttribute()
+    {
+        var csr = CarrierCsrBuilder.TwoExtensionRequestAttributes(
+            "cn.example.com", "first.example.com", "smuggled.example.com");
+
+        var identity = CsrHelper.ExtractCsrIdentity(csr);
+
+        identity.HasUnexpectedCsrAttributes.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Extract_RequestedApplicationPolicies_FlagsDisallowedExtension()
+    {
+        // The lab Run 4 shape: a SAN plus a requested Application Policies
+        // extension, which ADCS can copy into the certificate (ESC15).
+        var csr = CarrierCsrBuilder.SanPlusRequestedExtension(
+            "cn.example.com", "cn.example.com",
+            CarrierCsrBuilder.ApplicationPoliciesExtension("1.3.6.1.4.1.311.20.2.2"));
+
+        var identity = CsrHelper.ExtractCsrIdentity(csr);
+
+        identity.HasUnexpectedCsrAttributes.Should().BeFalse();
+        identity.DisallowedRequestedExtensionOid.Should().Be(CarrierCsrBuilder.ApplicationPoliciesOid);
+    }
+
+    // ── Basic constraints and the subject key identifier (issue #687) ────
+
+    [Fact]
+    public void Extract_RequestedCaCertificate_IsRefusedAndSaysSo()
+    {
+        // The guard #548 exists for: a requester must never obtain a CA
+        // certificate. Admitting cA=false must not admit this.
+        var csr = CarrierCsrBuilder.SanPlusRequestedExtension(
+            "cn.example.com", "cn.example.com",
+            CarrierCsrBuilder.BasicConstraintsExtension(isCa: true));
+
+        var identity = CsrHelper.ExtractCsrIdentity(csr);
+
+        identity.DisallowedRequestedExtensionOid.Should().Be("2.5.29.19");
+        identity.DisallowedRequestedExtensionDetail.Should().Contain("cA=true");
+    }
+
+    [Fact]
+    public void Extract_RequestedCaCertificateMarkedCritical_IsRefused()
+    {
+        var csr = CarrierCsrBuilder.SanPlusRequestedExtension(
+            "cn.example.com", "cn.example.com",
+            CarrierCsrBuilder.BasicConstraintsExtension(isCa: true, pathLen: 0, critical: true));
+
+        var identity = CsrHelper.ExtractCsrIdentity(csr);
+
+        identity.DisallowedRequestedExtensionOid.Should().Be("2.5.29.19");
+        identity.DisallowedRequestedExtensionDetail.Should().Contain("cA=true");
+    }
+
+    [Fact]
+    public void Extract_RequestedPathLengthWithoutCa_IsRefused()
+    {
+        // RFC 5280 allows a path length only with cA=true, so a request for one
+        // is not an end entity request, whatever its cA says.
+        var csr = CarrierCsrBuilder.SanPlusRequestedExtension(
+            "cn.example.com", "cn.example.com",
+            CarrierCsrBuilder.BasicConstraintsExtension(isCa: false, pathLen: 3));
+
+        var identity = CsrHelper.ExtractCsrIdentity(csr);
+
+        identity.DisallowedRequestedExtensionOid.Should().Be("2.5.29.19");
+        identity.DisallowedRequestedExtensionDetail.Should().Contain("path length");
+    }
+
+    [Fact]
+    public void Extract_RepeatedBasicConstraints_DoesNotParse()
+    {
+        // A cA=false the value check admits, then a cA=true a CA might honour.
+        // BouncyCastle refuses a repeated extension outright, and both finalize
+        // paths answer a CSR that does not parse with badCSR.
+        var csr = CarrierCsrBuilder.SanPlusRequestedExtension(
+            "cn.example.com", "cn.example.com",
+            CarrierCsrBuilder.BasicConstraintsExtension(isCa: false),
+            CarrierCsrBuilder.BasicConstraintsExtension(isCa: true));
+
+        var act = () => CsrHelper.ExtractCsrIdentity(csr);
+
+        act.Should().Throw<ArgumentException>();
+    }
+
+    [Fact]
+    public void Extract_BasicConstraintsWithAnUnknownElement_IsRefused()
+    {
+        var csr = CarrierCsrBuilder.SanPlusRequestedExtension(
+            "cn.example.com", "cn.example.com",
+            CarrierCsrBuilder.BasicConstraintsExtension(isCa: false, trailingElement: true));
+
+        var identity = CsrHelper.ExtractCsrIdentity(csr);
+
+        identity.DisallowedRequestedExtensionOid.Should().Be("2.5.29.19");
+        identity.DisallowedRequestedExtensionDetail.Should().Contain("does not decode");
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Extract_RequestedEndEntityBasicConstraints_IsAllowed(bool critical)
+    {
+        // acme.sh sends basicConstraints = CA:FALSE beside OCSP must staple.
+        var csr = CarrierCsrBuilder.SanPlusRequestedExtension(
+            "cn.example.com", "cn.example.com",
+            CarrierCsrBuilder.BasicConstraintsExtension(isCa: false, critical: critical));
+
+        var identity = CsrHelper.ExtractCsrIdentity(csr);
+
+        identity.DisallowedRequestedExtensionOid.Should().BeNull();
+        identity.DisallowedRequestedExtensionDetail.Should().BeNull();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Extract_PoshAcmeCsr_IsAllowed(bool ecKey)
+    {
+        // The issue #687 regression: Posh-ACME requests basic constraints
+        // (cA=false), key usage, the SANs and a subject key identifier on every
+        // order, RSA or EC, and #548 refused the first of them.
+        var csr = PoshAcmeCsrBuilder.Build(ecKey, ocspMustStaple: false, "test2.example.com", "www.example.com");
+
+        var identity = CsrHelper.ExtractCsrIdentity(csr);
+
+        identity.HasUnexpectedCsrAttributes.Should().BeFalse();
+        identity.HasOtherSanEntries.Should().BeFalse();
+        identity.DisallowedRequestedExtensionOid.Should().BeNull(identity.DisallowedRequestedExtensionDetail);
+        identity.DnsNames.Should().Equal("test2.example.com", "www.example.com");
+        identity.SubjectCns.Should().Equal("test2.example.com");
+    }
+
+    [Fact]
+    public void Extract_PoshAcmeCsrWithMustStaple_IsRefusedForTheTlsFeature()
+    {
+        // OCSP must staple stays refused: the TLS feature is outside the allow
+        // list, and the refusal names it rather than basic constraints.
+        var csr = PoshAcmeCsrBuilder.Build(ecKey: false, ocspMustStaple: true, "test2.example.com");
+
+        var identity = CsrHelper.ExtractCsrIdentity(csr);
+
+        identity.DisallowedRequestedExtensionOid.Should().Be("1.3.6.1.5.5.7.1.24");
+    }
+
+    [Fact]
+    public void Extract_SubjectKeyIdentifierOfTheCsrKey_IsAllowed()
+    {
+        var csr = CarrierCsrBuilder.SanPlusKeyDerivedExtension(
+            "cn.example.com", "cn.example.com",
+            subjectPublicKey => CarrierCsrBuilder.SubjectKeyIdentifierExtension(SHA1.HashData(subjectPublicKey)));
+
+        var identity = CsrHelper.ExtractCsrIdentity(csr);
+
+        identity.DisallowedRequestedExtensionOid.Should().BeNull(identity.DisallowedRequestedExtensionDetail);
+    }
+
+    [Fact]
+    public void Extract_SubjectKeyIdentifierOfAnotherKey_IsRefused()
+    {
+        // A requester may name its own key only, never borrow an identifier
+        // such as the issuing CA's.
+        var borrowed = Convert.FromHexString("0123456789ABCDEF0123456789ABCDEF01234567");
+        var csr = CarrierCsrBuilder.SanPlusRequestedExtension(
+            "cn.example.com", "cn.example.com", CarrierCsrBuilder.SubjectKeyIdentifierExtension(borrowed));
+
+        var identity = CsrHelper.ExtractCsrIdentity(csr);
+
+        identity.DisallowedRequestedExtensionOid.Should().Be("2.5.29.14");
+        identity.DisallowedRequestedExtensionDetail.Should().Contain("own public key");
+    }
+
+    [Fact]
+    public void Extract_CriticalSubjectKeyIdentifier_IsRefused()
+    {
+        var csr = CarrierCsrBuilder.SanPlusKeyDerivedExtension(
+            "cn.example.com", "cn.example.com",
+            subjectPublicKey => CarrierCsrBuilder.SubjectKeyIdentifierExtension(
+                SHA1.HashData(subjectPublicKey), critical: true));
+
+        var identity = CsrHelper.ExtractCsrIdentity(csr);
+
+        identity.DisallowedRequestedExtensionOid.Should().Be("2.5.29.14");
+        identity.DisallowedRequestedExtensionDetail.Should().Contain("critical");
+    }
+
+    [Fact]
+    public void Extract_RequestedKeyUsage_IsAllowed()
+    {
+        // cert-manager encodes key usage into the CSR by default, so a key
+        // usage request must not be refused.
+        var csr = CarrierCsrBuilder.SanPlusRequestedExtension(
+            "cn.example.com", "cn.example.com", CarrierCsrBuilder.KeyUsageExtension());
+
+        var identity = CsrHelper.ExtractCsrIdentity(csr);
+
+        identity.HasUnexpectedCsrAttributes.Should().BeFalse();
+        identity.DisallowedRequestedExtensionOid.Should().BeNull();
+        identity.DnsNames.Should().Contain("cn.example.com");
+    }
+
+    [Fact]
+    public void Extract_RequestedExtendedKeyUsage_IsAllowed()
+    {
+        var csr = CarrierCsrBuilder.SanPlusRequestedExtension(
+            "cn.example.com", "cn.example.com", CarrierCsrBuilder.ExtendedKeyUsageExtension());
+
+        var identity = CsrHelper.ExtractCsrIdentity(csr);
+
+        identity.HasUnexpectedCsrAttributes.Should().BeFalse();
+        identity.DisallowedRequestedExtensionOid.Should().BeNull();
+    }
+
+    [Fact]
+    public void Extract_CleanSanOnly_FlagsNeither()
+    {
+        // Regression: an ordinary SAN only CSR carries neither flag.
+        using var key = NewKey();
+        var csr = DeviceCsrBuilder.Build(key, "CN=cn.example.com", null, null, "cn.example.com");
+
+        var identity = CsrHelper.ExtractCsrIdentity(csr);
+
+        identity.HasUnexpectedCsrAttributes.Should().BeFalse();
+        identity.DisallowedRequestedExtensionOid.Should().BeNull();
+    }
+
     [Fact]
     public void Extract_TamperedSignature_Throws()
     {

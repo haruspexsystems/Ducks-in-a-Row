@@ -8,12 +8,17 @@
     Creates the data directory (default ProgramData\Ducks in a Row) for
     database, logs, and runtime configuration; the administrator can choose
     another location and the choice is recorded in the registry
-    Registers the DucksInARow Windows Service (auto start)
+    Registers the DucksInARow Windows Service (auto start), with service
+    recovery: restart after the first and second failures (issue #495)
+    Creates an empty, protected modules folder in the install folder and
+    records the module contract the core carries, for the paid module's
+    installer (issue #495)
 
   Build (normally via build.ps1, which supplies ProductVersion from
-  Directory.Build.props):
+  Directory.Build.props and the module contract from the contract
+  assembly's own project):
     dotnet publish src/Certus.Service -c Release -r win-x64
-    wix build installer/Certus.wxs -d ProductVersion=1.0.0.0 -o artifacts/Ducks-in-a-Row.msi -bindpath artifacts/publish
+    wix build installer/Certus.wxs -d ProductVersion=1.0.0.0 -d ModuleContractVersion=1.0 -d ModuleContractMajor=1 -o artifacts/Ducks-in-a-Row.msi -bindpath artifacts/publish
 -->
 
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
@@ -24,6 +29,22 @@
   <!-- Fallback for direct wix invocations; build.ps1 always defines it. -->
   <?ifndef ProductVersion ?>
   <?define ProductVersion = "1.0.0.0" ?>
+  <?endif ?>
+
+  <!--
+    The module contract the core carries (licence design section 14.2, issue
+    #495). build.ps1 always defines both from the AssemblyVersion of
+    src/Certus.Modules.Abstractions, the assembly ModuleHost reads its own
+    contract from, and checks the published DLL agrees. These fallbacks serve
+    only a direct wix invocation, and ModuleContractTests fails when they
+    drift from that assembly. Always major.minor: the upgrade check below
+    compares by prefix, and the paid module's installer reads the major.
+  -->
+  <?ifndef ModuleContractVersion ?>
+  <?define ModuleContractVersion = "1.0" ?>
+  <?endif ?>
+  <?ifndef ModuleContractMajor ?>
+  <?define ModuleContractMajor = "1" ?>
   <?endif ?>
 
   <Package
@@ -72,6 +93,119 @@
       governs starting it now. The service-options dialog binds its checkbox here.
     -->
     <Property Id="START_SERVICE" Value="1" Secure="yes" />
+
+    <!--
+      Monitor mode (issue #471): the service watches the CA and never issues or
+      revokes. MONITOR_ONLY=1 chooses it, from the service options dialog or
+      unattended:
+        msiexec /i Ducks-in-a-Row.msi /qn MONITOR_ONLY=1
+      The service reads the choice once at startup from the REG_SZ value Mode
+      beside DataDirectory (CertusInstanceMode, issue #470), which only a local
+      administrator can change.
+
+      Four rules, each one a way this has gone wrong elsewhere:
+
+      1. MONITOR_ONLY has no default and no RegistrySearch of its own. A
+         checkbox shows ticked for ANY value, so a remembered "full" read into
+         it would tick the box, and a remembered value would also outrank the
+         command line (AppSearch ordering, as DATAFOLDER notes above).
+      2. The remembered value is read into REMEMBERED_MODE instead, and turned
+         into MONITOR_ONLY=1 only when it says monitor (~= ignores case, as the
+         service does). The action runs once, in whichever sequence runs first,
+         so it pre-ticks the box on an upgrade but never re-ticks one the user
+         cleared, and a silent upgrade or a repair still keeps monitor mode.
+      3. The value written is always the string "monitor" or "full", never
+         absent and never a number. The service refuses a REG_DWORD, or any
+         other word, at startup (the misleading MSI Error 1920 territory).
+      4. A remembered value the service would refuse stops setup rather than
+         being overwritten with full: a server someone tried to put in monitor
+         mode must never become an issuing server silently. RegistrySearch
+         Type="raw" returns a REG_DWORD as "#1". Neither condition applies to an
+         uninstall (REMOVE=ALL, which msiexec /x, the bundle's uninstall and a
+         major upgrade's removal of the old product all set), so a bad value
+         never traps anyone with a product they cannot remove.
+    -->
+    <Property Id="MONITOR_ONLY" Secure="yes" />
+    <Property Id="REMEMBERED_MODE" Secure="yes">
+      <RegistrySearch Id="RememberedMode"
+                      Root="HKLM"
+                      Key="Software\Haruspex Systems\Ducks in a Row"
+                      Name="Mode"
+                      Type="raw" />
+    </Property>
+    <SetProperty Id="MONITOR_ONLY" Value="1" After="AppSearch" Sequence="first"
+                 Condition='NOT MONITOR_ONLY AND REMEMBERED_MODE ~= "monitor"' />
+    <!-- Private, so the command line cannot set it; the value PersistMode writes. -->
+    <Property Id="CertusModeValue" Value="full" />
+    <SetProperty Id="CertusModeValue" Value="monitor" Before="InstallInitialize" Sequence="execute"
+                 Condition='MONITOR_ONLY = "1"' />
+    <Launch Condition='REMOVE ~= "ALL" OR NOT REMEMBERED_MODE OR REMEMBERED_MODE ~= "monitor" OR REMEMBERED_MODE ~= "full"'
+            Message="The registry value Mode under HKLM\SOFTWARE\Haruspex Systems\Ducks in a Row is [REMEMBERED_MODE], which Ducks in a Row cannot use. Set it to monitor or full as a string value (REG_SZ), or delete it for full mode, then run setup again. A value that starts with # is a number (REG_DWORD), which the service does not read." />
+    <Launch Condition='REMOVE ~= "ALL" OR NOT MONITOR_ONLY OR MONITOR_ONLY = "1"'
+            Message="MONITOR_ONLY takes the value 1 for monitor mode. Leave it out for full mode; on an upgrade, leaving it out keeps the mode this server already has." />
+
+    <!--
+      The upgrade warning (licence design sections 14.2 and 14.3, issue #495).
+      An upgrade that moves the module contract to another major leaves an
+      installed paid module unable to load, so paid features go off. That must
+      never happen silently: the wizard warns first (ModuleContractDlg in
+      CertusUi.wxs), and an unattended upgrade stops unless
+      ALLOW_INCOMPATIBLE_MODULE=1 says to go ahead. Issuance never notices
+      either way.
+
+      What makes this work without a custom action:
+
+      1. INSTALLED_MODULE_CONTRACT reads the contract the installed core
+         recorded. AppSearch runs before RemoveExistingProducts (the
+         MajorUpgrade above is scheduled afterInstallInitialize), so it still
+         sees the old core's value, not the one this package writes.
+      2. INSTALLED_MODULE_MANIFEST finds any module.json one level under the
+         installed core's modules folder, whatever the module's id: the paid
+         module's installer puts its files in modules\<id>\, module.json
+         included (design section 14.1).
+      3. Every module installed by its own MSI was built for the installed
+         core's major, because that MSI's LaunchCondition requires it. So a
+         recorded contract with another major, and a module present, means the
+         module will not load after this upgrade. The trailing dot keeps a
+         contract 10.x apart from 1.x. An absent value (a fresh install, or a
+         core from before this value existed) never warns, and NOT Installed
+         keeps a repair from warning even over a planted value.
+      4. ModuleContractCrossed is private and computed in both sequences, so
+         the command line cannot set it. The override is the only public
+         switch, and it is never remembered: no default, no RegistrySearch.
+      5. The refusal passes at full UI (UILevel 5), where the page asks
+         instead, and the page's Continue sets the Secure override, so the
+         execute sequence passes whatever UILevel it sees. Setup.exe /passive
+         is reduced UI, so it is refused like a silent install. Like every
+         Launch here, both spare an uninstall.
+    -->
+    <Property Id="INSTALLED_MODULE_CONTRACT" Secure="yes">
+      <RegistrySearch Id="InstalledModuleContract"
+                      Root="HKLM"
+                      Key="Software\Haruspex Systems\Ducks in a Row"
+                      Name="ModuleContractVersion"
+                      Type="raw" />
+    </Property>
+    <Property Id="INSTALLED_MODULE_MANIFEST" Secure="yes">
+      <RegistrySearch Id="InstalledModulesRoot"
+                      Root="HKLM"
+                      Key="Software\Haruspex Systems\Ducks in a Row"
+                      Name="InstallDir"
+                      Type="directory">
+        <DirectorySearch Id="InstalledModuleManifest" Path="modules" Depth="1">
+          <FileSearch Name="module.json" />
+        </DirectorySearch>
+      </RegistrySearch>
+    </Property>
+    <!-- Private: the contract this package carries, for the page and message text. -->
+    <Property Id="CertusModuleContract" Value="$(var.ModuleContractVersion)" />
+    <SetProperty Id="ModuleContractCrossed" Value="1" After="AppSearch" Sequence="both"
+                 Condition='NOT Installed AND INSTALLED_MODULE_CONTRACT AND NOT (INSTALLED_MODULE_CONTRACT &lt;&lt; "$(var.ModuleContractMajor).") AND INSTALLED_MODULE_MANIFEST' />
+    <Property Id="ALLOW_INCOMPATIBLE_MODULE" Secure="yes" />
+    <Launch Condition='REMOVE ~= "ALL" OR NOT ModuleContractCrossed OR ALLOW_INCOMPATIBLE_MODULE = "1" OR UILevel = 5'
+            Message="The paid module installed on this server ([INSTALLED_MODULE_MANIFEST]) was built for module contract [INSTALLED_MODULE_CONTRACT], and this release carries contract [CertusModuleContract]. After this upgrade the paid module would not load, and paid features would stay off until you install the paid module built for this release. Certificate issuance and renewal are not affected. To upgrade anyway, run setup again with ALLOW_INCOMPATIBLE_MODULE=1." />
+    <Launch Condition='REMOVE ~= "ALL" OR NOT ALLOW_INCOMPATIBLE_MODULE OR ALLOW_INCOMPATIBLE_MODULE = "1"'
+            Message="ALLOW_INCOMPATIBLE_MODULE takes the value 1. Leave it out unless an upgrade must go ahead although the paid module installed on this server will not load afterwards." />
 
     <!--
       Remember the directory the user chose. Without this, a major upgrade would
@@ -130,9 +264,14 @@
     <Icon Id="DucksIcon" SourceFile="ducks.ico" />
     <Property Id="ARPPRODUCTICON" Value="DucksIcon" />
 
-    <!-- Installation directory: Program Files\Ducks in a Row -->
+    <!-- Installation directory: Program Files\Ducks in a Row. The modules
+         folder's Id is mixed case on purpose: an upper case Id is a public
+         property, and MODULESFOLDER= on the command line could then move it
+         away from where the module host looks (AppContext.BaseDirectory). -->
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="Ducks in a Row" />
+      <Directory Id="INSTALLFOLDER" Name="Ducks in a Row">
+        <Directory Id="ModulesFolder" Name="modules" />
+      </Directory>
     </StandardDirectory>
 
     <!-- Start Menu program group for the web UI shortcut -->
@@ -153,10 +292,13 @@
       <ComponentRef Id="DataDirectory" />
       <ComponentRef Id="LogsDirectory" />
       <ComponentRef Id="InstallFolderPermissions" />
+      <ComponentRef Id="ModulesDirectory" />
       <ComponentRef Id="ServiceComponent" />
       <ComponentRef Id="StartServiceControl" />
       <ComponentRef Id="PersistInstallDir" />
       <ComponentRef Id="PersistDataDir" />
+      <ComponentRef Id="PersistMode" />
+      <ComponentRef Id="PersistModuleContract" />
       <ComponentRef Id="StartMenuShortcut" />
     </Feature>
 
@@ -205,6 +347,28 @@
       </CreateFolder>
     </Component>
 
+    <!-- The modules folder the paid module installs into (licence design
+         section 14.2, issue #495). Empty on a free install; the module host
+         reads an empty folder as no module, exactly as an absent one.
+
+         It carries the install folder's SDDL as an explicit, protected DACL
+         rather than inheriting it. The MsiLockPermissionsEx row re-applies
+         the DACL and the owner to the folder itself on every install and
+         upgrade, but MSI does not re-propagate a parent's DACL to a child
+         that already exists (measured on lab 2019 for issue #489). So a
+         modules folder that was already there, or one a standard user created
+         before an install under a root they could write, still ends up owned
+         by Administrators and writable only by SYSTEM and Administrators,
+         which is what the module host's folder trust gate requires of every
+         link from the install folder down. The paid module's installer must
+         author nothing on this folder itself, only on modules\<id>\ below it:
+         MSI removes it at uninstall only when it is empty. -->
+    <Component Id="ModulesDirectory" Directory="ModulesFolder" Guid="441CCA99-C37E-4DC8-BD26-F106EA669599">
+      <CreateFolder>
+        <PermissionEx Sddl="O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)" />
+      </CreateFolder>
+    </Component>
+
     <!-- Windows Service registration (ServiceExe listed separately from harvested files) -->
     <Component Id="ServiceComponent" Directory="INSTALLFOLDER" Guid="765B4E7C-8AC3-4E41-B811-0326C86D7B21">
       <File Id="ServiceExe" Source="DucksInARow.Service.exe" KeyPath="yes" />
@@ -216,7 +380,36 @@
         Type="ownProcess"
         Start="auto"
         ErrorControl="normal"
-        Account="LocalSystem" />
+        Account="LocalSystem">
+        <!--
+          Service recovery (issue #495, licence design section 14.2). This
+          reverses the decision PR #353 recorded, that the installer sets no
+          recovery, for one reason: a paid module runs inside this process, and
+          a defect in it (a stack overflow, a fail fast, a native fault) ends
+          the process without the service reporting that it stopped. The module
+          host's journal strikes a death before its ten minute healthy mark and
+          sets that module version aside at two strikes, so exactly two
+          restarts bring the service back without the module, and certificates
+          keep flowing (the binding promise that the licence never stops them).
+
+          The third action is none, which caps the flapping #353 worried about
+          at two restarts. The failure actions flag stays off, and this custom
+          action never sets it, so a stop that reports an error code (a fault
+          found at startup, which a restart would only reach again) still
+          stays down with its reason in the log.
+
+          Never the core ServiceConfig or ServiceConfigFailureActions elements:
+          they fill the MsiServiceConfig table family, which WiX warns (1149)
+          the Windows Installer SDK documents as not working. And WiX does not
+          validate these action words: anything but restart, reboot or
+          runCommand quietly becomes none, so Test-BuildScripts.ps1 pins them.
+        -->
+        <util:ServiceConfig FirstFailureActionType="restart"
+                            SecondFailureActionType="restart"
+                            ThirdFailureActionType="none"
+                            ResetPeriodInDays="1"
+                            RestartServiceDelayInSeconds="30" />
+      </ServiceInstall>
       <ServiceControl
         Id="StartDucksService"
         Name="DucksInARow"
@@ -287,6 +480,34 @@
                Guid="8FC68C99-D255-43D0-BC69-AE90642C722F">
       <RegistryValue Root="HKLM" Key="Software\Haruspex Systems\Ducks in a Row"
                      Name="DataDirectory" Type="string" Value="[DATAFOLDER]" KeyPath="yes" />
+    </Component>
+
+    <!--
+      The instance mode the service reads at startup (issue #471; see the
+      properties above). One unconditioned component writing a formatted value,
+      rather than two components with opposite conditions: one owner of the
+      value, nothing for a condition to re-evaluate on repair, and the value is
+      always written. WriteRegistryValues runs before StartServices, so the
+      first start reads it.
+    -->
+    <Component Id="PersistMode" Directory="INSTALLFOLDER"
+               Guid="5E0B3C64-7D2A-4F19-9B8E-3A6C1D47F902">
+      <RegistryValue Root="HKLM" Key="Software\Haruspex Systems\Ducks in a Row"
+                     Name="Mode" Type="string" Value="[CertusModeValue]" KeyPath="yes" />
+    </Component>
+
+    <!--
+      The module contract this core carries (issue #495), which the paid
+      module's installer reads in its LaunchCondition and requires to have the
+      same major. One unconditioned component, as PersistMode above: always
+      written, always a string, always major.minor, and removed with the core.
+      The next upgrade reads it back as INSTALLED_MODULE_CONTRACT before
+      overwriting it.
+    -->
+    <Component Id="PersistModuleContract" Directory="INSTALLFOLDER"
+               Guid="1C3B4E97-BCE9-431D-8BF4-8A45CF5C3D9B">
+      <RegistryValue Root="HKLM" Key="Software\Haruspex Systems\Ducks in a Row"
+                     Name="ModuleContractVersion" Type="string" Value="$(var.ModuleContractVersion)" KeyPath="yes" />
     </Component>
 
     <!--

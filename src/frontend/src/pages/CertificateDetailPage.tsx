@@ -1,4 +1,4 @@
-import { useParams, Link } from 'react-router-dom';
+import { useParams, Link } from 'react-router';
 import { ArrowLeft, Copy, CheckCircle2, ShieldOff } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
@@ -139,8 +139,11 @@ export function CertificateDetailPage() {
             server refuses the revocation (the detail response and the
             revoke endpoint share one evaluator), the button renders
             disabled with the server's reason rather than hidden: the admin
-            should see the action exists and read why it is unavailable. */}
-        {issuedCertificate && !revoked && (
+            should see the action exists and read why it is unavailable.
+            Monitor mode is the exception (issue #470): there the action does
+            not exist on this server at all, so it is not shown, and the
+            badge at the top of every page says why. */}
+        {issuedCertificate && !revoked && cert.revocationBlocked !== 'monitor-mode' && (
           cert.revocationBlocked ? (
             <div className="shrink-0 max-w-xs text-right">
               <button

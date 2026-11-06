@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, CheckCircle2, Loader2, ShieldCheck } from 'lucide-react';
+import { errorText } from '@/api/client';
 import {
   fetchAllowedDomainsSettings,
   updateAllowedDomains,
@@ -79,7 +80,7 @@ export function AllowedDomainsCard() {
       setEnabledEdit(null);
       setDomainsEdit(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Saving failed');
+      setError(errorText(err, 'Saving failed'));
     } finally {
       setSaving(false);
     }

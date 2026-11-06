@@ -100,13 +100,33 @@ public class TemplateNameStartupReportTests : IDisposable
     private async Task<RecordingLogger> RunAsync(
         string[]? enabledTemplates,
         IAdcsClient client,
-        AcmeOptions? acmeOptions = null)
+        AcmeOptions? acmeOptions = null,
+        CertusInstanceMode? mode = null)
     {
         var (templates, enabled) = Build(enabledTemplates, client, acmeOptions);
         var logger = new RecordingLogger();
 
-        await TemplateNameStartupReport.LogAsync(templates, enabled, logger);
+        await TemplateNameStartupReport.LogAsync(
+            templates, enabled, mode ?? CertusInstanceMode.Full, logger);
         return logger;
+    }
+
+    [Fact]
+    public async Task MonitorMode_SaysNothing_AndAsksTheCaNothing()
+    {
+        // Monitor mode exposes no template over ACME, so a dirty exposed name
+        // that would warn in full mode is nobody's problem there (issue #532),
+        // and the CA is not asked for its list at all.
+        var client = Substitute.For<IAdcsClient>();
+        client.GetTemplatesAsync(Arg.Any<CancellationToken>()).Returns(new[]
+        {
+            new TemplateInfo("WebServer", With(SoftHyphen, "Web", " Server"), "1.2.3"),
+        });
+
+        var logger = await RunAsync(new[] { "WebServer" }, client, mode: CertusInstanceMode.Monitor);
+
+        logger.Warnings.Should().BeEmpty();
+        await client.DidNotReceiveWithAnyArgs().GetTemplatesAsync(default);
     }
 
     [Fact]

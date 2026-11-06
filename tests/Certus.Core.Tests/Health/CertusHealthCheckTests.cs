@@ -1,4 +1,5 @@
 using Certus.Core.Adcs;
+using Certus.Core.Configuration;
 using Certus.Core.Data;
 using Certus.Core.Health;
 using Microsoft.Data.Sqlite;
@@ -6,6 +7,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using NSubstitute;
 
 namespace Certus.Core.Tests.Health;
@@ -32,10 +34,82 @@ public class CertusHealthCheckTests : IDisposable
             .Returns(new CaInfo("TestCA", "ca.test.com", "Test CA", true));
     }
 
-    private CertusHealthCheck CreateCheck(CaHealthCache? caHealthCache = null)
+    /// <summary>
+    /// A monitor whose probe answers a fixed number, so the dev box's real disk
+    /// never decides a test. Null stands for a volume that cannot be read.
+    /// </summary>
+    internal static DataFolderFreeSpaceMonitor FreeSpace(long? freeBytes = 50L * 1024 * 1024 * 1024, long thresholdMegabytes = 1024) =>
+        new(Path.GetTempPath(),
+            Options.Create(new CertusOptions { FreeSpaceWarningMegabytes = thresholdMegabytes }),
+            NullLogger<DataFolderFreeSpaceMonitor>.Instance,
+            probe: _ => freeBytes);
+
+    private CertusHealthCheck CreateCheck(CaHealthCache? caHealthCache = null, DataFolderFreeSpaceMonitor? freeSpace = null)
     {
         return new CertusHealthCheck(
-            _db, _mockClient, caHealthCache ?? new CaHealthCache(), NullLogger<CertusHealthCheck>.Instance);
+            _db, _mockClient, caHealthCache ?? new CaHealthCache(), freeSpace ?? FreeSpace(),
+            NullLogger<CertusHealthCheck>.Instance);
+    }
+
+    [Fact]
+    public async Task CheckHealth_DataFolderVolumeLow_ReturnsDegradedWithTheReason()
+    {
+        var check = CreateCheck(freeSpace: FreeSpace(freeBytes: 100L * 1024 * 1024, thresholdMegabytes: 1024));
+
+        var result = await check.CheckHealthAsync(new HealthCheckContext());
+
+        result.Status.Should().Be(HealthStatus.Degraded);
+        result.Description.Should().Be("Free space on the data folder's volume is low");
+        result.Data["dataFolderFreeSpace"].Should().Be("100 MB free, below the 1024 MB warning threshold");
+    }
+
+    [Fact]
+    public async Task CheckHealth_DataFolderVolumeFine_ReportsTheNumberAndStaysHealthy()
+    {
+        var check = CreateCheck(freeSpace: FreeSpace(freeBytes: 2048L * 1024 * 1024, thresholdMegabytes: 1024));
+
+        var result = await check.CheckHealthAsync(new HealthCheckContext());
+
+        result.Status.Should().Be(HealthStatus.Healthy);
+        result.Data["dataFolderFreeSpace"].Should().Be("2048 MB free");
+    }
+
+    [Fact]
+    public async Task CheckHealth_DataFolderVolumeUnreadable_IsNotDegraded()
+    {
+        // A failed read says nothing about the disk; degrading on it would send
+        // an operator looking for space that is there.
+        var check = CreateCheck(freeSpace: FreeSpace(freeBytes: null));
+
+        var result = await check.CheckHealthAsync(new HealthCheckContext());
+
+        result.Status.Should().Be(HealthStatus.Healthy);
+        result.Data["dataFolderFreeSpace"].Should().Be("unknown");
+    }
+
+    [Fact]
+    public async Task CheckHealth_CaDownAndVolumeLow_TheCaReasonWins_AndTheDiskIsStillInTheData()
+    {
+        _mockClient.GetCaInfoAsync(Arg.Any<CancellationToken>())
+            .Returns(new CaInfo("TestCA", "ca.test.com", null, false));
+        var check = CreateCheck(freeSpace: FreeSpace(freeBytes: 0, thresholdMegabytes: 1024));
+
+        var result = await check.CheckHealthAsync(new HealthCheckContext());
+
+        result.Status.Should().Be(HealthStatus.Degraded);
+        result.Description.Should().Be("CA is not accessible");
+        result.Data["dataFolderFreeSpace"].Should().BeOfType<string>().Which.Should().Contain("below");
+    }
+
+    [Fact]
+    public async Task CheckHealth_DatabaseDownAndVolumeLow_IsUnhealthy()
+    {
+        _db.Dispose();
+        var check = CreateCheck(freeSpace: FreeSpace(freeBytes: 0));
+
+        var result = await check.CheckHealthAsync(new HealthCheckContext());
+
+        result.Status.Should().Be(HealthStatus.Unhealthy);
     }
 
     [Fact]
@@ -107,7 +181,7 @@ public class CertusHealthCheckTests : IDisposable
                 CaAccessDeniedException.ConnectPermissionMessage, new UnauthorizedAccessException()));
         var logger = Substitute.For<ILogger<CertusHealthCheck>>();
 
-        var check = new CertusHealthCheck(_db, _mockClient, new CaHealthCache(), logger);
+        var check = new CertusHealthCheck(_db, _mockClient, new CaHealthCache(), FreeSpace(), logger);
 
         var result = await check.CheckHealthAsync(new HealthCheckContext());
 

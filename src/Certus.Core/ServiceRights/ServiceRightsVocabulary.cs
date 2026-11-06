@@ -63,7 +63,10 @@ public enum RightNeededFor
     /// <summary>The certificate inventory the dashboard shows.</summary>
     Inventory = 2,
 
-    /// <summary>Revoking from the dashboard or through ACME revoke-cert.</summary>
+    /// <summary>
+    /// Revoking from the dashboard, through ACME revoke-cert, or automatically when the finalize
+    /// check refuses an issued certificate.
+    /// </summary>
     Revocation = 4,
 
     /// <summary>Watching the CA's revocation lists.</summary>
@@ -94,6 +97,12 @@ public enum RightsGroup
 /// </summary>
 public static class ServiceRightsWire
 {
+    /// <summary>
+    /// The <c>notNeeded</c> value on a row whose right monitor mode never uses (issue
+    /// #470). A reason rather than a flag, so another mode could say why on its own terms.
+    /// </summary>
+    public const string NotNeededInMonitorMode = "monitorMode";
+
     public static string Status(RightsStatus status) => status switch
     {
         RightsStatus.Proven => "proven",

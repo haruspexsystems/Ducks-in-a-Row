@@ -12,12 +12,21 @@ namespace Certus.Web;
 /// two copies staying identical.
 ///
 /// The keyring lives in a "keys" folder next to the database so a data
-/// directory backup carries it, and on Windows the keyring itself is DPAPI
-/// protected (machine scope). Restoring the data directory onto a different
-/// machine therefore cannot decrypt stored EAB secrets; the recovery is
-/// regenerating each credential's secret from the dashboard (the key id and
-/// its configuration survive as plaintext columns). Integration tests replace
-/// the provider with the ephemeral one, so nothing touches the disk there.
+/// directory backup carries it. The Windows service keeps the database in the
+/// data directory and refuses to start otherwise (DataFolderPlacement, issue
+/// #506), so in production the keyring sits under the data directory's lock;
+/// that lock is its only protection, since nothing checks a key file before it
+/// is loaded. On Windows the keyring itself is DPAPI protected under the
+/// account the service runs as: ProtectKeysWithDpapi() without the machine
+/// scope argument, so the key files decrypt only for that account on that
+/// machine (issue #635 corrected the documentation, which said machine scope).
+/// Restoring the data directory onto a different machine, or running the
+/// service as another account, therefore cannot decrypt the stored EAB secrets
+/// or the saved SMTP password; the recovery is regenerating each credential's
+/// secret from the dashboard (the key id and its configuration survive as
+/// plaintext columns) and entering the SMTP password again. Integration tests
+/// replace the provider with the ephemeral one, so nothing touches the disk
+/// there.
 /// </summary>
 public static class CertusDataProtectionExtensions
 {
@@ -26,9 +35,11 @@ public static class CertusDataProtectionExtensions
 
     /// <summary>
     /// Registers Data Protection with the shared keyring plus the
-    /// <see cref="ISecretProtector"/> the EAB credential store encrypts with.
-    /// Call with the manually bound, normalized options copy (the same one
-    /// the connection string is built from).
+    /// <see cref="ISecretProtector"/> the EAB credential store encrypts with
+    /// and the <see cref="ISmtpSecretProtector"/> the alerts card saves the
+    /// SMTP password with, each under its own purpose (issue #635). Call with
+    /// the manually bound, normalized options copy (the same one the
+    /// connection string is built from).
     /// </summary>
     public static IServiceCollection AddCertusSecretProtection(
         this IServiceCollection services, CertusOptions certusOptions)
@@ -42,6 +53,7 @@ public static class CertusDataProtectionExtensions
             dataProtection.ProtectKeysWithDpapi();
 
         services.AddSingleton<ISecretProtector, DataProtectionSecretProtector>();
+        services.AddSingleton<ISmtpSecretProtector, SmtpPasswordProtector>();
         return services;
     }
 

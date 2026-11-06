@@ -19,6 +19,9 @@ namespace Certus.Core.Alerts;
 /// fire the whole threshold ladder for a certificate the product renews for
 /// itself. <see cref="HttpsCertificateAutoRenewalService"/> owns it, and
 /// speaks up on these same channels only when its renewal actually fails.
+/// The exclusion holds only while that service is active (issue #470): with
+/// automatic renewal turned off, or in monitor mode, nothing renews the
+/// certificate, so it gets the same ladder as every other one.
 /// </summary>
 public sealed class ExpiryMonitorService : BackgroundService
 {
@@ -145,13 +148,15 @@ public sealed class ExpiryMonitorService : BackgroundService
                 .OrderBy(c => c.NotAfter)
                 .ToListAsync(cancellationToken);
 
-            // Drop the server's own certificate. Filtered here rather than in
+            // Drop the server's own certificate while automatic renewal owns
+            // it, and only then (issue #470). Filtered here rather than in
             // the query because matching a CA database serial against an X509
             // one needs SerialNumbers.Normalize, which SQLite cannot run. No
             // AlertsSent row is written for a suppressed certificate, so if it
-            // ever stops being ours the normal ladder still fires.
+            // ever stops being ours, or renewal is turned off, the normal
+            // ladder still fires.
             var suppressed = expiringCerts
-                .RemoveAll(c => _serverCertificate.IsOwnCertificate(c.SerialNumber));
+                .RemoveAll(c => _serverCertificate.IsSuppressedFromAlerts(c.SerialNumber));
             if (suppressed > 0)
             {
                 _logger.LogDebug(
@@ -178,29 +183,40 @@ public sealed class ExpiryMonitorService : BackgroundService
 
             var batch = new ExpiryAlertBatch(thresholdDays, certInfos);
 
-            // Send via all enabled channels
+            // Send via all enabled channels, keeping each channel's own outcome
+            // (issue #206), so a webhook that failed beside an email that arrived
+            // does not read as nobody having been told.
             var channels = new List<string>();
-            var allSuccess = true;
-            string? lastError = null;
+            var delivered = new List<string>();
+            var failures = new List<(string Channel, string? Error)>();
 
             foreach (var notifier in enabledNotifiers)
             {
                 var result = await notifier.SendExpiryAlertAsync(batch, cancellationToken);
                 channels.Add(notifier.Channel);
 
-                if (!result.Success)
+                if (result.Success)
                 {
-                    allSuccess = false;
-                    lastError = result.ErrorMessage;
+                    delivered.Add(notifier.Channel);
+                }
+                else
+                {
+                    // The notifiers redact their own failure text, and this is the
+                    // second pass on the way to the database (issue #635): a row
+                    // outlives every later change to what a notifier reports, and
+                    // the database travels with every backup.
+                    failures.Add((notifier.Channel, AlertErrorRedactor.Redact(result.ErrorMessage, _options)));
                 }
             }
 
+            var errorMessage = DescribeFailures(failures);
+
             // Record the alert as sent for every certificate in the batch, whether the
             // send succeeded or failed. A recorded row permanently suppresses this
-            // certificate and threshold: the query above does not filter on Success, so a
-            // failed alert is never retried (intentional, to avoid repeat notifications).
-            // Success, Channels, and ErrorMessage are aggregated across all channels, so if
-            // one channel fails the row is marked failed even when another channel delivered.
+            // certificate and threshold on every channel: the query above does not
+            // filter on Success, so a failed channel is never retried (intentional, to
+            // avoid repeat notifications). Success is true only when every channel
+            // delivered; DeliveredChannels says which ones did when it is false.
             foreach (var cert in expiringCerts)
             {
                 db.AlertsSent.Add(new AlertSent
@@ -209,8 +225,9 @@ public sealed class ExpiryMonitorService : BackgroundService
                     ThresholdDays = thresholdDays,
                     SentAt = DateTime.UtcNow,
                     Channels = string.Join(",", channels),
-                    Success = allSuccess,
-                    ErrorMessage = lastError,
+                    DeliveredChannels = string.Join(",", delivered),
+                    Success = failures.Count == 0,
+                    ErrorMessage = errorMessage,
                 });
             }
 
@@ -219,5 +236,31 @@ public sealed class ExpiryMonitorService : BackgroundService
             // on the next run.
             await db.SaveChangesAsync(cancellationToken);
         }
+    }
+
+    /// <summary>
+    /// The stored error for one batch: null when every channel delivered, the
+    /// error alone when one channel failed (the row's channel columns already
+    /// say which), and one line per channel, named, when more than one did.
+    ///
+    /// Bounded here because SQLite does not enforce the column width. Each
+    /// line gets an equal share of it, so a long first error cannot push the
+    /// last channel's error out of the row.
+    /// </summary>
+    internal static string? DescribeFailures(IReadOnlyList<(string Channel, string? Error)> failures)
+    {
+        if (failures.Count == 0)
+            return null;
+
+        if (failures.Count == 1)
+            return AlertErrorRedactor.Truncate(failures[0].Error, AlertErrorRedactor.MaxStoredLength);
+
+        // Less one for each line break.
+        var share = (AlertErrorRedactor.MaxStoredLength - (failures.Count - 1)) / failures.Count;
+        var lines = failures.Select(f => AlertErrorRedactor.Truncate(
+            string.IsNullOrEmpty(f.Error) ? $"{f.Channel}: failed" : $"{f.Channel}: {f.Error}",
+            share));
+
+        return string.Join("\n", lines);
     }
 }

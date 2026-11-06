@@ -52,6 +52,10 @@ public sealed class CertusOptions
     /// Path to the SQLite database file.
     /// Defaults to ducks.db in the effective data directory
     /// (%ProgramData%\Ducks in a Row unless the installer chose another).
+    /// The Windows service refuses to start with the database anywhere but the
+    /// data directory, because the status file and the Data Protection keyring
+    /// follow it into whatever folder it names (<see cref="DataFolderPlacement"/>,
+    /// issue #506). Other folders are for the development host and the tests.
     /// </summary>
     public string DatabasePath { get; set; } = CertusPaths.DefaultDatabasePath;
 
@@ -78,8 +82,10 @@ public sealed class CertusOptions
     /// <summary>
     /// Where the setup wizard persists the settings overlay. Null means the
     /// default (<see cref="CertusPaths.SettingsOverlayPath"/> in the data
-    /// directory) — which is where the service host loads it from, so leave
-    /// this unset in production. Tests redirect it to keep runs hermetic.
+    /// directory), which is where the service host loads it from. The Windows
+    /// service refuses any other value (<see cref="DataFolderPlacement"/>), since
+    /// saves would land in a file it never reads. The development host and the
+    /// tests redirect it to keep runs hermetic.
     /// </summary>
     public string? SettingsOverlayPath { get; set; }
 
@@ -142,6 +148,17 @@ public sealed class CertusOptions
     public int SyncIntervalMinutes { get; set; } = 5;
 
     /// <summary>
+    /// The free space, in megabytes, on the volume holding the data folder
+    /// below which the health check reports degraded and the service logs a
+    /// warning (issue #632). The database, its write ahead log and the log
+    /// files all live there, and a full volume turns every write into an
+    /// error with no warning first. Nothing is deleted automatically. Set to
+    /// 0 to turn the check off. Absent from appsettings.json on purpose, so
+    /// this initializer really is the default.
+    /// </summary>
+    public long FreeSpaceWarningMegabytes { get; set; } = 1024;
+
+    /// <summary>
     /// How far back the certificate sync reaches for pending, denied, and
     /// failed requests, in days. Issued and revoked certificates are always
     /// synced in full; only these three request dispositions are bounded,
@@ -173,13 +190,6 @@ public sealed class CertusOptions
     /// never stops the service. Read <c>SQLite journal mode</c> in the startup
     /// log for what the database actually is, rather than inferring it from this
     /// setting: the log line reports the mode the database itself reports.
-    ///
-    /// Moving the data directory to a share needs the conversion to happen
-    /// first, while the database is still somewhere WAL works. A database
-    /// already in WAL mode will not open on a filesystem that cannot support
-    /// WAL, so there is no start on which this option could convert it. The
-    /// order is: set this to false, restart, confirm the logged mode is
-    /// <c>delete</c>, stop the service, move the data directory, start.
     ///
     /// The off state is <c>delete</c> specifically, which is SQLite's own
     /// default, so a converted database is indistinguishable from one created

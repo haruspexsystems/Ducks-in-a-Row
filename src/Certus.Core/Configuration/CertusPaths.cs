@@ -34,6 +34,13 @@ public static class CertusPaths
     public const string DataDirectoryValueName = "DataDirectory";
 
     /// <summary>
+    /// The registry value under <see cref="InstallerRegistryKey"/> holding the instance
+    /// mode, <c>monitor</c> or <c>full</c> (issue #470). Read by
+    /// <see cref="CertusInstanceMode"/>, which explains why nothing else may supply it.
+    /// </summary>
+    public const string ModeValueName = "Mode";
+
+    /// <summary>
     /// The file name of the runtime settings overlay written by the setup
     /// wizard into the data directory.
     /// </summary>

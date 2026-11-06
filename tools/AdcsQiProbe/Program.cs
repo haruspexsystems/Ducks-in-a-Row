@@ -588,6 +588,257 @@ internal static class ColumnProbe
             object cutoff = DateTime.UtcNow.AddDays(-30);
             view.SetRestriction(resolvedIdx, SeekGreaterOrEqual, SortNone, cutoff);
         }, resultColumns: Columns.Where(c => c != "ResolvedWhen").ToArray());
+
+        RunRequestIdPairs(caConfig);
+    }
+
+    // Issue #367. The sync registers RawCertificate on its one wide view, so the
+    // blob crosses from the CA for every row on every tick. The proposed fix is
+    // two views: the cheap columns first, then RawCertificate only for the rows
+    // that need it, one view restricted to a RequestID each. ApplyRestrictions
+    // always sets a Disposition equality, so that second view would carry a
+    // RequestID restriction stacked on a Disposition one, a pair no lab run has
+    // proved. A pair the CA silently ignores half of looks like a working one
+    // when the id happens to be issued, so every pair below is set up to tell
+    // the three outcomes apart: both honoured, RequestID ignored (the whole
+    // issued set comes back), Disposition ignored (a row of another disposition
+    // comes back). The RequestID alone control is the shape GetRequestStatusAsync
+    // already ships, so it shows the id is visible to this account at all.
+    const int DbDispositionRevoked = 21; // DbDisposition.Revoked
+
+    static readonly int[] OtherDispositions =
+        [DbDispositionRevoked, DbDispositionDenied, DbDispositionPending, DbDispositionError];
+
+    static void RunRequestIdPairs(string caConfig)
+    {
+        Console.WriteLine();
+        Console.WriteLine("  === RequestID plus Disposition pairs (issue #367) ===");
+
+        var issued = ReadRows(caConfig, "ids: Disposition=20 (Issued)",
+            v => Restrict(v, "Disposition", SeekEqual, DbDispositionIssued));
+        if (issued is null || issued.Count < 2)
+        {
+            Console.WriteLine("    VERDICT #367: NOT RUN. Needs at least two issued rows; seed the lab CA and re-run.");
+            return;
+        }
+        bool issuedCapped = issued.Count >= RowCountCap;
+
+        // An id that exists but is not issued. Without one the pair test below
+        // cannot tell a working pair from one that ignores Disposition.
+        (int Id, int Disposition)? other = null;
+        foreach (var disposition in OtherDispositions)
+        {
+            var rows = ReadRows(caConfig, $"ids: Disposition={disposition}",
+                v => Restrict(v, "Disposition", SeekEqual, disposition), printRows: 0);
+            if (rows is { Count: > 0 })
+            {
+                other = rows[0];
+                break;
+            }
+        }
+
+        int known = issued[0].Id;
+        var verdicts = new List<(string Pair, bool? Honoured)>();
+
+        // The RequestID equality alone, the shape GetRequestStatusAsync ships.
+        var alone = ReadRows(caConfig, $"RequestID={known} alone (control)",
+            v => Restrict(v, "RequestID", SeekEqual, known));
+        verdicts.Add(("RequestID= alone", alone is null ? null : IsExactly(alone, known, DbDispositionIssued)));
+
+        // The per row fetch in the proposed design, in the order ApplyRestrictions
+        // would set it (Disposition first), with RawCertificate registered as the
+        // second view would register it.
+        var pairEq = ReadRows(caConfig, $"Disposition=20 AND RequestID={known}", v =>
+        {
+            Restrict(v, "Disposition", SeekEqual, DbDispositionIssued);
+            Restrict(v, "RequestID", SeekEqual, known);
+        }, withRawCertificate: true);
+        verdicts.Add(("Disposition= AND RequestID= (issued id)",
+            pairEq is null ? null : IsExactly(pairEq, known, DbDispositionIssued)));
+
+        // The same pair set the other way round, in case the CA treats the
+        // second restriction differently from the first.
+        var pairEqReversed = ReadRows(caConfig, $"RequestID={known} AND Disposition=20 (reverse order)", v =>
+        {
+            Restrict(v, "RequestID", SeekEqual, known);
+            Restrict(v, "Disposition", SeekEqual, DbDispositionIssued);
+        });
+        verdicts.Add(("RequestID= AND Disposition= (reverse order)",
+            pairEqReversed is null ? null : IsExactly(pairEqReversed, known, DbDispositionIssued)));
+
+        if (other is { } o)
+        {
+            var otherAlone = ReadRows(caConfig, $"RequestID={o.Id} alone (control, Disposition {o.Disposition})",
+                v => Restrict(v, "RequestID", SeekEqual, o.Id));
+            verdicts.Add(("RequestID= alone (other id)",
+                otherAlone is null ? null : IsExactly(otherAlone, o.Id, o.Disposition)));
+
+            // The discriminating pass: honoured returns nothing, RequestID
+            // ignored returns the issued set, Disposition ignored returns the
+            // other row.
+            var pairMismatch = ReadRows(caConfig, $"Disposition=20 AND RequestID={o.Id} (id outside the Disposition set)", v =>
+            {
+                Restrict(v, "Disposition", SeekEqual, DbDispositionIssued);
+                Restrict(v, "RequestID", SeekEqual, o.Id);
+            });
+            if (pairMismatch is { Count: > 0 })
+                Console.WriteLine(pairMismatch.Any(r => r.Id == o.Id)
+                    ? "    The other row came back: the Disposition restriction was ignored."
+                    : "    Issued rows came back: the RequestID restriction was ignored.");
+            verdicts.Add(("Disposition= AND RequestID= (non issued id)",
+                pairMismatch is null ? null : pairMismatch.Count == 0));
+        }
+        else
+        {
+            Console.WriteLine("    No row of another disposition exists, so the pair cannot be told apart from");
+            Console.WriteLine("    one that ignores Disposition. Revoke one certificate (New-LabCaSeed.ps1) and re-run.");
+            verdicts.Add(("Disposition= AND RequestID= (non issued id)", null));
+        }
+
+        // GreaterOrEqual, the shape a "rows newer than the last captured id"
+        // pass would use. The cut is the middle issued id, so a working pair
+        // returns a strict, non empty subset of the issued set.
+        int cut = issued.Select(r => r.Id).OrderBy(i => i).ElementAt(issued.Count / 2);
+        var pairGe = ReadRows(caConfig, $"Disposition=20 AND RequestID>={cut}", v =>
+        {
+            Restrict(v, "Disposition", SeekEqual, DbDispositionIssued);
+            Restrict(v, "RequestID", SeekGreaterOrEqual, cut);
+        });
+        bool? geHonoured = null;
+        if (pairGe is not null)
+        {
+            bool shapeHolds = pairGe.Count > 0
+                && pairGe.All(r => r.Id >= cut && r.Disposition == DbDispositionIssued);
+            if (issuedCapped)
+            {
+                Console.WriteLine($"    The issued set hit the {RowCountCap} row cap, so only the row shape is checked.");
+                geHonoured = shapeHolds;
+            }
+            else
+            {
+                var expected = issued.Where(r => r.Id >= cut).Select(r => r.Id).OrderBy(i => i).ToList();
+                var actual = pairGe.Select(r => r.Id).OrderBy(i => i).ToList();
+                Console.WriteLine($"    Expected {expected.Count} of {issued.Count} issued rows (computed client side), got {actual.Count}.");
+                geHonoured = shapeHolds && expected.SequenceEqual(actual);
+            }
+        }
+        verdicts.Add(("Disposition= AND RequestID>=", geHonoured));
+
+        Console.WriteLine();
+        foreach (var (pair, honoured) in verdicts)
+            Console.WriteLine($"    VERDICT #367: {pair,-46} {(honoured switch { true => "HONOURED", false => "NOT HONOURED", null => "UNDETERMINED" })}");
+    }
+
+    static void Restrict(dynamic view, string column, int seek, int value)
+    {
+        int idx = (int)view.GetColumnIndex(SchemaColumn, column);
+        object boxed = value;
+        view.SetRestriction(idx, seek, SortNone, boxed);
+    }
+
+    static bool IsExactly(List<(int Id, int Disposition)> rows, int id, int disposition) =>
+        rows.Count == 1 && rows[0].Id == id && rows[0].Disposition == disposition;
+
+    /// <summary>
+    /// Opens a fresh CertView with RequestID and Disposition registered (and
+    /// RawCertificate when asked), applies the restriction, and returns every
+    /// row's id and disposition up to the cap, or null when the CA refused the
+    /// restriction or the view. Prints the first few rows so the transcript
+    /// shows what the pair returned rather than only a count.
+    /// </summary>
+    static List<(int Id, int Disposition)>? ReadRows(
+        string caConfig, string label, Action<dynamic> restrict,
+        bool withRawCertificate = false, int printRows = 5)
+    {
+        Console.WriteLine();
+        Console.WriteLine($"  --- Pass: {label} ---");
+
+        object? raw = null;
+        object? rowEnum = null;
+        try
+        {
+            raw = Activator.CreateInstance(Type.GetTypeFromCLSID(CertViewClsid)!);
+            dynamic view = raw!;
+            view.OpenConnection(caConfig);
+
+            string[] columns = withRawCertificate
+                ? ["RequestID", "Disposition", "SerialNumber", "RawCertificate"]
+                : ["RequestID", "Disposition"];
+            view.SetResultColumnCount(columns.Length);
+            foreach (var col in columns)
+                view.SetResultColumn((int)view.GetColumnIndex(SchemaColumn, col));
+
+            try
+            {
+                restrict(view);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"    SetRestriction failed: {ex.GetType().Name} 0x{Marshal.GetHRForException(ex):X8} {ex.Message}");
+                return null;
+            }
+
+            rowEnum = view.OpenView();
+            dynamic e = rowEnum!;
+            var rows = new List<(int Id, int Disposition)>();
+            while (rows.Count < RowCountCap && (int)e.Next() != -1)
+            {
+                int id = -1, disposition = -1;
+                string? certReport = null;
+                object? colEnumObj = null;
+                try
+                {
+                    colEnumObj = e.EnumCertViewColumn();
+                    dynamic colEnum = colEnumObj!;
+                    while ((int)colEnum.Next() != -1)
+                    {
+                        // GetName returns "Request.RequestID" and
+                        // "Request.Disposition", so match on the suffix.
+                        string name = (string)colEnum.GetName();
+                        if (name.EndsWith("RequestID", StringComparison.OrdinalIgnoreCase))
+                            id = colEnum.GetValue(EncodingBinary) is int i ? i : -1;
+                        else if (name.EndsWith("Disposition", StringComparison.OrdinalIgnoreCase))
+                            disposition = colEnum.GetValue(EncodingBinary) is int d ? d : -1;
+                        else if (name.EndsWith("RawCertificate", StringComparison.OrdinalIgnoreCase))
+                            certReport = DescribeGetValue(colEnum, EncodingBase64, checkBase64: true);
+                    }
+                }
+                finally
+                {
+                    if (colEnumObj != null && Marshal.IsComObject(colEnumObj))
+                        Marshal.FinalReleaseComObject(colEnumObj);
+                }
+
+                if (rows.Count < printRows)
+                    Console.WriteLine($"    Row {rows.Count + 1}: RequestID={id} Disposition={disposition}"
+                        + (certReport is null ? "" : $" RawCertificate(Base64) -> {certReport}"));
+
+                // A value that is not an Int32 is a read failure, not a
+                // restriction failure, so the verdict says UNDETERMINED rather
+                // than NOT HONOURED.
+                if (id == -1 || disposition == -1)
+                {
+                    Console.WriteLine("    RequestID or Disposition did not read back as Int32; this pass proves nothing.");
+                    return null;
+                }
+                rows.Add((id, disposition));
+            }
+
+            Console.WriteLine(rows.Count >= RowCountCap
+                ? $"    Rows in this pass: {RowCountCap}+ (stopped counting at the cap)"
+                : $"    Rows in this pass: {rows.Count}");
+            return rows;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"    FAIL - {ex.GetType().Name}: 0x{Marshal.GetHRForException(ex):X8} {ex.Message}");
+            return null;
+        }
+        finally
+        {
+            if (rowEnum != null && Marshal.IsComObject(rowEnum)) Marshal.FinalReleaseComObject(rowEnum);
+            if (raw != null && Marshal.IsComObject(raw)) Marshal.FinalReleaseComObject(raw);
+        }
     }
 
     /// <summary>

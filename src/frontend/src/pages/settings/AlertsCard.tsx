@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useEffect, useRef, useState } from 'react';
+import { Link, useLocation } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
@@ -10,6 +10,7 @@ import {
   Send,
   XCircle,
 } from 'lucide-react';
+import { errorText } from '@/api/client';
 import {
   ALERT_FIELDS,
   applyAlertConfig,
@@ -26,6 +27,7 @@ import {
 } from '@/api/alerts';
 import { alertConfigKey } from '@/hooks/useExpiryWarningDays';
 import { AlertOutcomeBadge } from '@/components/AlertHistoryEntry';
+import { describeChannelOutcome } from '@/lib/alerts';
 import { formatDateTime } from '@/types';
 
 /** How many recorded alerts the card shows. The backend clamps take to 1..200. */
@@ -80,6 +82,20 @@ export function AlertsCard() {
     staleTime: 5 * 60 * 1000,
     retry: false,
   });
+
+  // The monitor mode alert banner and the wizard's "Set up alerts" link here
+  // (issue #471). Scroll once the card has its content, or the jump lands on a
+  // spinner whose height then changes under it. Once per navigation rather than
+  // once per mount: following the banner's link while already on this page is a
+  // new navigation with the same hash, and has to scroll too.
+  const location = useLocation();
+  const cardRef = useRef<HTMLDivElement>(null);
+  const scrolledFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (location.hash !== '#alerts' || scrolledFor.current === location.key || isLoading) return;
+    scrolledFor.current = location.key;
+    cardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, [location.hash, location.key, isLoading]);
 
   const { data: history, isError: historyError } = useQuery({
     queryKey: ['alerts', 'history', { skip: 0, take: HISTORY_PAGE_SIZE }],
@@ -162,7 +178,7 @@ export function AlertsCard() {
       // above into re-seeding the form from the values still running.
       queryClient.setQueryData(alertConfigKey, result.config);
     } catch (err) {
-      setProblems([err instanceof Error ? err.message : 'The settings could not be saved.']);
+      setProblems([errorText(err, 'The settings could not be saved.')]);
     } finally {
       setSaving(false);
     }
@@ -203,9 +219,7 @@ export function AlertsCard() {
         );
       }
     } catch (err) {
-      setRestartMessage(
-        err instanceof Error ? err.message : 'The restart could not be requested.',
-      );
+      setRestartMessage(errorText(err, 'The restart could not be requested.'));
     } finally {
       setRestarting(false);
     }
@@ -255,7 +269,7 @@ export function AlertsCard() {
       // Deliberately no invalidateQueries here. A test send writes nothing, and
       // refetching the history would imply a row might appear.
     } catch (err) {
-      setTestError(err instanceof Error ? err.message : 'The test could not be sent.');
+      setTestError(errorText(err, 'The test could not be sent.'));
     } finally {
       setSending(false);
     }
@@ -266,7 +280,11 @@ export function AlertsCard() {
   const anyChannel = emailEnabled || webhookEnabled;
 
   return (
-    <div className="bg-surface border border-hairline rounded-lg p-6 space-y-4">
+    <div
+      id="alerts"
+      ref={cardRef}
+      className="bg-surface border border-hairline rounded-lg p-6 space-y-4 scroll-mt-4"
+    >
       <div className="flex items-center gap-2">
         <BellRing className="h-4 w-4 text-certus-600" />
         <h3 className="text-sm font-semibold text-ink">Alerts</h3>
@@ -662,7 +680,9 @@ export function AlertsCard() {
                 above, email is tested with the values in the form, saved or not,
                 so a typed relay, port or credential can be proven before a restart;
                 with the host blank, the test uses the settings the service is
-                running on. The webhook always uses the running settings.
+                running on. The stored password is only ever sent to the relay it
+                was saved for: to test a different host, port or TLS mode, type the
+                password for it. The webhook always uses the running settings.
               </p>
               <button
                 onClick={handleTest}
@@ -723,42 +743,45 @@ export function AlertsCard() {
               </p>
             ) : (
               <ul className="divide-y divide-hairline-soft border border-hairline rounded-lg">
-                {history.items.map((item) => (
-                  <li key={item.id} className="px-4 py-3">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <Link
-                        to={`/certificates/${item.certificateId}`}
-                        className="text-sm font-medium text-certus-700 dark:text-certus-300 hover:underline break-all"
-                      >
-                        {item.subject}
-                      </Link>
-                      <AlertOutcomeBadge state={item.success ? 'sent' : 'failed'} />
-                      <span className="text-xs text-muted">
-                        {item.thresholdDays} day warning
-                      </span>
-                    </div>
-                    <p className="text-sm text-ink-mid mt-1">
-                      {item.success ? 'Sent' : 'Failed'} {formatDateTime(item.sentAt)}.{' '}
-                      {/* "Attempted", not "delivered": the row records which
-                          notifiers ran, not which of them the recipient heard from. */}
-                      Attempted over {item.channels.split(',').filter(Boolean).join(', ')}.
-                    </p>
-                    {!item.success && (
-                      <>
-                        {item.errorMessage && (
-                          <p className="text-sm text-red-700 dark:text-red-300 mt-1 break-words whitespace-pre-line">
-                            {item.errorMessage}
-                          </p>
-                        )}
-                        <p className="text-sm text-red-700 dark:text-red-300 mt-1">
-                          At least one channel failed. Ducks does not retry a
-                          threshold it has already recorded, so this warning will
-                          not be sent again.
-                        </p>
-                      </>
-                    )}
-                  </li>
-                ))}
+                {history.items.map((item) => {
+                  const delivery = describeChannelOutcome(item);
+                  return (
+                    <li key={item.id} className="px-4 py-3">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Link
+                          to={`/certificates/${item.certificateId}`}
+                          className="text-sm font-medium text-certus-700 dark:text-certus-300 hover:underline break-all"
+                        >
+                          {item.subject}
+                        </Link>
+                        <AlertOutcomeBadge
+                          state={item.success ? 'sent' : 'failed'}
+                          partial={delivery.partial}
+                        />
+                        <span className="text-xs text-muted">
+                          {item.thresholdDays} day warning
+                        </span>
+                      </div>
+                      <p className="text-sm text-ink-mid mt-1">
+                        {delivery.verb} {formatDateTime(item.sentAt)}. {delivery.channels}
+                      </p>
+                      {!item.success && (
+                        <>
+                          {item.errorMessage && (
+                            <p className="text-sm text-red-700 dark:text-red-300 mt-1 break-words whitespace-pre-line">
+                              {item.errorMessage}
+                            </p>
+                          )}
+                          {delivery.failure && (
+                            <p className="text-sm text-red-700 dark:text-red-300 mt-1">
+                              {delivery.failure}
+                            </p>
+                          )}
+                        </>
+                      )}
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </div>

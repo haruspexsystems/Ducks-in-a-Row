@@ -18,8 +18,9 @@ namespace Certus.Web.Controllers.Dashboard;
 /// Until issue #402 the base sat on the .app domain of the same name. That
 /// domain was never ours, and an unrelated business registered it on
 /// 2026-09-07, so every type the 0.9.0 and 0.10.0 betas emit points at a
-/// stranger's site. NoLabArtefactsTests refuses the old domain anywhere in
-/// what ships, which is why it is not spelled out here.
+/// stranger's site. NoLabArtefactsTests refuses the old domain in every
+/// shipped file outside tests/ and tools/, which is why it is not spelled out
+/// here.
 ///
 /// The ACME surface does not use these. It answers with the RFC 8555 section
 /// 6.7 URNs in AcmeErrorType.
@@ -35,6 +36,13 @@ public static class DashboardProblemType
     public const string CertificateNotRevocable = Prefix + "certificate-not-revocable";
     public const string CertificateUnavailable = Prefix + "certificate-unavailable";
     public const string InvalidRevocationReason = Prefix + "invalid-revocation-reason";
+
+    /// <summary>
+    /// The server runs in monitor mode and never writes to its CA (issue #470). Also the
+    /// page the dashboard's monitor mode badge links to.
+    /// </summary>
+    public const string MonitorMode = Prefix + "monitor-mode";
+
     public const string RevocationBlockedByGuardrail = Prefix + "revocation-blocked-by-guardrail";
     public const string RevocationOutOfScope = Prefix + "revocation-out-of-scope";
     public const string RevocationTargetMismatch = Prefix + "revocation-target-mismatch";

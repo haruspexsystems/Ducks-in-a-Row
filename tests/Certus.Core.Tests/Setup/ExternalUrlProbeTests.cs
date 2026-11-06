@@ -1,7 +1,9 @@
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Text;
+using Certus.Core.Configuration;
 using Certus.Core.Setup;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -22,7 +24,26 @@ public class ExternalUrlProbeTests
         {
             Timeout = timeout ?? TimeSpan.FromSeconds(30),
         };
-        return new ExternalUrlProbe(client, NullLogger<ExternalUrlProbe>.Instance);
+        return new ExternalUrlProbe(client, CertusInstanceMode.Full, NullLogger<ExternalUrlProbe>.Instance);
+    }
+
+    [Fact]
+    public void CertificateWarning_InFullMode_NamesAcmeClients()
+    {
+        ExternalUrlProbe.DescribeCertificateWarning(
+                "certus.contoso.com:5001", SslPolicyErrors.RemoteCertificateChainErrors, monitorMode: false)
+            .Should().Contain("ACME clients will need to trust");
+    }
+
+    [Fact]
+    public void CertificateWarning_InMonitorMode_NamesTheBrowserAndNotAcme()
+    {
+        // Monitor mode serves no ACME directory (issue #532).
+        var warning = ExternalUrlProbe.DescribeCertificateWarning(
+            "certus.contoso.com:5001", SslPolicyErrors.RemoteCertificateChainErrors, monitorMode: true);
+
+        warning.Should().Contain("Browsers opening the dashboard");
+        warning.Should().NotContain("ACME");
     }
 
     [Fact]

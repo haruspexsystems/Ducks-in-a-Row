@@ -1,9 +1,12 @@
+using System.Text.Json;
 using Certus.Core.Acme.Services;
 using Certus.Core.Adcs;
 using Certus.Core.Configuration;
 using Certus.Core.ServiceRights;
 using Certus.Core.Setup;
+using Certus.Web.Audit;
 using Certus.Web.Authentication;
+using Certus.Web.Controllers.Dashboard;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
@@ -31,7 +34,18 @@ public sealed class SetupController : ControllerBase
     private readonly IHttpsCertificateStore _certificateStore;
     private readonly ServiceRightsCheck _serviceRightsCheck;
     private readonly IConfiguration _configuration;
+    private readonly CertusInstanceMode _instanceMode;
     private readonly ILogger<SetupController> _logger;
+
+    /// <summary>
+    /// Why a reopened wizard is open: a server that finished setup in monitor
+    /// mode was switched to full and has no template yet (issue #471).
+    /// </summary>
+    internal const string ReopenReasonIssuanceEnabled = "issuanceEnabled";
+
+    internal const string MonitorModeRecordsNoTemplate =
+        "This server runs in monitor mode, so setup records no certificate template. " +
+        "Remove the templates from the request.";
 
     public SetupController(
         SetupService setupService,
@@ -40,6 +54,7 @@ public sealed class SetupController : ControllerBase
         IHttpsCertificateStore certificateStore,
         ServiceRightsCheck serviceRightsCheck,
         IConfiguration configuration,
+        CertusInstanceMode instanceMode,
         ILogger<SetupController> logger)
     {
         _setupService = setupService;
@@ -48,6 +63,7 @@ public sealed class SetupController : ControllerBase
         _certificateStore = certificateStore;
         _serviceRightsCheck = serviceRightsCheck;
         _configuration = configuration;
+        _instanceMode = instanceMode;
         _logger = logger;
     }
 
@@ -80,14 +96,22 @@ public sealed class SetupController : ControllerBase
     /// enrolled TLS certificate ride along so a reopened wizard (cross origin
     /// continue link, F5 during the mid wizard restart) resumes where it was
     /// instead of starting over at Welcome.
+    ///
+    /// The instance mode rides along too (issue #471), because the wizard has a
+    /// different shape in monitor mode and must know which before it renders a
+    /// step. A full mode server that finished setup in monitor mode reopens at
+    /// the Templates step, and <c>reopenReason</c> says why.
     /// </summary>
     [HttpGet("config")]
     public IActionResult GetConfig()
     {
         var status = _setupService.GetStatus();
+        var awaitsTemplateChoice = _setupService.AwaitsTemplateChoice(status);
         return Ok(new
         {
             setupCompleted = _setupService.IsSetupEffectivelyComplete(),
+            mode = _instanceMode.WireName,
+            reopenReason = awaitsTemplateChoice ? ReopenReasonIssuanceEnabled : null,
             wizardCompleted = status.SetupCompleted,
             caMode = _setupService.CaMode,
             completedAt = status.CompletedAt,
@@ -98,7 +122,13 @@ public sealed class SetupController : ControllerBase
             allowedDomainsEnabled = status.AllowedDomainsEnabled,
             allowedDomains = status.AllowedDomains,
             suggestedAllowedDomain = AdDomainSuggestion.Get(),
-            wizardStep = status.SetupCompleted ? null : status.WizardStep,
+            // The recorded mode, "off" for an install upgraded from before the
+            // field, and the fresh install default (required) when nothing was
+            // ever recorded (issue #631).
+            eabEnforcement = _setupService.EabEnforcementPrefill(),
+            wizardStep = awaitsTemplateChoice ? "templates"
+                : status.SetupCompleted ? null
+                : status.WizardStep,
             tlsCertificate = DescribeConfiguredTlsCertificate(),
         });
     }
@@ -145,7 +175,9 @@ public sealed class SetupController : ControllerBase
     /// risk, but the lock stands either way.
     /// </summary>
     [HttpPost("draft")]
-    public IActionResult SaveDraft([FromBody] SaveWizardDraftRequest request)
+    [AdminAudit("setup.draft.saved")]
+    public async Task<IActionResult> SaveDraft(
+        [FromBody] SaveWizardDraftRequest request, CancellationToken ct)
     {
         if (_setupService.IsSetupEffectivelyComplete())
             return Conflict(new { error = "Setup already completed" });
@@ -161,6 +193,12 @@ public sealed class SetupController : ControllerBase
                 return BadRequest(new { error = draftError });
         }
 
+        // Which is also why monitor mode refuses one outright (issue #471): a
+        // template drafted on a monitor mode server would go live for ACME the
+        // moment the server is switched to full, without anyone choosing it there.
+        if (_instanceMode.IsMonitor && request.EnabledTemplates is { Count: > 0 })
+            return BadRequest(new { error = MonitorModeRecordsNoTemplate });
+
         // A draft records the CA the wizard will later be completed against, and
         // every CA call logs that string verbatim, so the draft is a second
         // writer to it exactly as it is to the template set (issue #220). A
@@ -168,14 +206,24 @@ public sealed class SetupController : ControllerBase
         if (!AdcsCaConnectionString.TryValidate(request.CaConnectionString, out var draftCaError))
             return BadRequest(new { error = draftCaError });
 
-        _setupService.SaveWizardDraft(
-            new SetupConfiguration(
-                CaConnectionString: request.CaConnectionString ?? string.Empty,
-                EnabledTemplates: request.EnabledTemplates ?? new List<string>(),
-                ExternalUrl: request.ExternalUrl ?? string.Empty,
-                AllowedDomainsEnabled: request.AllowedDomainsEnabled,
-                AllowedDomains: request.AllowedDomains),
-            request.WizardStep);
+        // A draft writes the same eabEnforcement field completion does, and
+        // EabEnforcementPolicy reads it whatever SetupCompleted says, so it is
+        // parsed as strictly here as at completion.
+        if (!TryParseEabChoice(request.EabEnforcement, out var draftEab, out var draftEabError))
+            return BadRequest(new { error = draftEabError });
+
+        var draft = new SetupConfiguration(
+            CaConnectionString: request.CaConnectionString ?? string.Empty,
+            EnabledTemplates: request.EnabledTemplates ?? new List<string>(),
+            ExternalUrl: request.ExternalUrl ?? string.Empty,
+            AllowedDomainsEnabled: request.AllowedDomainsEnabled,
+            AllowedDomains: request.AllowedDomains,
+            EabEnforcement: draftEab);
+
+        // The audit row before the file write (issue #634).
+        await this.AdminAudit().RecordBeforeFileWriteAsync(
+            $"wizard step {request.WizardStep ?? "(none)"}", null, DescribeSetup(draft), ct);
+        _setupService.SaveWizardDraft(draft, request.WizardStep);
 
         return Ok(new { saved = true });
     }
@@ -196,6 +244,7 @@ public sealed class SetupController : ControllerBase
     /// POST /api/setup/test-connection — test connectivity to a candidate CA.
     /// </summary>
     [HttpPost("test-connection")]
+    [AdminAuditExempt("asks the candidate CA whether it answers and changes nothing")]
     public async Task<IActionResult> TestConnection(
         [FromBody] TestConnectionRequest request, CancellationToken ct)
     {
@@ -216,6 +265,7 @@ public sealed class SetupController : ControllerBase
     /// on the Review step.
     /// </summary>
     [HttpPost("service-rights")]
+    [AdminAuditExempt("reads the service account's rights at the candidate CA and changes nothing")]
     public async Task<IActionResult> CheckServiceRights(
         [FromBody] ServiceRightsRequest request, CancellationToken ct)
     {
@@ -234,7 +284,7 @@ public sealed class SetupController : ControllerBase
         }
 
         var report = await _serviceRightsCheck.RunAsync(request.CaConnectionString, templates, ct);
-        return Ok(report.ToWire());
+        return Ok(report.ToWire(_instanceMode));
     }
 
     /// <summary>
@@ -247,6 +297,7 @@ public sealed class SetupController : ControllerBase
     /// because the candidate CA travels in the body, like test-connection.
     /// </summary>
     [HttpPost("templates")]
+    [AdminAuditExempt("lists the candidate CA's templates; a POST only because it carries the connection string")]
     public async Task<IActionResult> GetTemplates(
         [FromBody] TestConnectionRequest request, CancellationToken ct)
     {
@@ -264,6 +315,14 @@ public sealed class SetupController : ControllerBase
         {
             _logger.LogWarning(ex, "Setup templates: the CA is unavailable");
             return StatusCode(503, new { error = true, message = "The certificate authority is unavailable. Try again shortly." });
+        }
+        catch (CaAccessDeniedException ex)
+        {
+            // Above the general arm, which would otherwise answer a missing right
+            // with "failed to retrieve templates" and no remedy (issue #476). The
+            // message is carried in full, as the TLS enrollment arm below does.
+            _logger.LogError(ex, "Setup templates: the CA denied access");
+            return StatusCode(503, new { error = true, message = ex.Message });
         }
         catch (Exception ex)
         {
@@ -284,6 +343,7 @@ public sealed class SetupController : ControllerBase
     /// update endpoint probes.
     /// </summary>
     [HttpPost("validate-url")]
+    [AdminAuditExempt("probes the external URL and changes nothing")]
     public async Task<IActionResult> ValidateUrl(
         [FromBody] ValidateUrlRequest request, CancellationToken ct)
     {
@@ -313,6 +373,7 @@ public sealed class SetupController : ControllerBase
     /// can be legitimately unreachable from the server itself.
     /// </summary>
     [HttpPost("complete")]
+    [AdminAudit("setup.completed")]
     public async Task<IActionResult> CompleteSetup(
         [FromBody] CompleteSetupRequest request, CancellationToken ct)
     {
@@ -322,8 +383,20 @@ public sealed class SetupController : ControllerBase
         if (string.IsNullOrWhiteSpace(request.ExternalUrl))
             return BadRequest(new { error = "External URL is required" });
 
-        if (request.EnabledTemplates == null || request.EnabledTemplates.Count == 0)
+        // Monitor mode never issues, so its setup completes without a template,
+        // and refuses one (issue #471): a recorded template would be exposed over
+        // ACME the moment the server is switched to full, without anyone having
+        // chosen it in full mode. Recording none instead is what reopens the
+        // wizard at the Templates step after that switch.
+        if (_instanceMode.IsMonitor)
+        {
+            if (request.EnabledTemplates is { Count: > 0 })
+                return BadRequest(new { error = MonitorModeRecordsNoTemplate });
+        }
+        else if (request.EnabledTemplates == null || request.EnabledTemplates.Count == 0)
+        {
             return BadRequest(new { error = "At least one template must be enabled" });
+        }
 
         // The recorded set is what the ACME template policy matches against and
         // where the webserver certificate renewal reads its template from, so
@@ -347,8 +420,55 @@ public sealed class SetupController : ControllerBase
         if (!AdcsCaConnectionString.TryValidate(request.CaConnectionString, out var caError))
             return BadRequest(new { error = caError });
 
+        if (!TryParseEabChoice(request.EabEnforcement, out var eabEnforcement, out var eabError))
+            return BadRequest(new { error = eabError });
+
+        // Record the CA's own name for each template, not whichever of the two
+        // forms the browser sent (issue #271). Every consumer that submits to the
+        // CA resolves again anyway (PR #270); this is what makes the dashboard and
+        // the settings page show one form. It runs before the URL probe, so an
+        // unpublished template or a CA outage is answered before the five second
+        // probe and its confirmation loop. The mock CA has no published list.
+        var enabledTemplates = request.EnabledTemplates ?? [];
+        if (enabledTemplates.Count > 0 && _setupService.CaMode != "mock")
+        {
+            try
+            {
+                var resolved = await _setupService.ResolvePublishedTemplateNamesAsync(
+                    request.CaConnectionString!, enabledTemplates, ct);
+                if (resolved.Any(name => name is null))
+                {
+                    // The name is not echoed: it is request body text, and the
+                    // wizard only ever offers names the CA published a moment ago.
+                    return BadRequest(new
+                    {
+                        error = "A selected certificate template is not published by the CA. " +
+                                "Pick the templates again from the template list.",
+                    });
+                }
+
+                enabledTemplates = resolved.Select(name => name!).ToList();
+            }
+            catch (CaUnavailableException ex)
+            {
+                // A string error, unlike the TLS endpoints' { error: true, message }:
+                // completeSetup() in the wizard shows body.error as the reason.
+                _logger.LogWarning(ex, "Setup completion: the CA is unavailable");
+                return StatusCode(503, new { error = "The certificate authority is unavailable. Try again shortly." });
+            }
+            catch (CaAccessDeniedException ex)
+            {
+                _logger.LogError(ex, "Setup completion: the CA denied access");
+                return StatusCode(503, new { error = ex.Message });
+            }
+        }
+
+        // The display name and the programmatic name of one template resolve to
+        // the same name, which is recorded once.
+        enabledTemplates = enabledTemplates.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
         var validation = await _setupService.ValidateExternalUrlAsync(
-            request.ExternalUrl, request.EnabledTemplates[0], ct);
+            request.ExternalUrl, enabledTemplates.FirstOrDefault(), ct);
 
         if (!validation.Valid)
             return BadRequest(new { error = validation.ErrorMessage ?? "External URL is invalid" });
@@ -387,12 +507,29 @@ public sealed class SetupController : ControllerBase
 
         var config = new SetupConfiguration(
             CaConnectionString: request.CaConnectionString ?? string.Empty,
-            EnabledTemplates: request.EnabledTemplates,
+            EnabledTemplates: enabledTemplates,
             ExternalUrl: request.ExternalUrl,
             AllowedDomainsEnabled: request.AllowedDomainsEnabled,
-            AllowedDomains: allowedDomains);
+            AllowedDomains: allowedDomains,
+            EabEnforcement: eabEnforcement);
 
-        var status = _setupService.CompleteSetup(config);
+        // CompleteSetup writes the overlay first, so a refusal there leaves the
+        // wizard exactly where it was (issue #553). Before this arm it was a bare
+        // 500 from the wizard's last step, and since issue #550 a valid file can
+        // cause it: a top level "Certus:ExternalUrl" or "Certus:CaConnectionString".
+        // The audit row before the file writes (issue #634).
+        await this.AdminAudit().RecordBeforeFileWriteAsync(
+            "setup", null, DescribeSetup(config, _setupService.EabEnforcementAtCompletion(config)), ct);
+
+        SetupStatus status;
+        try
+        {
+            status = _setupService.CompleteSetup(config);
+        }
+        catch (JsonException ex)
+        {
+            return OverlayUnreadable(ex);
+        }
 
         var restartScheduled = _serviceRestarter.TryScheduleRestart();
         return Ok(new
@@ -420,6 +557,7 @@ public sealed class SetupController : ControllerBase
     /// every ACME order as the same computer account this enrollment uses.
     /// </summary>
     [HttpPost("tls-certificate")]
+    [AdminAudit("setup.https-certificate.enrolment-requested")]
     public async Task<IActionResult> ProvisionTlsCertificate(
         [FromBody] ProvisionTlsCertificateRequest request, CancellationToken ct)
     {
@@ -456,6 +594,33 @@ public sealed class SetupController : ControllerBase
                 });
             }
 
+            // Refuse before enrolling, never after (issue #553). The apply step below
+            // records the thumbprint and template in settings.json, and the overlay
+            // refuses a record that would set a key twice: a key it writes also
+            // written by hand in the colon form at the top level. Found there, the CA
+            // had already issued and the store installed a certificate nothing names,
+            // one more on every click. A failed outcome, as the CA's own refusals are,
+            // because that is the shape the wizard shows the message of.
+            try
+            {
+                _setupService.EnsureHttpsCertificateCanBeRecorded(templateName);
+            }
+            catch (SettingsOverlayConflictException ex)
+            {
+                _logger.LogWarning(ex,
+                    "TLS certificate enrollment: refused before enrolling, because the settings " +
+                    "overlay could not record the certificate");
+                return Ok(new
+                {
+                    outcome = "failed",
+                    message = ex.Message + " Nothing was enrolled, so no certificate was issued or installed.",
+                });
+            }
+            catch (JsonException ex)
+            {
+                return OverlayUnreadable(ex);
+            }
+
             var result = await _tlsEnroller.EnrollAsync(
                 request.CaConnectionString,
                 templateName,
@@ -465,6 +630,11 @@ public sealed class SetupController : ControllerBase
 
             if (result.Status != TlsEnrollmentStatus.Installed)
             {
+                // A 200 that installed nothing (issue #634): the CA's answer is
+                // the record, and the row says so rather than claiming an enrolment.
+                this.AdminAudit().Describe(
+                    $"template {templateName}",
+                    after: $"enrolment requested, CA answered {result.Status.ToString().ToLowerInvariant()}: {result.Message}");
                 return Ok(new
                 {
                     outcome = result.Status switch
@@ -484,6 +654,9 @@ public sealed class SetupController : ControllerBase
                 // certificate does not cover the external URL host, so every
                 // ACME client would fail TLS. The wizard shows what was
                 // issued and asks for an explicit decision.
+                this.AdminAudit().Describe(
+                    $"template {templateName}",
+                    after: $"enrolled {result.Thumbprint} into the store; it does not cover the external URL host, so it awaits a decision");
                 return Ok(new
                 {
                     outcome = "sanMismatch",
@@ -493,9 +666,9 @@ public sealed class SetupController : ControllerBase
                 });
             }
 
-            return Ok(ApplyEnrolledCertificate(
+            return ApplyEnrolledCertificate(
                 request.CaConnectionString, templateName, request.ExternalUrl,
-                result.Thumbprint!, result.CurrentHostCovered));
+                result.Thumbprint!, result.CurrentHostCovered);
         }
         catch (CaUnavailableException ex)
         {
@@ -522,6 +695,7 @@ public sealed class SetupController : ControllerBase
     /// that is already installed in the store.
     /// </summary>
     [HttpPost("tls-certificate/apply")]
+    [AdminAudit("setup.https-certificate.applied")]
     public async Task<IActionResult> ApplyTlsCertificate(
         [FromBody] ApplyTlsCertificateRequest request, CancellationToken ct)
     {
@@ -572,13 +746,21 @@ public sealed class SetupController : ControllerBase
             _logger.LogWarning(ex, "TLS certificate apply: the CA is unavailable");
             return StatusCode(503, new { error = true, message = "The certificate authority is unavailable. Try again shortly." });
         }
+        catch (CaAccessDeniedException ex)
+        {
+            // The resolution reads the template list, which the CA can refuse
+            // (issue #476). Without this arm the refusal faulted to a bare 500,
+            // where the enrollment endpoint above already answers it like this.
+            _logger.LogError(ex, "TLS certificate apply: the CA denied access");
+            return StatusCode(503, new { error = true, message = ex.Message });
+        }
 
         var currentHostCovered = TlsCertificateEnroller.CoversHost(
             TlsCertificateEnroller.GetSubjectNames(certificate), Request.Host.Host);
 
-        return Ok(ApplyEnrolledCertificate(
+        return ApplyEnrolledCertificate(
             request.CaConnectionString, templateName, request.ExternalUrl,
-            request.Thumbprint, currentHostCovered));
+            request.Thumbprint, currentHostCovered);
     }
 
     /// <summary>
@@ -588,6 +770,7 @@ public sealed class SetupController : ControllerBase
     /// certificate does).
     /// </summary>
     [HttpPost("tls-certificate/discard")]
+    [AdminAudit("setup.https-certificate.discarded")]
     public IActionResult DiscardTlsCertificate([FromBody] DiscardTlsCertificateRequest request)
     {
         var guard = GuardTlsProvisioning();
@@ -598,17 +781,266 @@ public sealed class SetupController : ControllerBase
             return BadRequest(new { error = "Thumbprint is required" });
 
         var removed = _certificateStore.Remove(request.Thumbprint);
+        this.AdminAudit().Describe(
+            $"certificate {request.Thumbprint}",
+            after: removed ? "removed from LocalMachine\\My" : "was not in LocalMachine\\My");
         return Ok(new { removed });
     }
 
     /// <summary>
-    /// Common refusals for the TLS provisioning endpoints: the mock CA
-    /// cannot issue a real certificate (and the demo probe never surfaces
-    /// the offer), and after setup the wizard endpoints are locked (SEC-G1)
-    /// — certificate changes then belong to the settings page.
+    /// GET /api/setup/existing-certificates — the certificates already in
+    /// LocalMachine\My the service could serve HTTPS with, for the monitor mode
+    /// wizard (issue #471). Monitor mode never enrols the server's own certificate,
+    /// so an existing one is how it gets a trusted one. Rows covering the external
+    /// URL's host come first. Only eligible certificates are listed (see
+    /// <see cref="MachineCertificateChoices.IsEligible"/>).
+    /// </summary>
+    [HttpGet("existing-certificates")]
+    public IActionResult ListExistingCertificates([FromQuery] string? externalUrl)
+    {
+        var guard = GuardExistingCertificates();
+        if (guard is not null)
+            return guard;
+
+        var urlValidation = _setupService.ValidateExternalUrl(externalUrl ?? string.Empty);
+        if (!urlValidation.Valid)
+            return BadRequest(new { error = urlValidation.ErrorMessage ?? "External URL is invalid" });
+
+        var externalHost = new Uri(externalUrl!, UriKind.Absolute).Host;
+        var configuredThumbprint = ReadConfiguredThumbprint();
+
+        var certificates = _certificateStore.ListCertificates();
+        try
+        {
+            return Ok(new
+            {
+                externalHost,
+                configuredThumbprint,
+                certificates = MachineCertificateChoices.Describe(
+                    certificates, externalHost, configuredThumbprint, DateTimeOffset.UtcNow),
+            });
+        }
+        finally
+        {
+            foreach (var certificate in certificates)
+                certificate.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// POST /api/setup/existing-certificates/use — pin the service to a
+    /// certificate already in LocalMachine\My and restart to serve it, in monitor
+    /// mode (issue #471). Eligibility is decided again here, on the server, rather
+    /// than trusted from the list the browser saw: a certificate the service could
+    /// not use would stop it binding HTTPS after the restart. A certificate that
+    /// does not cover the external URL's host needs an explicit confirmation, the
+    /// same decision the full mode SAN mismatch path asks for.
+    /// </summary>
+    [HttpPost("existing-certificates/use")]
+    [AdminAudit("setup.https-certificate.chosen")]
+    public IActionResult UseExistingCertificate([FromBody] UseExistingCertificateRequest request)
+    {
+        var guard = GuardExistingCertificates();
+        if (guard is not null)
+            return guard;
+
+        // The draft written below records this CA, and every CA call logs it
+        // verbatim (issue #220).
+        if (!AdcsCaConnectionString.TryValidate(request.CaConnectionString, out var caError))
+            return BadRequest(new { error = caError });
+
+        var urlValidation = _setupService.ValidateExternalUrl(request.ExternalUrl ?? string.Empty);
+        if (!urlValidation.Valid)
+            return BadRequest(new { error = urlValidation.ErrorMessage ?? "External URL is invalid" });
+
+        if (string.IsNullOrWhiteSpace(request.Thumbprint))
+            return BadRequest(new { error = "Thumbprint is required" });
+
+        var wanted = HttpsCertificateFollow.NormalizeThumbprint(request.Thumbprint);
+        var now = DateTimeOffset.UtcNow;
+        var certificates = _certificateStore.ListCertificates();
+        try
+        {
+            var chosen = certificates.FirstOrDefault(c =>
+                string.Equals(HttpsCertificateFollow.NormalizeThumbprint(c.Thumbprint), wanted, StringComparison.Ordinal)
+                && MachineCertificateChoices.IsEligible(c, now));
+            if (chosen is null)
+            {
+                return NotFound(new
+                {
+                    error = "No certificate the service can serve HTTPS with has that thumbprint " +
+                            "in LocalMachine\\My. Pick one from the list.",
+                });
+            }
+
+            var names = TlsCertificateEnroller.GetSubjectNames(chosen);
+            var externalHost = new Uri(request.ExternalUrl!, UriKind.Absolute).Host;
+            if (!TlsCertificateEnroller.CoversHost(names, externalHost) && !request.AcceptNameMismatch)
+            {
+                return UnprocessableEntity(new
+                {
+                    reason = "nameMismatch",
+                    externalHost,
+                    names,
+                });
+            }
+
+            return ApplyRecordedCertificate(
+                request.CaConnectionString ?? string.Empty,
+                [],
+                request.ExternalUrl!,
+                chosen.Thumbprint,
+                templateName: null,
+                TlsCertificateEnroller.CoversHost(names, Request.Host.Host));
+        }
+        finally
+        {
+            foreach (var certificate in certificates)
+                certificate.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// POST /api/setup/existing-certificates/keep-self-signed — the monitor mode
+    /// wizard's "keep the self signed certificate" choice (issue #471). Nothing to
+    /// do unless an earlier pick recorded a thumbprint; then it is cleared and the
+    /// service restarts to serve the self signed certificate again.
+    /// </summary>
+    [HttpPost("existing-certificates/keep-self-signed")]
+    [AdminAudit("setup.https-certificate.self-signed-kept")]
+    public IActionResult KeepSelfSignedCertificate([FromBody] KeepSelfSignedCertificateRequest request)
+    {
+        var guard = GuardExistingCertificates();
+        if (guard is not null)
+            return guard;
+
+        if (!AdcsCaConnectionString.TryValidate(request.CaConnectionString, out var caError))
+            return BadRequest(new { error = caError });
+
+        // The draft below records this URL, so it gets the checks the use route
+        // gives it.
+        var urlValidation = _setupService.ValidateExternalUrl(request.ExternalUrl ?? string.Empty);
+        if (!urlValidation.Valid)
+            return BadRequest(new { error = urlValidation.ErrorMessage ?? "External URL is invalid" });
+
+        var configuredThumbprint = ReadConfiguredThumbprint();
+        if (string.IsNullOrWhiteSpace(configuredThumbprint))
+        {
+            // Nothing recorded, nothing cleared: no row (issue #634).
+            this.AdminAudit().Suppress();
+            return Ok(new { outcome = "unchanged" });
+        }
+
+        this.AdminAudit().Describe(
+            "HTTPS certificate", before: configuredThumbprint, after: "(none), the self signed certificate is served again");
+
+        // Save the draft first, so the wizard that reloads after the restart
+        // resumes at this step with what it had.
+        SaveDraftAtUrlStep(request.CaConnectionString ?? string.Empty, [], request.ExternalUrl!);
+        _setupService.ClearHttpsCertificateThumbprint();
+
+        return Ok(new
+        {
+            outcome = "selfSigned",
+            restartScheduled = _serviceRestarter.TryScheduleRestart(),
+        });
+    }
+
+    /// <summary>
+    /// Refusals for the existing certificate endpoints. They exist for monitor mode
+    /// only (issue #471), where the service never enrols its own certificate, so a
+    /// full mode server answers 404, as if they were not there. Like every wizard
+    /// write they lock once setup is effectively complete. The mock CA is no reason
+    /// to refuse, since nothing here reaches a CA.
+    /// </summary>
+    private IActionResult? GuardExistingCertificates()
+    {
+        if (!_instanceMode.IsMonitor)
+        {
+            return NotFound(new
+            {
+                error = "Choosing a certificate already in the machine store is offered in monitor " +
+                        "mode. In full mode the wizard enrolls one from your CA.",
+            });
+        }
+
+        if (_setupService.IsSetupEffectivelyComplete())
+            return Conflict(new { error = "Setup already completed" });
+
+        return null;
+    }
+
+    /// <summary>
+    /// A wizard configuration in the words the audit trail records (issue #634).
+    /// The CA connection string is recorded as the wizard received it, the same
+    /// value every CA call logs. A completion passes the binding mode it is about
+    /// to write, so a request without a choice still records what took effect
+    /// (issue #631); a draft that made none records that it made none.
+    /// </summary>
+    internal static string DescribeSetup(SetupConfiguration config, string? eabWritten = null) =>
+        $"CA {(string.IsNullOrEmpty(config.CaConnectionString) ? "(none)" : config.CaConnectionString)}, " +
+        $"templates {(config.EnabledTemplates.Count == 0 ? "(none)" : string.Join(", ", config.EnabledTemplates))}, " +
+        $"external URL {(string.IsNullOrEmpty(config.ExternalUrl) ? "(none)" : config.ExternalUrl)}, " +
+        $"allowed domains {(config.AllowedDomainsEnabled ? "on: " + string.Join(", ", config.AllowedDomains ?? []) : "off")}, " +
+        $"external account binding {(config.EabEnforcement is { } eab ? EabEnforcementPolicy.ModeName(eab) : eabWritten is null ? "(not chosen)" : eabWritten + " (not chosen)")}";
+
+    /// <summary>
+    /// The wizard's binding choice (issue #631). Absent is no choice, which keeps
+    /// the recorded mode or, on a fresh install, completes as required. A present
+    /// value must name a mode: a typo is refused rather than read as off, the same
+    /// strictness as the settings page's enforcement endpoint.
+    /// </summary>
+    private static bool TryParseEabChoice(string? value, out EabEnforcementMode? mode, out string? error)
+    {
+        mode = null;
+        error = null;
+        if (value is null)
+            return true;
+
+        if (EabEnforcementPolicy.TryParseMode(value, out var parsed))
+        {
+            mode = parsed;
+            return true;
+        }
+
+        error = "External account binding must be off, optional or required.";
+        return false;
+    }
+
+    /// <summary>The thumbprint the overlay records, or null; best effort.</summary>
+    private string? ReadConfiguredThumbprint()
+    {
+        try
+        {
+            return SettingsOverlay.Load(_setupService.SettingsOverlayPath).HttpsCertificateThumbprint;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Common refusals for the TLS provisioning endpoints: monitor mode never
+    /// enrolls (issue #470), the mock CA cannot issue a real certificate (and
+    /// the demo probe never surfaces the offer), and after setup the wizard
+    /// endpoints are locked (SEC-G1) — certificate changes then belong to the
+    /// settings page. Monitor mode is checked first so it answers whatever
+    /// else is true; only the enrolment itself writes to the CA, but its apply
+    /// and discard steps have nothing to act on without it.
     /// </summary>
     private IActionResult? GuardTlsProvisioning()
     {
+        if (_instanceMode.IsMonitor)
+        {
+            _logger.LogWarning(
+                "Refused a setup wizard HTTPS certificate request: this server runs in monitor mode");
+            return MonitorModeProblem.Refuse(this,
+                "This server runs in monitor mode, so it never enrolls a certificate. Keep the " +
+                "self signed certificate, or point the server at a certificate already in the " +
+                "machine store.");
+        }
+
         if (_setupService.CaMode == "mock")
             return BadRequest(new { error = "TLS certificate enrollment is not available with the mock CA" });
 
@@ -626,27 +1058,76 @@ public sealed class SetupController : ControllerBase
     /// after the restart that session's fetches would fail the TLS handshake
     /// and the wizard would appear to hang.
     /// </summary>
-    private object ApplyEnrolledCertificate(
+    private IActionResult ApplyEnrolledCertificate(
         string caConnectionString,
         string templateName,
         string externalUrl,
         string thumbprint,
-        bool? currentHostCovered)
+        bool? currentHostCovered) =>
+        ApplyRecordedCertificate(
+            caConnectionString, [templateName], externalUrl, thumbprint, templateName, currentHostCovered);
+
+    /// <summary>
+    /// The draft every certificate choice saves before the restart it schedules, so
+    /// a wizard reopened afterwards (at this origin or another) resumes at the URL
+    /// step. The request carries only the CA, the templates and the URL, but the
+    /// draft overwrites the whole status file, so the allowed domain choice is read
+    /// back and carried through, or the restart would wipe what the domains step
+    /// saved.
+    /// </summary>
+    private void SaveDraftAtUrlStep(string caConnectionString, IReadOnlyList<string> templates, string externalUrl)
     {
-        // The TLS request carries only the CA, template, and URL, but this
-        // draft overwrites the whole status file. Read the current draft
-        // back and carry the allowed domain choice through, or the mid
-        // wizard restart wipes what the domains step already saved.
         var current = _setupService.GetStatus();
         _setupService.SaveWizardDraft(
             new SetupConfiguration(
                 CaConnectionString: caConnectionString,
-                EnabledTemplates: new List<string> { templateName },
+                EnabledTemplates: templates,
                 ExternalUrl: externalUrl,
                 AllowedDomainsEnabled: current.AllowedDomainsEnabled,
                 AllowedDomains: current.AllowedDomains),
             wizardStep: "url");
-        _setupService.SetHttpsCertificateThumbprint(thumbprint, templateName);
+    }
+
+    /// <summary>
+    /// The apply step every wizard certificate choice shares: an enrolled one in
+    /// full mode, with its template, or an existing one in monitor mode, with
+    /// none (issue #471).
+    ///
+    /// <para>
+    /// A settings overlay that refuses the record answers with the file named
+    /// rather than a bare 500 (issue #553), and schedules no restart, since there is
+    /// nothing new to apply. The enrolment endpoint asks the overlay before it
+    /// enrolls, so from there this arm means a hand edit landed in between; the
+    /// two others enroll nothing.
+    /// </para>
+    /// </summary>
+    private IActionResult ApplyRecordedCertificate(
+        string caConnectionString,
+        IReadOnlyList<string> templates,
+        string externalUrl,
+        string thumbprint,
+        string? templateName,
+        bool? currentHostCovered)
+    {
+        this.AdminAudit().Describe(
+            "HTTPS certificate",
+            before: ReadConfiguredThumbprint() ?? "(none)",
+            after: templateName is null
+                ? $"{thumbprint}, chosen from LocalMachine\\My"
+                : $"{thumbprint}, enrolled with template {templateName}");
+
+        SaveDraftAtUrlStep(caConnectionString, templates, externalUrl);
+        try
+        {
+            _setupService.SetHttpsCertificateThumbprint(thumbprint, templateName);
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogWarning(
+                "The HTTPS certificate {Thumbprint} is in LocalMachine\\My but could not be " +
+                "recorded in the settings overlay", thumbprint);
+            return OverlayUnreadable(ex);
+        }
 
         var restartScheduled = _serviceRestarter.TryScheduleRestart();
 
@@ -657,14 +1138,33 @@ public sealed class SetupController : ControllerBase
             continueUrl = uri.GetLeftPart(UriPartial.Authority) + "/setup";
         }
 
-        return new
+        return Ok(new
         {
             outcome = "installed",
             thumbprint,
             restartScheduled,
             currentHostCovered,
             continueUrl,
-        };
+        });
+    }
+
+    /// <summary>
+    /// The settings overlay cannot be read, or a change would set one configuration
+    /// key twice (issues #550 and #553). The wizard's answer is the settings page's
+    /// (<c>SettingsController.OverlayUnreadable</c>): the file named in a string
+    /// <c>error</c>, which is what the wizard shows, rather than a bare 500 that
+    /// leaves an administrator no clue which file to fix.
+    /// </summary>
+    private ObjectResult OverlayUnreadable(JsonException ex)
+    {
+        var path = _setupService.SettingsOverlayPath;
+        _logger.LogError(ex, "The settings overlay at {Path} could not be read or saved", path);
+        return StatusCode(500, new
+        {
+            error = $"The settings overlay at {path} is not valid JSON, or would set a " +
+                    "configuration key twice, and must be fixed by hand before setup can " +
+                    "continue. The service log names the problem.",
+        });
     }
 }
 
@@ -695,7 +1195,8 @@ public sealed record CompleteSetupRequest(
     string ExternalUrl,
     bool ConfirmUnreachableExternalUrl = false,
     bool AllowedDomainsEnabled = false,
-    List<string>? AllowedDomains = null);
+    List<string>? AllowedDomains = null,
+    string? EabEnforcement = null);
 
 /// <summary>
 /// Request body for enrolling the server's own TLS certificate. Carries the
@@ -722,6 +1223,23 @@ public sealed record ApplyTlsCertificateRequest(
 public sealed record DiscardTlsCertificateRequest(string Thumbprint);
 
 /// <summary>
+/// Request body for pinning the service to a certificate already in the machine
+/// store (monitor mode, issue #471). The wizard state rides along for the draft
+/// saved before the restart. AcceptNameMismatch confirms a certificate that does
+/// not cover the external URL's host.
+/// </summary>
+public sealed record UseExistingCertificateRequest(
+    string? CaConnectionString,
+    string? ExternalUrl,
+    string? Thumbprint,
+    bool AcceptNameMismatch = false);
+
+/// <summary>Request body for going back to the self signed certificate (monitor mode).</summary>
+public sealed record KeepSelfSignedCertificateRequest(
+    string? CaConnectionString,
+    string? ExternalUrl);
+
+/// <summary>
 /// Request body for saving a wizard draft. Lenient on purpose: the wizard
 /// saves whatever it has at each step, and missing values become empty.
 /// </summary>
@@ -731,4 +1249,5 @@ public sealed record SaveWizardDraftRequest(
     string? ExternalUrl,
     string? WizardStep,
     bool AllowedDomainsEnabled = false,
-    List<string>? AllowedDomains = null);
+    List<string>? AllowedDomains = null,
+    string? EabEnforcement = null);

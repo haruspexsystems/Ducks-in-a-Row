@@ -1,4 +1,4 @@
-import { Link } from 'react-router-dom';
+import { Link } from 'react-router';
 import { card, cardHover, mono, textInk, textInkSoft, textMuted, textFaint, cn } from '../lib/ui';
 import { STATUS, ACCENT, alpha } from '../lib/colors';
 import { useIsDark } from '../lib/useIsDark';

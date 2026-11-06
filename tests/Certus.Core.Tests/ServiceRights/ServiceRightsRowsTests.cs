@@ -170,6 +170,62 @@ public class ServiceRightsRowsTests
             r.Status == RightsStatus.Failed && r.Optional && r.NeededFor == RightNeededFor.Revocation);
     }
 
+    /// <summary>
+    /// Issue #515. The product revokes in three places and all three need this
+    /// right: the dashboard, ACME revoke-cert, and the finalize guard's automatic
+    /// revocation (OrderService.RefuseIssuedCertificateAsync). The row used to name
+    /// only the first two and then say everything else works, which is the text an
+    /// operator reads when deciding whether to grant the right.
+    /// </summary>
+    [Fact]
+    public void AMissingOfficerRole_NamesEveryRevocation_AndWhatTheAutomaticOneLeavesBehind()
+    {
+        var rows = ServiceRightsRows.Build(
+            AllAnswered() with { Roles = new CaRolesReading(ReadingOutcome.Ok, CaAccessRoles.Read | CaAccessRoles.Enroll) }, Measured);
+
+        var row = Row(rows, "ca-officer");
+        row.Detail.Should().Contain("dashboard")
+            .And.Contain("ACME revoke-cert")
+            .And.Contain("automatically at finalize")
+            .And.Contain("stays valid at the CA");
+        row.Detail.Should().Contain("Issuance, the inventory and alerts keep working without it.");
+        row.Remedy.Should().Contain("only if Ducks in a Row should revoke, the automatic revocation at finalize included");
+    }
+
+    [Fact]
+    public void AHeldOfficerRole_NamesEveryRevocationAsItsOnlyUse()
+    {
+        var rows = ServiceRightsRows.Build(AllAnswered(), Measured);
+
+        Row(rows, "ca-officer").Detail.Should().Contain("Only revocation uses it")
+            .And.Contain("dashboard")
+            .And.Contain("ACME revoke-cert")
+            .And.Contain("automatically at finalize");
+    }
+
+    /// <summary>
+    /// The officer row's NeededFor already widens to the inventory when an open
+    /// view was not seen to show every certificate. Its words must follow the same
+    /// finding, or the row says the inventory works without a right it lists the
+    /// inventory as needing.
+    /// </summary>
+    [Fact]
+    public void WithoutProofTheViewIsComplete_TheOfficerRowPromisesNothingAboutTheInventory()
+    {
+        var unproven = Measured with { ViewOpenProvesInventory = false };
+        var held = Row(ServiceRightsRows.Build(AllAnswered(), unproven), "ca-officer");
+        var missing = Row(ServiceRightsRows.Build(
+            AllAnswered() with { Roles = new CaRolesReading(ReadingOutcome.Ok, CaAccessRoles.Read | CaAccessRoles.Enroll) },
+            unproven), "ca-officer");
+
+        held.Detail.Should().NotContain("Only revocation").And.Contain("is not established")
+            .And.Contain("automatically at finalize");
+        missing.Status.Should().Be(RightsStatus.Failed);
+        missing.Detail.Should().NotContain("the inventory and alerts keep working").And.Contain("is not established")
+            .And.Contain("automatically at finalize");
+        missing.Remedy.Should().NotContain("only if").And.Contain("inventory misses certificates");
+    }
+
     [Fact]
     public void ARefusedView_FailsTheInventory_AndNamesRead()
     {

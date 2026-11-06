@@ -1,4 +1,4 @@
-import { Link } from 'react-router-dom';
+import { Link } from 'react-router';
 import { Bot, Wrench } from 'lucide-react';
 import type { CertStatus, ExpiryState } from '@/types';
 import { getExpiryState } from '@/types';

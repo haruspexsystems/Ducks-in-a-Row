@@ -2,6 +2,7 @@ using System.Text.Json;
 using Certus.Core.Acme.Crypto;
 using Certus.Core.Acme.Models;
 using Certus.Core.Acme.Services;
+using Certus.Core.Data.Entities;
 using Certus.Core.Security;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
@@ -100,11 +101,15 @@ public sealed class KeyChangeController : AcmeControllerBase
         if (payload == null)
             return AcmeError(400, AcmeErrorType.Malformed, "The inner payload is required.");
 
-        // 7. The inner 'account' must name the account that signed the outer JWS.
-        var expectedAccountUrl = AcmeUrl($"/acme/{template}/acct/{account.AccountId}");
-        if (NormalizeAcmeUrl(payload.Account) != NormalizeAcmeUrl(expectedAccountUrl))
+        // 7. The inner 'account' must be the outer kid: RFC 8555 §7.3.5 asks for "the URL for the
+        //    account matching the old key (i.e., the 'kid' field in the outer JWS)". Compare with
+        //    the kid itself, not a URL rebuilt from this request's template, because a client may
+        //    hold a kid under one template name and post key-change under another (issue #607).
+        //    A missing kid fails closed, because NormalizeAcmeUrl(null) would match an empty
+        //    account. The id in the kid already resolved to the account that signed the outer JWS.
+        if (auth.Kid == null || NormalizeAcmeUrl(payload.Account) != NormalizeAcmeUrl(auth.Kid))
             return AcmeError(400, AcmeErrorType.Malformed,
-                "Inner payload 'account' does not match the authenticated account.");
+                "Inner payload 'account' does not match the 'kid' of the outer JWS.");
 
         // 8. The inner 'oldKey' must be the account's current key. Compare by canonical thumbprint
         //    (RFC 7638) so member order in the supplied JWK does not matter.
@@ -128,20 +133,28 @@ public sealed class KeyChangeController : AcmeControllerBase
         //    also rejects rolling over to the same key (it resolves to this same account).
         var existing = await _accountService.FindByThumbprintAsync(newKeyJson, ct);
         if (existing != null)
-        {
-            Response.Headers["Location"] = AcmeUrl($"/acme/{template}/acct/{existing.AccountId}");
-            return AcmeError(409, AcmeErrorType.Malformed,
-                "The new key is already in use by another account.");
-        }
+            return KeyAlreadyInUse(template, existing);
 
-        // 10. Swap the key. A lost race on the unique key index is reported as a conflict.
-        var outcome = await _accountService.ChangeKeyAsync(account, newKeyJson, ct);
-        if (outcome == KeyChangeOutcome.Conflict)
-            return AcmeError(409, AcmeErrorType.Malformed,
-                "The new key is already in use by another account.");
+        // 10. Swap the key. A lost race on the unique key index is reported as a conflict, and
+        //     it owes the client the same Location as the pre-check above (issue #127).
+        var result = await _accountService.ChangeKeyAsync(account, newKeyJson, ct);
+        if (result.Outcome == KeyChangeOutcome.Conflict)
+            return KeyAlreadyInUse(template, result.KeyHolder!);
 
         // RFC 8555 §7.3.5: a successful rollover returns the account object.
-        Response.Headers["Location"] = expectedAccountUrl;
+        Response.Headers["Location"] = AcmeUrl($"/acme/{template}/acct/{account.AccountId}");
         return Ok(AccountService.ToResponse(account, AcmeUrl, template));
+    }
+
+    /// <summary>
+    /// The 409 for a new key that another account already holds. RFC 8555 §7.3.5 requires the
+    /// Location header to name that account. Both refusals go through here, the pre-check and
+    /// the race the unique index catches at save, so the two cannot drift apart again.
+    /// </summary>
+    private IActionResult KeyAlreadyInUse(string template, AcmeAccount holder)
+    {
+        Response.Headers["Location"] = AcmeUrl($"/acme/{template}/acct/{holder.AccountId}");
+        return AcmeError(409, AcmeErrorType.Malformed,
+            "The new key is already in use by another account.");
     }
 }

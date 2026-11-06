@@ -256,6 +256,31 @@ public class DeviceAttestIntegrationTests
         (await ReadErrorAsync(response)).Detail.Should().Contain("base64url");
     }
 
+    [Fact]
+    public async Task Challenge_PostAsGet_ReadsWithoutSpendingTheSingleShot()
+    {
+        // An empty payload is a read for every challenge type. Issue #482 moved that
+        // test out of the device branch so it covers the network types too, and this
+        // pins that the device type kept it: reading a pending device challenge must
+        // not consume it, so the attObj that follows is the one that gets validated.
+        var flow = await StartOpenModeFlowAsync();
+
+        var read = await PostChallengeAsync(flow.Rsa, flow.Kid, flow.ChallengePath, null);
+
+        read.StatusCode.Should().Be(HttpStatusCode.OK);
+        JsonSerializer.Deserialize<ChallengeResponse>(await read.Content.ReadAsStringAsync())!
+            .Status.Should().Be("pending");
+        (await GetAuthzAsync(flow.Rsa, flow.Kid, flow.AuthzPath)).Challenges[0].Status
+            .Should().Be("pending", "a read must not spend the single shot");
+
+        var attObj = BuildAttestation(flow, attestedSerial: Serial);
+        (await PostChallengeAsync(flow.Rsa, flow.Kid, flow.ChallengePath, new { attObj }))
+            .StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var authz = await WaitForAuthzDecisionAsync(flow);
+        authz.Status.Should().Be("valid", authz.Challenges[0].Error?.Detail);
+    }
+
     // ---- full flows through the background worker ----
 
     [Fact]
@@ -576,8 +601,12 @@ public class DeviceAttestIntegrationTests
             await response.Content.ReadAsStringAsync())!;
     }
 
+    /// <summary>
+    /// Posts to the challenge URL. A null payload sends an empty one, which is a
+    /// POST-as-GET; anything else is serialized as the response.
+    /// </summary>
     private async Task<HttpResponseMessage> PostChallengeAsync(
-        RSA rsa, string kid, string challengePath, object payload)
+        RSA rsa, string kid, string challengePath, object? payload)
     {
         var nonce = await GetFreshNonce();
         var jws = CreateKidJws(rsa, kid, challengePath, nonce, payload);

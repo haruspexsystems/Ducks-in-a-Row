@@ -1,5 +1,6 @@
 using Certus.Core.Acme.Services;
 using Certus.Core.Adcs;
+using Certus.Core.Configuration;
 using Certus.Core.Data;
 using Certus.Core.Data.Entities;
 using Certus.Core.Security;
@@ -10,9 +11,10 @@ namespace Certus.Core.Services;
 
 /// <summary>
 /// Whether the dashboard may revoke one inventory row, and when not, why.
-/// BlockedKind is "guardrail" for a TLS capability ceiling refusal and
-/// "out-of-scope" for a revocation scope refusal; Detail is the human
-/// message the API response and the disabled revoke button both render.
+/// BlockedKind is "monitor-mode" when the server runs in monitor mode and never
+/// revokes anything (issue #470), "guardrail" for a TLS capability ceiling
+/// refusal and "out-of-scope" for a revocation scope refusal; Detail is the
+/// human message the API response and the disabled revoke button both render.
 /// </summary>
 public sealed record RevocationEligibility(
     bool Allowed,
@@ -25,6 +27,11 @@ public sealed record RevocationEligibility(
 /// <see cref="CertificateRevocationService"/> and the detail response's
 /// disabled button reason, so the refusal an admin reads and the refusal the
 /// API enforces cannot drift apart.
+///
+/// Monitor mode answers before either gate (issue #470): such a server never
+/// revokes, whatever the certificate, so neither gate has anything to add, and
+/// answering first spares the detail page a CA template list read for a button
+/// the dashboard does not show in that mode.
 ///
 /// Two gates, in order. First the TLS capability ceiling over the
 /// certificate itself, built from the strongest evidence the row carries:
@@ -41,23 +48,36 @@ public sealed class RevocationEligibilityService
     private readonly CertusDbContext _db;
     private readonly TemplateService _templates;
     private readonly RevocationScopePolicy _scope;
+    private readonly CertusInstanceMode _instanceMode;
     private readonly ILogger<RevocationEligibilityService> _logger;
+
+    /// <summary>The blocked kind a monitor mode server reports (issue #470).</summary>
+    public const string MonitorModeKind = "monitor-mode";
 
     public RevocationEligibilityService(
         CertusDbContext db,
         TemplateService templates,
         RevocationScopePolicy scope,
+        CertusInstanceMode instanceMode,
         ILogger<RevocationEligibilityService> logger)
     {
         _db = db;
         _templates = templates;
         _scope = scope;
+        _instanceMode = instanceMode;
         _logger = logger;
     }
 
     public async Task<RevocationEligibility> EvaluateAsync(
         SyncedCertificate entity, CancellationToken cancellationToken = default)
     {
+        if (_instanceMode.IsMonitor)
+        {
+            return new RevocationEligibility(false, MonitorModeKind,
+                "This server runs in monitor mode, so it never revokes a certificate. Revoke " +
+                "it at the certification authority, or from a Ducks in a Row server in full mode.");
+        }
+
         var capability = BuildCapability(entity, out var undeterminedDetail);
         if (capability == null)
             return new RevocationEligibility(false, "guardrail", undeterminedDetail);
@@ -88,9 +108,13 @@ public sealed class RevocationEligibilityService
             default:
                 // Ducks managed, the union: certificates Ducks issued through
                 // ACME (the provenance leg, lookup free), plus certificates on
-                // the currently enabled ACME templates.
+                // the currently enabled ACME templates. The provenance leg must
+                // match the serial as well as the request id (issue #442), or
+                // after the install is pointed at another CA, any certificate
+                // there that reuses an old ACME request's number would read as
+                // issued by Ducks and widen what this page may revoke.
                 if (await _db.AcmeCertificates.AnyAsync(
-                        a => a.AdcsRequestId == entity.RequestId, cancellationToken))
+                        AcmeInventoryBridge.AcmeRowsFor(entity), cancellationToken))
                     return new RevocationEligibility(true, null, null);
                 if (await TemplateInSetAsync(entity.TemplateName, scope.EnabledTemplates, cancellationToken))
                     return new RevocationEligibility(true, null, null);
@@ -112,11 +136,17 @@ public sealed class RevocationEligibilityService
     /// names. The CA being unreachable degrades to the raw answer: while the
     /// CA is down the revocation itself would fail anyway, so a conservative
     /// scope answer costs nothing and can never widen.
+    ///
+    /// An empty name is an unknown template, written when the stored value
+    /// sanitized away to nothing, and is in no set (issue #545). The dashboard
+    /// drops blank entries before saving, but the status file is read back as
+    /// written, so a hand edited blank entry would otherwise admit every row
+    /// whose template is unknown.
     /// </summary>
     private async Task<bool> TemplateInSetAsync(
         string templateName, IReadOnlyList<string> set, CancellationToken cancellationToken)
     {
-        if (set.Count == 0)
+        if (set.Count == 0 || string.IsNullOrWhiteSpace(templateName))
             return false;
 
         if (set.Contains(templateName, StringComparer.OrdinalIgnoreCase))

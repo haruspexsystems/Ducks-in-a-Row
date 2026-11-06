@@ -64,7 +64,10 @@ public sealed class AccountController : AcmeControllerBase
             return templateError;
 
         // 2. Read and parse JWS body
-        var body = await new StreamReader(Request.Body).ReadToEndAsync(cancellationToken);
+        var (body, readError) = await ReadRequestBodyAsync(cancellationToken);
+        if (readError != null)
+            return readError;
+
         JwsFlattenedRequest? jws;
         try
         {

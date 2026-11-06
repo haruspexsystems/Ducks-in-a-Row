@@ -47,11 +47,14 @@ public sealed class WebhookAlertNotifier : IAlertNotifier
         ServerCertificateAlert alert,
         CancellationToken cancellationToken = default)
     {
+        // WireDetail, never Detail: a denial's Detail names the service's computer
+        // account and its domain, and this body goes to a third party relay (issue
+        // #485). See the ServerCertificateAlert doc.
         var payload = new ServerCertificateWebhookPayload
         {
             Event = "server.certificate.renewal_failed",
             Outcome = alert.Outcome,
-            Detail = alert.Detail,
+            Detail = alert.WireDetail,
             TemplateName = alert.Template,
             DaysRemaining = alert.DaysRemaining,
             Timestamp = DateTime.UtcNow,
@@ -98,6 +101,39 @@ public sealed class WebhookAlertNotifier : IAlertNotifier
     }
 
     /// <summary>
+    /// The licence POST (issue #494, licence design section 13.6).
+    ///
+    /// One event per kind, picked from the licence's status, and the stage in a
+    /// field of its own: a receiver routes on "expiring", "grace" and "lapsed",
+    /// and reads which warning of the ladder this is from the stage. The switch
+    /// has a default arm so that building the payload, which happens before
+    /// PostAsync's try, can never throw.
+    /// </summary>
+    public async Task<AlertNotificationResult> SendLicenceAlertAsync(
+        LicenceAlert alert,
+        CancellationToken cancellationToken = default)
+    {
+        var payload = new LicenceWebhookPayload
+        {
+            Event = alert.Kind switch
+            {
+                LicenceAlertKind.Expiring => "licence.expiring",
+                LicenceAlertKind.Grace => "licence.grace",
+                _ => "licence.lapsed",
+            },
+            Timestamp = DateTime.UtcNow,
+            LicenceId = alert.LicenceId,
+            Tier = alert.Tier,
+            Stage = alert.Stage,
+            ValidUntil = alert.ValidUntil?.UtcDateTime,
+            GraceUntil = alert.GraceUntil?.UtcDateTime,
+            DaysRemaining = alert.DaysRemaining,
+        };
+
+        return await PostAsync(payload, $"the licence {alert.Stage} alert", cancellationToken);
+    }
+
+    /// <summary>
     /// The operator triggered test POST (issue #161).
     ///
     /// It deliberately goes through the same PostAsync as a real alert, so the
@@ -125,7 +161,7 @@ public sealed class WebhookAlertNotifier : IAlertNotifier
     }
 
     /// <summary>
-    /// Serialize, sign, and POST a payload. Shared by both alert kinds so the
+    /// Serialize, sign, and POST a payload. Shared by every alert kind so the
     /// HMAC signature, the custom headers, and the failure reporting stay
     /// identical whatever is being delivered.
     /// </summary>
@@ -135,6 +171,12 @@ public sealed class WebhookAlertNotifier : IAlertNotifier
         var webhook = _options.Webhook;
         if (webhook == null || !IsEnabled)
             return new AlertNotificationResult(false, "Webhook not configured");
+
+        // What the log may say about where this went (issue #635): scheme,
+        // host and a port that is not the default. The services carry the
+        // secret in the path or the query, and the log file travels with every
+        // support bundle, SIEM feed and backup.
+        var endpoint = AlertErrorRedactor.DescribeEndpoint(webhook.Url);
 
         try
         {
@@ -160,21 +202,48 @@ public sealed class WebhookAlertNotifier : IAlertNotifier
 
             if (!response.IsSuccessStatusCode)
             {
+                // The status code and an excerpt of the body, the configured
+                // secrets replaced first and then anything token shaped: a
+                // receiver that echoes the request echoes the URL, the signing
+                // secret and the custom headers with it. Configured first,
+                // because the token pass cuts an echoed path into pieces the
+                // whole path no longer matches, and uncapped, because a cap
+                // before the token pass can cut a token too short for it to
+                // find. The cap comes last. Redacted here, at the source, so
+                // the stored history row never holds the raw text.
                 var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
-                var error = $"Webhook returned {(int)response.StatusCode}: {responseBody}";
-                _logger.LogWarning("Webhook alert failed: {Error}", error);
+                var error = AlertErrorRedactor.Redact(
+                    $"Webhook returned {(int)response.StatusCode}: " +
+                    AlertErrorRedactor.ExcerptResponseBody(
+                        AlertErrorRedactor.RedactConfigured(responseBody, _options)),
+                    _options);
+                _logger.LogWarning(
+                    "Webhook alert for {Description} to {Endpoint} failed: {Error}",
+                    description, endpoint, error);
                 return new AlertNotificationResult(false, error);
             }
 
             _logger.LogInformation(
-                "Webhook alert sent for {Description} to {Url}", description, webhook.Url);
+                "Webhook alert sent for {Description} to {Endpoint}", description, endpoint);
 
             return new AlertNotificationResult(true);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to send webhook alert");
-            return new AlertNotificationResult(false, ex.Message);
+            // The exception, not logged as an exception: HttpRequestException and
+            // UriFormatException quote the URL as configured, inner exceptions
+            // included, and a structured logger writes an exception's ToString
+            // verbatim. The type name and the redacted message are what the log
+            // keeps; the stack trace of a failed POST adds nothing an operator
+            // can act on. The configured secrets uncapped, then the token pass,
+            // then the cap, for the same reasons as the response body above.
+            var error = AlertErrorRedactor.Redact(
+                AlertErrorRedactor.RedactTokens(AlertErrorRedactor.RedactConfigured(ex.Message, _options)),
+                _options);
+            _logger.LogError(
+                "Failed to send the webhook alert for {Description} to {Endpoint}: {ExceptionType}: {Error}",
+                description, endpoint, ex.GetType().Name, error);
+            return new AlertNotificationResult(false, error);
         }
     }
 
@@ -273,6 +342,27 @@ internal sealed class CrlWebhookPayload
     public List<string> Sources { get; set; } = [];
     public DateTime? LastReadAt { get; set; }
     public DateTime Timestamp { get; set; }
+}
+
+/// <summary>
+/// The licence payload (issue #494). The properties are declared in the order
+/// they are serialised, which is the order the licence design names them.
+///
+/// It deliberately carries no licensee name (personal data for a sole trader),
+/// no licensee reference, no reason code, no forests and no features: only what
+/// the core has typed or validated. A null tier, which is what a value that is
+/// not a tier name becomes, is left out of the JSON rather than sent as null.
+/// </summary>
+internal sealed class LicenceWebhookPayload
+{
+    public string Event { get; set; } = string.Empty;
+    public DateTime Timestamp { get; set; }
+    public string LicenceId { get; set; } = string.Empty;
+    public string? Tier { get; set; }
+    public string Stage { get; set; } = string.Empty;
+    public DateTime? ValidUntil { get; set; }
+    public DateTime? GraceUntil { get; set; }
+    public int? DaysRemaining { get; set; }
 }
 
 /// <summary>

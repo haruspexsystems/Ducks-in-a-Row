@@ -1,4 +1,5 @@
 import { ApiError, CSRF_HEADERS, fetchJson } from './client';
+import type { EabModeName, InstanceModeName } from '@/lib/setupWizard';
 
 /**
  * Setup status response. Anonymous endpoint, reduced to the routing boolean
@@ -27,6 +28,17 @@ export interface SetupConfigResponse {
   wizardCompleted: boolean;
   /** Effective CA mode: 'real', 'mock', or 'unconfigured'. */
   caMode: 'real' | 'mock' | 'unconfigured';
+  /**
+   * The instance mode (issue #471). The wizard has a different shape in monitor
+   * mode, so it reads this before it renders a step.
+   */
+  mode: InstanceModeName;
+  /**
+   * Why a finished wizard is open again: 'issuanceEnabled' when a server that
+   * finished setup in monitor mode was switched to full and has no template yet.
+   * Null otherwise.
+   */
+  reopenReason?: 'issuanceEnabled' | null;
   completedAt?: string;
   caConnectionString?: string;
   enabledTemplates: string[];
@@ -43,8 +55,15 @@ export interface SetupConfigResponse {
   /** The machine's AD domain as an allowed domain suggestion; null in a workgroup. */
   suggestedAllowedDomain?: string | null;
   /**
+   * The external account binding mode the wizard starts with (issue #631): the
+   * recorded mode, "off" for an install upgraded from before the setting existed,
+   * and "required" on a fresh install.
+   */
+  eabEnforcement?: string | null;
+  /**
    * The step id a saved draft should resume at ('url', 'review'). Null when
-   * no draft recorded one or setup is complete.
+   * no draft recorded one or setup is complete, and 'templates' when a
+   * reopened wizard is waiting for a template choice.
    */
   wizardStep?: string | null;
   /** Set when the wizard's TLS enrollment already configured a certificate. */
@@ -241,6 +260,7 @@ export async function saveWizardDraft(draft: {
   externalUrl?: string;
   allowedDomainsEnabled?: boolean;
   allowedDomains?: string[];
+  eabEnforcement?: EabModeName;
   wizardStep?: string;
 }): Promise<void> {
   await fetchJson('/api/setup/draft', {
@@ -296,6 +316,7 @@ export async function completeSetup(config: {
   externalUrl: string;
   allowedDomainsEnabled?: boolean;
   allowedDomains?: string[];
+  eabEnforcement?: EabModeName;
   confirmUnreachableExternalUrl?: boolean;
 }): Promise<SetupCompleteOutcome> {
   const url = '/api/setup/complete';
@@ -437,6 +458,95 @@ export async function discardTlsCertificate(thumbprint: string): Promise<{ remov
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ thumbprint }),
+  });
+}
+
+/** A certificate already in LocalMachine\My that the service could serve (monitor mode). */
+export interface ExistingCertificate {
+  thumbprint: string;
+  subject: string;
+  names: string[];
+  issuer: string;
+  notAfter: string;
+  friendlyName?: string | null;
+  /** The template it names, a version 1 name or an OID. */
+  template?: string | null;
+  /** Whether a browser at the external URL would accept it for that host. */
+  coversExternalHost: boolean;
+  /** Issued by itself, which browsers do not trust. */
+  selfSigned: boolean;
+  /** The service is already pinned to it. */
+  configured: boolean;
+}
+
+export interface ExistingCertificatesResponse {
+  externalHost: string;
+  configuredThumbprint?: string | null;
+  certificates: ExistingCertificate[];
+}
+
+/**
+ * The certificates already in the machine store the service could serve HTTPS
+ * with, covering ones first (issue #471). Monitor mode only: a full mode server
+ * answers 404, because the wizard enrols one from the CA there.
+ */
+export async function fetchExistingCertificates(
+  externalUrl: string,
+): Promise<ExistingCertificatesResponse> {
+  return fetchJson(`/api/setup/existing-certificates?externalUrl=${encodeURIComponent(externalUrl)}`);
+}
+
+/**
+ * The outcome of choosing an existing certificate: the same shape as an
+ * enrolled one when it was recorded, or a name mismatch the administrator has
+ * to confirm before it is.
+ */
+export type UseExistingCertificateOutcome =
+  | { kind: 'recorded'; result: TlsProvisionResult }
+  | { kind: 'nameMismatch'; externalHost: string; names: string[] };
+
+/**
+ * Pin the service to a certificate already in the machine store, and restart
+ * to serve it. The server decides eligibility again rather than trusting the
+ * list; a certificate that does not cover the external host answers 422 until
+ * acceptNameMismatch confirms it.
+ */
+export async function chooseExistingCertificate(request: {
+  caConnectionString: string;
+  externalUrl: string;
+  thumbprint: string;
+  acceptNameMismatch?: boolean;
+}): Promise<UseExistingCertificateOutcome> {
+  const url = '/api/setup/existing-certificates/use';
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...CSRF_HEADERS },
+    body: JSON.stringify(request),
+  });
+  if (response.status === 422) {
+    const body = (await response.json()) as { externalHost: string; names: string[] };
+    return { kind: 'nameMismatch', externalHost: body.externalHost, names: body.names };
+  }
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as { error?: string } | null;
+    throw new ApiError(response.status, body?.error ?? response.statusText, url);
+  }
+  return { kind: 'recorded', result: (await response.json()) as TlsProvisionResult };
+}
+
+/**
+ * Go back to the self signed certificate after an earlier pick. 'unchanged'
+ * when nothing was picked, 'selfSigned' when the pick was cleared and the
+ * service is restarting.
+ */
+export async function keepSelfSignedCertificate(
+  caConnectionString: string,
+  externalUrl: string,
+): Promise<{ outcome: 'unchanged' } | { outcome: 'selfSigned'; restartScheduled: boolean }> {
+  return fetchJson('/api/setup/existing-certificates/keep-self-signed', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ caConnectionString, externalUrl }),
   });
 }
 

@@ -1,8 +1,10 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Certus.Core.Alerts;
+using Certus.Core.Configuration;
 using Certus.Core.Security;
 using Certus.Core.Setup;
+using Certus.Web.Audit;
 using Certus.Web.Authentication;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -25,7 +27,7 @@ public sealed class AlertsController : ControllerBase
     private readonly IServiceRestarter _serviceRestarter;
     private readonly IEnumerable<IAlertNotifier> _notifiers;
     private readonly IOptions<AlertOptions> _alertOptions;
-    private readonly ISecretProtector _protector;
+    private readonly ISmtpSecretProtector _protector;
     private readonly ILogger<AlertsController> _logger;
 
     /// <param name="alertOptions">
@@ -36,8 +38,10 @@ public sealed class AlertsController : ControllerBase
     /// </param>
     /// <param name="protector">
     /// Protects an incoming SMTP password before it reaches the overlay, and
-    /// only that: this controller never unprotects anything, so a blob can
-    /// travel through here but a plaintext password can only travel in.
+    /// rewrites a carried forward blob that an older version wrote under the
+    /// EAB purpose (issue #635). This controller never hands a plaintext
+    /// password out, so a blob can travel through here but a plaintext
+    /// password can only travel in.
     /// </param>
     public AlertsController(
         AlertQueryService alertQueryService,
@@ -46,7 +50,7 @@ public sealed class AlertsController : ControllerBase
         IServiceRestarter serviceRestarter,
         IEnumerable<IAlertNotifier> notifiers,
         IOptions<AlertOptions> alertOptions,
-        ISecretProtector protector,
+        ISmtpSecretProtector protector,
         ILogger<AlertsController> logger)
     {
         _alertQueryService = alertQueryService;
@@ -146,7 +150,9 @@ public sealed class AlertsController : ControllerBase
     /// middleware, like every other mutating dashboard endpoint.
     /// </summary>
     [HttpPut("config")]
-    public IActionResult UpdateConfig([FromBody] UpdateAlertConfigRequest request)
+    [AdminAudit("alerts.config.changed")]
+    public async Task<IActionResult> UpdateConfig(
+        [FromBody] UpdateAlertConfigRequest request, CancellationToken ct)
     {
         // Read once here only to answer the "will authentication actually
         // happen after this save" warning. The warning tolerates a racing
@@ -214,15 +220,44 @@ public sealed class AlertsController : ControllerBase
         // write time, not a snapshot a racing save could have replaced.
         var normalized = validation.Normalized!;
 
+        // The audit row before the file write (issue #634). Like the log line
+        // below it carries the credential halves as state transitions only,
+        // never a value, and not the recipient list.
+        var usernameState = request.Smtp?.ClearUsername == true ? "cleared"
+            : !string.IsNullOrWhiteSpace(request.Smtp?.Username) ? "set"
+            : "unchanged";
+        var passwordState = request.Smtp?.ClearPassword == true ? "cleared"
+            : !string.IsNullOrEmpty(request.Smtp?.Password) ? "set"
+            : "unchanged";
+        await this.AdminAudit().RecordBeforeFileWriteAsync(
+            "alert settings",
+            DescribeForAudit(_alertQueryService.GetConfig()),
+            $"enabled {normalized.Enabled}, interval {normalized.CheckIntervalMinutes} minutes, " +
+            $"thresholds {string.Join(", ", normalized.ThresholdDays ?? [])}, " +
+            $"{normalized.Smtp?.Recipients?.Length ?? 0} recipient(s), " +
+            $"relay host {(string.IsNullOrEmpty(normalized.Smtp?.Host) ? "cleared" : "set")}, " +
+            $"username {usernameState}, password {passwordState}", ct);
+
         try
         {
             _configStore.Save(
                 normalized,
-                currentBlob => AlertConfigPolicy.ResolvePasswordBlob(
-                    request.Smtp?.Password,
-                    request.Smtp?.ClearPassword ?? false,
-                    currentBlob,
-                    _protector.Protect),
+                currentBlob =>
+                {
+                    var blob = AlertConfigPolicy.ResolvePasswordBlob(
+                        request.Smtp?.Password,
+                        request.Smtp?.ClearPassword ?? false,
+                        currentBlob,
+                        _protector.Protect);
+
+                    // A blob carried forward unchanged gets the SMTP purpose if
+                    // an older version wrote it under the EAB one (issue #635).
+                    // The rewrite happens under the store's lock, on the value
+                    // on disk, like the carry forward itself.
+                    return !string.IsNullOrEmpty(blob) && blob == currentBlob
+                        ? _protector.Rewrite(blob)
+                        : blob;
+                },
                 currentUsername => AlertConfigPolicy.ResolveUsername(
                     request.Smtp?.Username,
                     request.Smtp?.ClearUsername ?? false,
@@ -286,9 +321,11 @@ public sealed class AlertsController : ControllerBase
     /// so there the operator restarts the process themselves).
     /// </summary>
     [HttpPost("config/apply")]
+    [AdminAudit("alerts.config.applied")]
     public IActionResult ApplyConfig()
     {
         var restartScheduled = _serviceRestarter.TryScheduleRestart();
+        this.AdminAudit().Describe("alert settings", after: $"restart scheduled: {restartScheduled}");
 
         _logger.LogInformation(
             "Alert configuration apply requested by {Actor}; restart scheduled: {RestartScheduled}",
@@ -309,6 +346,17 @@ public sealed class AlertsController : ControllerBase
     /// field. <see cref="AlertConfigView.From"/> stays a pure projection of the
     /// bound options; the file layering is known only here.
     /// </summary>
+    /// <summary>
+    /// The in force alert settings in the words the audit trail records (issue
+    /// #634): the same fields the change row describes, so before and after
+    /// read alike. No recipient addresses and no credential values.
+    /// </summary>
+    internal static string DescribeForAudit(AlertConfigView view) =>
+        $"enabled {view.Enabled}, interval {view.CheckIntervalMinutes} minutes, " +
+        $"thresholds {string.Join(", ", view.ThresholdDays)}, " +
+        $"{view.Smtp?.Recipients?.Count ?? 0} recipient(s), " +
+        $"relay host {(string.IsNullOrEmpty(view.Smtp?.Host) ? "cleared" : "set")}";
+
     private AlertConfigView Describe()
     {
         var state = _configStore.Read();
@@ -321,6 +369,32 @@ public sealed class AlertsController : ControllerBase
             RestartPending = AlertConfigView.HasUnappliedChanges(
                 _alertOptions.Value, state.Saved, _configStore.OutrankedKeys),
         };
+    }
+
+    /// <summary>
+    /// The relay the stored password was saved for, as the notifier would see it
+    /// after a restart: each overlay field over the bound options. Null when
+    /// nothing names a relay anywhere, which <see cref="SmtpTestSendPolicy"/>
+    /// reads as "no saved relay", so a stored password is not sent to the first
+    /// host a test names.
+    /// </summary>
+    private SmtpOptions? SavedRelay(SettingsOverlay.AlertSmtpOverlaySettings? overlay)
+    {
+        var running = _alertOptions.Value.Smtp;
+        var host = overlay?.Host ?? running?.Host;
+        if (string.IsNullOrWhiteSpace(host))
+            return null;
+
+        var relay = new SmtpOptions
+        {
+            Host = host,
+            Port = overlay?.Port ?? running?.Port ?? 587,
+            UseSsl = running?.UseSsl ?? true,
+            TlsMode = running?.TlsMode,
+        };
+        if (overlay?.TlsMode is { } mode && SmtpTlsModes.TryParse(mode, out var parsed))
+            relay.TlsMode = parsed;
+        return relay;
     }
 
     /// <summary>
@@ -348,6 +422,7 @@ public sealed class AlertsController : ControllerBase
     /// middleware, like every other mutating dashboard endpoint.
     /// </summary>
     [HttpPost("test")]
+    [AdminAudit("alerts.test-sent")]
     public async Task<IActionResult> SendTest(
         [FromBody(EmptyBodyBehavior = EmptyBodyBehavior.Allow)] SendTestAlertRequest? request,
         CancellationToken ct)
@@ -407,7 +482,8 @@ public sealed class AlertsController : ControllerBase
                 clearUsername: false,
                 currentUsername: saved?.Smtp?.Username ?? _alertOptions.Value.Smtp?.Username);
 
-            if (!string.IsNullOrEmpty(smtp.Password))
+            var passwordTyped = !string.IsNullOrEmpty(smtp.Password);
+            if (passwordTyped)
             {
                 // A just typed password, used directly and never stored.
                 candidate.Password = smtp.Password;
@@ -434,6 +510,19 @@ public sealed class AlertsController : ControllerBase
                     ?? _alertOptions.Value.Smtp?.PasswordProtected;
                 candidate.Password = _alertOptions.Value.Smtp?.Password;
             }
+
+            // The stored password goes only to the relay it was saved for
+            // (issue #635): the overlay's values where it has them, the running
+            // configuration behind them, the same precedence the notifier
+            // applies after a restart. A refusal here is a 400 like the other
+            // candidate refusals, and nothing is sent.
+            var storedPasswordExists = !passwordTyped &&
+                (!string.IsNullOrEmpty(candidate.PasswordProtected) ||
+                 !string.IsNullOrEmpty(candidate.Password));
+            var refusal = SmtpTestSendPolicy.Refuse(
+                candidate, passwordTyped, storedPasswordExists, SavedRelay(saved?.Smtp));
+            if (refusal is not null)
+                return BadRequest(new { error = refusal });
 
             if (!EmailAlertNotifier.IsDeliverable(candidate))
             {
@@ -475,6 +564,10 @@ public sealed class AlertsController : ControllerBase
                 // 200 even when a channel failed. The request was carried out;
                 // the per channel result is the answer, and a 5xx here would
                 // read as "Ducks is broken" when the truth is "your relay is".
+                this.AdminAudit().Describe(
+                    candidate is null ? "configured alert channels" : "SMTP settings from the form",
+                    after: string.Join("; ", result.Results.Select(r =>
+                        $"{r.Channel} {(r.Success ? "delivered" : "failed")}")));
                 return Ok(new
                 {
                     attemptedAt = DateTime.UtcNow,

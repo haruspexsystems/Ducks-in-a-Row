@@ -2,6 +2,7 @@ using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using Certus.Core.Adcs;
 using Certus.Web.Authentication;
+using Certus.Web.Controllers.Dashboard;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
@@ -45,9 +46,9 @@ public sealed class CaCertificatesController : ControllerBase
     [HttpGet("")]
     public async Task<IActionResult> List(CancellationToken ct)
     {
-        var chain = await FetchChainAsync(ct);
+        var (chain, error) = await FetchChainAsync(ct);
         if (chain is null)
-            return CaUnavailable();
+            return error!;
 
         try
         {
@@ -76,9 +77,9 @@ public sealed class CaCertificatesController : ControllerBase
     [HttpGet("{thumbprint}/der")]
     public async Task<IActionResult> DownloadDer(string thumbprint, CancellationToken ct)
     {
-        var chain = await FetchChainAsync(ct);
+        var (chain, error) = await FetchChainAsync(ct);
         if (chain is null)
-            return CaUnavailable();
+            return error!;
 
         try
         {
@@ -101,9 +102,9 @@ public sealed class CaCertificatesController : ControllerBase
     [HttpGet("{thumbprint}/pem")]
     public async Task<IActionResult> DownloadPem(string thumbprint, CancellationToken ct)
     {
-        var chain = await FetchChainAsync(ct);
+        var (chain, error) = await FetchChainAsync(ct);
         if (chain is null)
-            return CaUnavailable();
+            return error!;
 
         try
         {
@@ -127,9 +128,9 @@ public sealed class CaCertificatesController : ControllerBase
     [HttpGet("chain/pem")]
     public async Task<IActionResult> DownloadChainPem(CancellationToken ct)
     {
-        var chain = await FetchChainAsync(ct);
+        var (chain, error) = await FetchChainAsync(ct);
         if (chain is null)
-            return CaUnavailable();
+            return error!;
 
         try
         {
@@ -153,9 +154,9 @@ public sealed class CaCertificatesController : ControllerBase
     [HttpGet("chain/p7b")]
     public async Task<IActionResult> DownloadChainP7b(CancellationToken ct)
     {
-        var chain = await FetchChainAsync(ct);
+        var (chain, error) = await FetchChainAsync(ct);
         if (chain is null)
-            return CaUnavailable();
+            return error!;
 
         try
         {
@@ -174,11 +175,13 @@ public sealed class CaCertificatesController : ControllerBase
     }
 
     /// <summary>
-    /// Fetch and parse the chain, or null when the CA is unavailable (the
-    /// caller answers 503). Any other failure propagates as a 500, which is
-    /// right: a CA that answers with an unparseable chain is a real fault.
+    /// Fetch and parse the chain, or a null chain with the 503 the caller
+    /// returns when the CA is unavailable or refuses the service. Any other
+    /// failure propagates as a 500, which is right: a CA that answers with an
+    /// unparseable chain is a real fault.
     /// </summary>
-    private async Task<List<X509Certificate2>?> FetchChainAsync(CancellationToken ct)
+    private async Task<(List<X509Certificate2>? Chain, IActionResult? Error)> FetchChainAsync(
+        CancellationToken ct)
     {
         IReadOnlyList<byte[]> derChain;
         try
@@ -188,10 +191,24 @@ public sealed class CaCertificatesController : ControllerBase
         catch (CaUnavailableException ex)
         {
             _logger.LogWarning(ex, "CA certificate download: the CA is unavailable");
-            return null;
+            return (null, CaUnavailable());
+        }
+        catch (CaAccessDeniedException ex)
+        {
+            // The CA refused the service the chain (issue #476), which no retry
+            // fixes. An administrator surface, so the remedy is carried in full,
+            // as the dashboard does for the sync's refusal. A problem document of
+            // its own type, so the card can tell this from an outage and show the
+            // detail instead of telling the administrator to try again.
+            _logger.LogError(ex, "CA certificate download: the CA denied access");
+            return (null, Problem(
+                type: DashboardProblemType.CaAccessDenied,
+                title: "CA certificate chain access denied",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status503ServiceUnavailable));
         }
 
-        return derChain.Select(der => X509CertificateLoader.LoadCertificate(der)).ToList();
+        return (derChain.Select(der => X509CertificateLoader.LoadCertificate(der)).ToList(), null);
     }
 
     private ObjectResult CaUnavailable() => StatusCode(503, new

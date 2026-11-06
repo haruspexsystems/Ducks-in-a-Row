@@ -69,21 +69,33 @@ Restart-Service DucksInARow
 
 The wizard and the **Service rights on the CA** card on the Settings page check
 what the service's own account may do. [Verifying](verifying.md#the-services-rights)
-explains the five statuses. The rows that come up most:
+explains the five statuses, and
+[what to ask your AD and CA team](ad-and-ca-team-request.md#what-to-ask-for) says
+who usually grants each right and where. The rows that come up most:
 
 - **Reaching the CA as this server: Failed, "the CA answered and refused".** The
   account lacks **Request Certificates** on the CA. Authenticated Users hold it
   on a default CA, so someone has taken it away. A CA that refuses remote requests
   altogether (the `IF_NOREMOTEICERTREQUEST` interface flag) answers the same way.
   The template list, the CA certificate downloads and CRL watching read through
-  the same interface, so they fail too.
+  the same interface, so they fail too. Also check that the CA server's
+  **Certificate Service DCOM Access** group still admits the account. It holds
+  Authenticated Users on a default CA, and a CA server that refuses the account
+  at DCOM does so before its own permissions are consulted.
+- **A row still reads Failed after the right was granted to a group.** The CA
+  sees a computer's new group membership only after its Kerberos tickets renew.
+  Restart the server, or run `klist -li 0x3e7 purge` and restart the service,
+  then **Check again**. See
+  [granting to a group](ad-and-ca-team-request.md#granting-to-a-group).
 - **The certificate view the inventory reads: Failed.** Grant **Read** on the
   CA. Request Certificates does not open the view. If the row says the CA reports
   Read and still refused the view, the CA may refuse remote administration
   altogether (the `IF_NOREMOTEICERTADMIN` interface flag).
 - **Issue and Manage Certificates: Not granted (optional).** Only revocation
-  needs it. Everything else works without it; see [revocation](revocation.md)
-  before granting it.
+  needs it, but every kind of revocation: from the dashboard, through
+  `revoke-cert`, and the automatic revocation at finalize. Everything else works
+  without it; see [revocation](revocation.md#what-the-ca-has-to-allow) before
+  granting it.
 - **Issue and Manage Certificates: Unproven, "the CA would not report the
   service's roles".** The CA reports roles only to an account holding Read or
   more. Grant Read, then **Check again**.
@@ -205,6 +217,31 @@ and add the domain (subdomains of an entry are covered automatically), or
 turn the restriction off. Changes apply immediately, no restart needed. Each
 rejected order also appears on the dashboard activity feed as **Rejected**.
 
+## Every ACME order is rejected: the allowed domain list is empty or unreadable
+
+Every order gets the `rejectedIdentifier` error above, whatever name it asks
+for, and the service log carries one of these at Error:
+
+```
+Domain restriction is enabled in C:\ProgramData\Ducks in a Row\ducks-setup.json
+but no usable entries were found; every ACME order is refused until an allowed
+domain is added or the restriction is switched off
+```
+
+```
+Could not read C:\ProgramData\Ducks in a Row\ducks-setup.json; every ACME order
+is refused until the file is fixed or the setup wizard is re-run
+```
+
+The restriction is on but there is nothing to allow. The wizard and the
+Settings page refuse to save that state, so the file was edited by hand or
+damaged. The restriction fails closed on purpose: an operator who switched it
+on asked for a closed posture. To recover, open **Settings, Allowed Domains**
+and add at least one domain, or switch the restriction off. For the second
+message, fix or restore the file (see [Backup and restore](backup-and-restore.md))
+or re-run the setup wizard. Orders issue again on the next request; no
+restart is needed.
+
 ## An ACME order is rejected: outside the credential's domain namespace
 
 The client reports an error like:
@@ -262,11 +299,13 @@ The message names the cause:
 ## EAB secrets stopped verifying after moving or restoring the data folder
 
 The MAC secrets are encrypted at rest with a Data Protection keyring stored
-next to the database and protected by the machine's DPAPI. Restoring the
-data folder onto a different machine (or reinstalling Windows) means the
-keyring can no longer be decrypted, so every stored EAB secret becomes
-unreadable. Verification fails closed: clients get 403 unauthorized and the
-log says the stored secret could not be decrypted.
+in the `keys` folder in the data folder. The keyring is protected with DPAPI
+under the account the service runs as, on that machine: not the machine's own
+DPAPI scope, so it decrypts only for that account, there. Restoring the data
+folder onto a different machine, reinstalling Windows, or running the service
+as a different account means the keyring can no longer be decrypted, so every
+stored EAB secret becomes unreadable. Verification fails closed: clients get
+403 unauthorized and the log says the stored secret could not be decrypted.
 
 The credentials themselves survive: the key id, name, expiry, and domain
 namespace are plain columns. The recovery is **Regenerate** on each
@@ -303,10 +342,12 @@ broken.
 **Cause: the CA has not granted the right.** Revocation needs the server's
 machine account to hold **Issue and Manage Certificates** on the CA, which is
 separate from the Read that the inventory needs. The error names the missing
-right. See [revocation](revocation.md).
+right. Without it an ACME client cannot revoke through `revoke-cert` either. See
+[revocation](revocation.md#what-the-ca-has-to-allow).
 
 An ACME client revoking its own certificate is not subject to the scope modes,
-so a client can still revoke through `revoke-cert` when the dashboard will not.
+so when the scope is what stops the dashboard, a client can still revoke through
+`revoke-cert`.
 
 ## A device order is refused, or the device challenge never appears
 
@@ -340,9 +381,9 @@ that was already moving. See [device attestation](device-attestation.md).
 
 ## An ACME client reports a TLS or certificate trust error
 
-The HTTPS endpoint uses a self signed certificate by default
-(`ducks-selfsigned.pfx` in the data folder). ACME clients reject untrusted
-TLS on the ACME server. Either:
+The HTTPS endpoint uses a self signed certificate by default (kept in the
+data folder as `ducks-selfsigned.bin`, encrypted with the service's keyring).
+ACME clients reject untrusted TLS on the ACME server. Either:
 
 - give Ducks in a Row a certificate your clients trust (Kestrel HTTPS
   certificate in `appsettings.json`), or
@@ -400,15 +441,41 @@ carries the reason the certificate authority gave. The usual ones:
   entries above.
 
 If email or webhook alerts are configured, one alert is sent per failed
-attempt. The server's own certificate is deliberately excluded from the
-ordinary 30, 14, 7, and 1 day expiry alerts, because the product renews it
-itself; this failure alert is the only thing those channels say about it.
+attempt. While automatic renewal is on, the server's own certificate is
+deliberately excluded from the ordinary 30, 14, 7, and 1 day expiry alerts,
+because the product renews it itself; this failure alert is the only thing
+those channels say about it. With automatic renewal off, in monitor mode, or
+for a certificate the service did not install itself (one without the friendly
+name `Ducks in a Row HTTPS`, such as a certificate chosen in monitor mode),
+nothing in Ducks in a Row renews it, so it gets the ordinary alerts like every
+other certificate.
 
 To turn automatic renewal off, or to change the window, set
 `Certus:HttpsCertificateAutoRenewalEnabled` or
-`Certus:HttpsCertificateRenewalWindowDays` in `appsettings.json`. The default is
+`Certus:HttpsCertificateRenewalWindowDays` in `settings.json` in the data
+folder (see [Configuration](configuration.md)). The default is
 on, 30 days, capped at a third of the certificate's own validity so a short
 lived template does not renew on every check.
+
+## HTTPS went back to the self signed certificate after a renewal
+
+The browser warns about the certificate again, and the log names the self signed
+certificate in "HTTPS certificate for this boot". The certificate the service was
+pointed at by thumbprint has been renewed, and the service could not find its
+successor at startup. It follows a renewal when the old certificate is still in
+the machine store, archived, and the new one has the same subject and template;
+see [monitor mode](monitor-mode.md#the-https-certificate). The Warning line above
+"HTTPS certificate for this boot" says which condition failed:
+
+- **No certificate has the configured thumbprint**: the old certificate was
+  deleted from the store, so there is nothing to match against.
+- **It names no certificate template**: a certificate from a public CA, or one
+  imported from a file.
+- **No valid certificate issued after it ... carries its private key**: the
+  renewal has not happened yet, or its key is missing.
+
+Put the new certificate's thumbprint in `Certus:HttpsCertificateThumbprint` in
+`settings.json`, from an elevated session, and restart the service.
 
 ## An ACME client waits a long time, and the order stays "processing"
 
@@ -486,9 +553,28 @@ icacls $file /reset
 Restart-Service DucksInARow
 ```
 
-Saving from the setup wizard or the Settings page also replaces `settings.json`
-with a fresh file. It keeps only what that page saves, so add anything else you
-had in it again.
+Saving from the setup wizard or the Settings page also replaces an untrusted
+`settings.json` with a fresh file. Because the service does not trust the old
+file, the new one keeps only what that page saves, so add anything else you had
+in it again. A save over a file the service trusts keeps every key it does not
+manage.
+
+## The Licence card says the paid module is not running
+
+The card names what happened and shows the service's own reason beneath it:
+the module failed to start, stopped responding, was set aside after failing to
+start twice, was built for another release, or sits in a folder that
+non-administrators can change. Certificate issuance and renewal are not
+affected in any of these. What to do for each is in
+[licence and paid module](licence.md).
+
+## The Licence card says the licence folder cannot be trusted
+
+Someone other than SYSTEM and Administrators owns the `licence` folder in the
+data folder, or can write to it, so the service reads no licence from it and
+never repairs it. Delete the folder the service log names, then install the
+licence again from the card, which recreates the folder with the right
+permissions. See [licence and paid module](licence.md).
 
 ## The service will not start
 
@@ -496,6 +582,17 @@ had in it again.
 - Validate `appsettings.json` for JSON errors (a trailing comma or missing quote
   will stop startup).
 - Confirm ports 5000 and 5001 are not already in use.
+- Check the registry value `Mode` under
+  `HKLM\SOFTWARE\Haruspex Systems\Ducks in a Row`. Anything other than a
+  `REG_SZ` of `monitor` or `full` stops the service at startup, and the log says
+  "The instance mode ... cannot be used". See [monitor mode](monitor-mode.md).
+- A Fatal line naming `Certus:DatabasePath` or `Certus:SettingsOverlayPath`
+  means one of them points outside the data folder. See
+  [a file is outside the data folder](#the-service-will-not-start-a-file-is-outside-the-data-folder).
+- If it stopped by itself and came back, or stopped after coming back twice, it
+  ended unexpectedly and Windows' recovery restarted it. The installer sets two
+  restarts; see [if the service stops](installation.md#if-the-service-stops).
+  The System event log records each one, from the Service Control Manager.
 - Run the executable directly from an elevated prompt to see the error:
 
   ```powershell
@@ -537,6 +634,123 @@ The other common cause of a pre-logger crash is a blank `DatabasePath`, which
 yields the connection string `Data Source=` and opens a private temporary
 database per connection, so the schema migration fails on a table that cannot
 exist. Check `settings.json` in the data folder.
+
+An upgrade can also stop here when the database was moved out of the data
+folder. The log then names `Certus:DatabasePath`; see the next section.
+
+## The service will not start: a file is outside the data folder
+
+The log ends with a Fatal line naming `Certus:DatabasePath` or
+`Certus:SettingsOverlayPath`. The service keeps its database and its settings
+file in the data folder, `C:\ProgramData\Ducks in a Row` unless you chose
+another one at install, and refuses to start when configuration puts either of
+them anywhere else.
+
+The data folder is the one folder the service locks to SYSTEM and
+Administrators. The database does not move alone: `ducks-setup.json` and the
+`keys` folder, which protects the EAB secrets and the saved SMTP password,
+always sit beside it. In a folder that other accounts can write, all three are
+exposed, so the service no longer starts with the database anywhere else.
+
+### Bring the database back into the data folder
+
+1. Stop the service. A clean stop writes `ducks.db-wal` back into `ducks.db`
+   and removes it; if `ducks.db-wal` or `ducks.db-shm` is still there, copy it
+   with the database.
+2. Check who owns the files before you copy them. In an elevated PowerShell,
+   set `$old` to the folder that holds the database:
+
+   ```powershell
+   $old = "D:\DucksData"
+   Get-ChildItem $old -Recurse -File |
+       Select-Object FullName, @{ Name = 'Owner'; Expression = { (Get-Acl $_.FullName).Owner } }
+   ```
+
+   Every file should be owned by `NT AUTHORITY\SYSTEM` or
+   `BUILTIN\Administrators`. A file owned by anyone else was created by an
+   account that could write that folder, so do not carry it over:
+   - a file in `keys`: leave it behind. After the move, **Regenerate** every EAB
+     credential on the ACME page and enter the SMTP password again.
+   - `ducks.db` or `ducks-setup.json`: do not trust what it holds. Restore it
+     from a backup you trust, or leave it behind; the service then starts with
+     an empty database, syncs the certificate inventory from the CA again, and
+     the setup wizard runs.
+3. Copy the files into the data folder as an administrator. Copying, rather
+   than moving, gives each copy the data folder's owner and permissions:
+
+   ```powershell
+   $data = "C:\ProgramData\Ducks in a Row"
+   $files = 'ducks.db', 'ducks.db-wal', 'ducks.db-shm', 'ducks-setup.json' |
+       ForEach-Object { Join-Path $old $_ } | Where-Object { Test-Path $_ }
+   Copy-Item $files $data -Force
+   New-Item -ItemType Directory -Force "$data\keys" | Out-Null
+   Copy-Item "$old\keys\*" "$data\keys" -Force
+   ```
+
+4. Remove `Certus:DatabasePath` wherever it is set: `settings.json` in the data
+   folder, `appsettings.json` in the installation folder, a
+   `Certus__DatabasePath` environment variable, or the service's command line.
+5. Start the service. Once the dashboard shows your certificates and ACME
+   accounts, delete the old folder.
+
+To keep the data on another disk, move the whole data folder instead. Choose
+it at install with `DATAFOLDER` (see [installation](installation.md)), or for
+an existing install: stop the service, copy the entire data folder to the new
+place as an administrator, set the `DataDirectory` value under
+`HKLM\SOFTWARE\Haruspex Systems\Ducks in a Row` to the new folder, and start the
+service. The service locks the new folder to SYSTEM and Administrators on every
+start, replacing any other permissions on it. It must be on a local disk.
+
+### Certus:SettingsOverlayPath
+
+The service reads `settings.json` from the data folder and nowhere else, so any
+other value of `Certus:SettingsOverlayPath` sent the dashboard's saves to a file
+the service never read. Remove the key. If the file it named holds settings you
+want, check its owner as above, copy them into `settings.json` in the data
+folder as an administrator, and restart the service.
+
+## Setup stops: the registry value Mode cannot be used
+
+Setup ends with a message naming the registry value `Mode` under
+`HKLM\SOFTWARE\Haruspex Systems\Ducks in a Row` and saying Ducks in a Row cannot
+use it. Someone set the value by hand to something other than `monitor` or
+`full`, or as a number (`REG_DWORD`, which the message shows with a leading `#`).
+Setup refuses rather than overwrite it, because overwriting it with `full` would
+quietly turn on issuance for a server someone meant to keep read only.
+
+Set it from an elevated PowerShell session, then run setup again:
+
+```powershell
+New-ItemProperty -Path 'HKLM:\SOFTWARE\Haruspex Systems\Ducks in a Row' -Name Mode -Value monitor -PropertyType String -Force
+```
+
+Use `full` for issuance, or delete the value for full mode. An uninstall is never
+blocked by the value.
+
+## Setup stops: the paid module was built for another release
+
+An unattended upgrade ends with a message saying the paid module installed on
+this server was built for one module contract and this release carries another.
+After that upgrade the installed paid module would not load, so its features
+would stay off until the module built for the new release is installed. Setup
+refuses rather than switch them off without anyone choosing it. Certificate
+issuance and renewal are not affected either way.
+
+There are two ways forward:
+
+- Get the paid module built for the new release first, then upgrade and install
+  it straight after.
+- Or upgrade anyway, saying so:
+
+  ```powershell
+  msiexec /i Ducks-in-a-Row.msi /qn ALLOW_INCOMPATIBLE_MODULE=1
+  Ducks-in-a-Row-Setup.exe /quiet ALLOW_INCOMPATIBLE_MODULE=1
+  ```
+
+The interactive wizard asks instead, on its first page. The setup bundle's
+`/passive` runs without the wizard, so it refuses too. Through the setup bundle,
+the message is in the MSI's own log, which Burn writes beside the bundle's log
+with `DucksInARowMsi` in its name. An uninstall is never blocked by this check.
 
 ## Database schema mismatch
 
@@ -598,25 +812,9 @@ The service starts normally either way and retries on every start, so a refusal
 is not urgent. To clear it, stop whatever holds the file and restart the
 service, then confirm the logged mode.
 
-### Moving the data folder to a network share
-
-Do the conversion before the move, not after. A database already in `wal` mode
-will not open on a filesystem that cannot support WAL, so once it is on the
-share there is no start on which the service could convert it, and the service
-fails to start instead:
-
-1. With the data folder still on local disk, set `Certus:EnableWalMode` to
-   `false` in `settings.json` in the data folder.
-2. Restart the service and confirm the log reads
-   `SQLite journal mode changed from wal to delete`.
-3. Stop the service. Confirm `ducks.db-wal` and `ducks.db-shm` are gone.
-4. Move the data folder to the share and update the installer's `DataDirectory`
-   registry value, or set `Certus:DatabasePath` to the new location.
-5. Start the service. The log should read `SQLite journal mode is delete`.
-
-Note that WAL is a genuine performance benefit and network shares are a poor
-place for a SQLite database in general. Prefer local storage for the data folder
-where you have the choice.
+The data folder must be on a local disk. A network share is not supported: the
+service locks the data folder to SYSTEM and Administrators on every start, and
+on a share those are the file server's own accounts, not this server's.
 
 ## Cannot reach the dashboard, or get a 401
 
@@ -624,6 +822,34 @@ The dashboard and setup API use Windows Integrated Authentication and are
 limited to the administrator group. Sign in as a member of the built in
 Administrators group, or set `Auth:AdminGroup` to the Windows or Active
 Directory group you want to allow, then restart the service.
+
+## A script or tool cannot connect over HTTPS: "Could not create SSL/TLS secure channel"
+
+The HTTPS endpoint (port 5001 by default) accepts TLS 1.2 and TLS 1.3 only. A
+client that offers nothing newer than TLS 1.0 or TLS 1.1 is refused during the
+handshake, before any request reaches the service, so the service log shows
+nothing. What the client reports, measured on Windows Server 2019:
+
+- Windows PowerShell 5.1 (`Invoke-WebRequest`, `Invoke-RestMethod`) on a machine
+  that offers TLS 1.0 only: `The request was aborted: Could not create SSL/TLS
+  secure channel.`
+- A .NET Framework `SslStream` whose `AuthenticateAsClient` is given only a host
+  name: `The function requested is not supported`. On Windows Server 2019 that
+  call offers TLS 1.0 alone, even though Windows PowerShell's own web requests
+  on the same machine offer TLS 1.2.
+
+Fix it on the client:
+
+- Use PowerShell 7, which takes its protocols from Windows.
+- In Windows PowerShell 5.1, add TLS 1.2 before the request:
+  `[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12`
+- For an `SslStream`, name the protocol:
+  `$ssl.AuthenticateAsClient($hostName, $null, [Security.Authentication.SslProtocols]::Tls12, $false)`
+
+When a client cannot be changed, an administrator can name a wider list in
+`Kestrel:Endpoints:Https:SslProtocols` (see [Configuration](configuration.md)).
+That opens the endpoint to those protocols for every client, and the service
+logs a warning about it on every start.
 
 ## Still stuck
 

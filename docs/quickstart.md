@@ -1,12 +1,19 @@
 # Quickstart
 
-Get from a fresh install to your first issued certificate. Plan for about
-fifteen minutes the first time, most of it spent on Active Directory
-permissions.
+Get from a fresh install to your first issued certificate. Setup takes about
+five minutes of clicking once the approvals are in place. The approvals are the
+rights this server's computer account needs on the CA and its templates, and
+they are usually the lead time, so ask for them first.
 
 > New to ACME or ADCS? The [glossary](glossary.md) explains the key terms.
 
 ## Before you start
+
+Most of what follows is granted by the people who run your Active Directory, your
+CA and your network. Send them
+[what to ask your AD and CA team](ad-and-ca-team-request.md) first: it lists every
+right and firewall opening the server needs, why each one is needed and where it
+is granted, with a change request ready to copy.
 
 You need:
 
@@ -19,11 +26,18 @@ You need:
   Install-WindowsFeature RSAT-ADCS-Mgmt
   ```
 
-- The server's **machine account** granted, on the CA:
-  - **Enroll** on each certificate template you want to expose, and
-  - **Read** on the CA itself (Certification Authority console, CA properties,
-    Security tab). Read is what lets the dashboard sync the certificate
-    inventory. Without it, enrolment still works but the dashboard stays empty.
+- The server's **machine account**, `DOMAIN\SERVERNAME$`, granted:
+  - **Enroll** on each certificate template you want to expose,
+  - **Request Certificates** on the CA itself (Certification Authority console,
+    CA properties, Security tab). Authenticated Users hold it on a default CA,
+    so check only that nobody removed it, and
+  - **Read** on the CA, on the same tab. Read is what lets the dashboard sync
+    the certificate inventory. Without it, enrolment still works but the
+    dashboard stays empty.
+- Network access from the server to the CA on TCP 135 and TCP 49152 to 65535,
+  and the server's account admitted by the CA server's **Certificate Service
+  DCOM Access** group. On a default CA that group holds Authenticated Users, so
+  this too is usually in place already.
 - Optional: your CA connection string in `CAHOST\CA Name` form. The setup
   wizard discovers the CAs published in Active Directory on its own; you only
   need the string for manual entry. Find it with:
@@ -57,6 +71,8 @@ name Haruspex Systems B.V. as the publisher. The install wizard lets you:
 - choose the data folder for the database, logs, and runtime configuration
   (default `C:\ProgramData\Ducks in a Row\`),
 - choose whether to start the service immediately,
+- choose [monitor mode](monitor-mode.md), which watches the CA and never issues
+  or revokes, for a read only first step on a production CA,
 - open the setup page in your browser from the completion screen.
 
 In all cases the installer:
@@ -82,6 +98,10 @@ msiexec /i Ducks-in-a-Row.msi /qn INSTALLFOLDER="D:\Ducks in a Row" DATAFOLDER="
   later upgrade is not supported.
 - `START_SERVICE`: `1` (default) starts the service after install; `0` registers
   it but leaves it stopped until the next boot or a manual start.
+- `MONITOR_ONLY`: `1` installs in [monitor mode](monitor-mode.md). Leave it out
+  for full mode.
+
+`Ducks-in-a-Row-Setup.exe /quiet` takes the same properties.
 
 The "open the setup page" prompt only appears in the interactive wizard, so a
 `/qn` install never launches a browser.
@@ -95,7 +115,7 @@ group. By default that is the server's built in Administrators group; set
 specific Windows or Active Directory group.
 
 > The HTTPS endpoint uses a self signed certificate out of the box (generated in
-> the data folder as `ducks-selfsigned.pfx`), so your browser will warn on
+> the data folder as `ducks-selfsigned.bin`), so your browser will warn on
 > first visit. For production, give Ducks in a Row a certificate your clients
 > already trust (see
 > [Giving clients a TLS certificate they trust](#giving-clients-a-tls-certificate-they-trust)
@@ -129,18 +149,32 @@ does not send you back to the beginning.
 
    ![Setup wizard templates step showing the ACME readiness checklist](images/setup-03-templates.png)
 
-4. **Allowed domains.** Choose which domains this server may issue certificates
-   for. On a domain joined server the wizard arrives here with the restriction
-   already on and your Active Directory domain filled in. An entry covers the
-   domain and all of its subdomains, so `corp.example.com` also covers
-   `web.corp.example.com`; wildcard entries are not needed and are not accepted.
+4. **Client access.** Two controls decide who can get a certificate, and on a
+   new install both arrive switched on.
 
-   You can turn the restriction off, but leaving it on is the recommendation.
-   It restricts issuance **through Ducks in a Row only**: the CA itself can
-   still issue for any name through its own tools, so this complements CA side
-   controls like name constraints rather than replacing them.
+   **External account binding** is required: an ACME client can register only
+   with a credential you create for it on the dashboard's ACME page. That is
+   why step 3 below starts by issuing one. See
+   [external account binding](external-account-binding.md).
 
-   ![Setup wizard allowed domains step with the restriction enabled and one domain listed](images/setup-04-domains.png)
+   **Allowed domains** decides which names this server may issue certificates
+   for. On a domain joined server the restriction is already on with your
+   Active Directory domain filled in; in a workgroup there is nothing to
+   suggest, so it starts off. An entry covers the domain and all of its
+   subdomains, so `corp.example.com` also covers `web.corp.example.com`;
+   wildcard entries are not needed and are not accepted. The list restricts
+   issuance **through Ducks in a Row only**: the CA itself can still issue for
+   any name through its own tools, so this complements CA side controls like
+   name constraints rather than replacing them.
+
+   You can switch either control off, and the step says in one line what that
+   gives up. Leaving both on is the recommendation; the
+   [hardening guide](hardening.md#active-directory-integrated-dns-and-dns-01)
+   explains why binding matters most in an Active Directory domain. Both can be
+   changed later without a restart: binding on the ACME page, the domain list
+   on the Settings page.
+
+   ![Setup wizard client access step with binding required, the domain restriction enabled and one domain listed](images/setup-04-domains.png)
 
 5. **Set the external URL.** This is the address clients will use to reach the
    server. It comes prefilled with a suggestion and is checked for you. On this
@@ -150,16 +184,18 @@ does not send you back to the beginning.
 
    ![Setup wizard external URL step showing the server URL and the directory URL clients will use](images/setup-05-external-url.png)
 
-6. **Review and apply.** The step summarises your choices and runs the rights
+6. **Review and apply.** The step summarises your choices, binding and the
+   domain restriction included, and runs the rights
    check again, with a row for each template you chose. Unless step 5 enrolled
    an HTTPS certificate for the server, Complete Setup waits for you to tick a
    box naming the rights that are not proven yet. It never refuses because a
    right is missing. Your choices are then saved to `settings.json` in the data
    folder and the service restarts itself to load them. The wizard waits for the
-   service to come back, then shows a ready to run certbot command and opens the
-   dashboard.
+   service to come back, then shows a ready to run certbot command, a link to
+   sign up for security notices, and a button to open the dashboard. The
+   Settings page keeps that link.
 
-   ![Setup wizard review step summarising the CA, the template, the allowed domains and the external URL](images/setup-06-review.png)
+   ![Setup wizard review step summarising the CA, the template, external account binding, the allowed domains and the external URL](images/setup-06-review.png)
 
 To point an existing install at a different CA later, you have two options.
 Either edit `Certus:CaConnectionString` in `settings.json` in the data folder
@@ -167,7 +203,31 @@ and restart the service, or clear that value and restart to reopen the wizard.
 Setup locks once it is complete, so the wizard will not reopen while a CA is
 still configured.
 
+Before you switch, let every ACME order that is waiting at the current CA for a
+manager's approval finish: approve or deny each pending request there. An order
+still waiting after the switch cannot complete, because the new CA does not hold
+its request, and the old CA's request is left for you to deny by hand. See
+[the one automatic revocation](revocation.md#the-one-automatic-revocation).
+
 ## 3. Request your first certificate
+
+### Issue a credential
+
+External account binding is required on a new install, so before a client can
+register it needs a credential from you:
+
+1. On the dashboard, open the **ACME** page and its **Credentials** tab.
+2. Choose **New credential**, give it a name that says which client or team
+   holds it, and create it.
+3. Copy the **key ID** and the **HMAC key** from the panel that opens. The HMAC
+   key is shown only now and again if you regenerate it, never afterwards.
+
+Hand both values to the client. The panel also writes ready to paste client
+setup for certbot, win-acme and the others. If you switched binding off in the
+wizard, skip this step. See
+[issuing a credential](external-account-binding.md#issuing-a-credential).
+
+### Point a client at the directory
 
 Each certificate template is its own ACME endpoint:
 
@@ -187,10 +247,14 @@ A quick test with certbot:
 ```bash
 certbot certonly --standalone \
   --server https://your-server:5001/acme/WebServer/directory \
+  --eab-kid <key ID> --eab-hmac-key <HMAC key> \
   --email you@example.com \
   -d host.corp.example.com \
   --key-type rsa --rsa-key-size 2048
 ```
+
+The two `--eab` flags matter only for the client's first registration; a
+certbot that already holds an account on this server does not need them again.
 
 > [!WARNING]
 > **Match the key type to the template.** Your client must ask for the key type
@@ -207,11 +271,10 @@ certbot certonly --standalone \
 > forces RSA: most clients default to an elliptic curve key. See
 > [connecting ACME clients](acme-clients.md#key-type) for the per client flags.
 
-Out of the box no account pre-registration is needed and no external account
-binding is required: the client creates an account from its own key the first
-time it connects. If an administrator has set EAB enforcement to Optional or
-Required, the client needs a credential as well. See
-[external account binding](external-account-binding.md).
+No account pre-registration is needed beyond the credential: the client creates
+an account from its own key the first time it connects and binds it to the
+credential then. If binding was switched off, the client needs no credential at
+all. See [external account binding](external-account-binding.md).
 
 See [Connecting ACME clients](acme-clients.md) for certbot, win-acme, Caddy,
 Traefik, and Posh-ACME.
@@ -246,12 +309,12 @@ Restart the service after editing either file.
 | Setting | Default | Purpose |
 |---|---|---|
 | `Certus:CaConnectionString` | `null` (unconfigured; the wizard sets it) | ADCS CA in `CAHOST\CA Name` form |
-| `Certus:DatabasePath` | `ducks.db` in the data folder | SQLite database file |
+| `Certus:DatabasePath` | `ducks.db` in the data folder | SQLite database file. It must stay in the data folder, or the service refuses to start ([why](troubleshooting.md#the-service-will-not-start-a-file-is-outside-the-data-folder)) |
 | `Certus:ExternalUrl` | `null` | The base URL you expect clients to use. Recorded and checked at startup; ACME URLs themselves follow the host the client connects to |
 | `Certus:SyncIntervalMinutes` | `5` | How often the dashboard syncs from the CA |
 | `Certus:RequestHistoryDays` | `30` | How far back the sync reaches for pending, denied, and failed requests, so their detail pages can show the CA's own explanation. Issued and revoked certificates are always synced in full. Set to `0` to skip those three passes entirely, which also empties the Pending, Denied, and Failed filters on the certificate list |
 | `Certus:Acme:ExposeAllTemplates` | `false` | Break glass override: expose every CA published template over ACME, ignoring the wizard's template selection. Leave it `false`; the open posture is logged as a warning at startup |
-| `Certus:EnableWalMode` | `true` | SQLite write ahead logging, for better concurrent read and write performance. Set it to `false` on a filesystem that cannot support WAL, or when a backup or replication tool needs a single database file with no `-wal` and `-shm` sidecars. Applied in both directions on every start, so changing it converts the existing database. See [Troubleshooting](troubleshooting.md#the-database-journal-mode-does-not-match-enablewalmode) before moving the data folder to a network share |
+| `Certus:EnableWalMode` | `true` | SQLite write ahead logging, for better concurrent read and write performance. Set it to `false` on a filesystem that cannot support WAL, or when a backup or replication tool needs a single database file with no `-wal` and `-shm` sidecars. Applied in both directions on every start, so changing it converts the existing database. See [Troubleshooting](troubleshooting.md#the-database-journal-mode-does-not-match-enablewalmode) for what each mode means. The data folder must be on a local disk |
 | `Auth:Mode` | `Negotiate` | Windows Integrated Authentication for the dashboard |
 | `Auth:AdminGroup` | `null` (built in Administrators) | Group allowed into the dashboard and setup |
 | `Auth:RequireHttps` | `true` | HSTS and HTTP to HTTPS redirect outside development |

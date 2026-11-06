@@ -100,6 +100,32 @@ public sealed class OrderController : AcmeControllerBase
             return AcmeError(400, AcmeErrorType.Malformed,
                 "Order must contain at least one identifier.");
 
+        // 3b. The resource caps (issue #632): how many identifiers one request
+        // may name, and how many orders one account may hold open. Checked
+        // here, before the loop below, so a refused request has examined no
+        // value, written no audit row and created nothing. Like the empty
+        // check this reads only the count, so it may sit above the device
+        // branch (issue #193): it tells a client nothing about the feature.
+        switch (await _orderService.CheckOrderCapsAsync(
+            auth.Account!, request.Identifiers.Length, ct))
+        {
+            case OrderCapOutcome.TooManyIdentifiers:
+                return AcmeError(400, AcmeErrorType.Malformed,
+                    $"An order may name at most {_orderService.MaxIdentifiersPerOrder} " +
+                    $"identifiers; this one names {request.Identifiers.Length}.");
+
+            case OrderCapOutcome.TooManyPendingOrders:
+                // No Retry-After: the cap clears when the client finalizes an
+                // order, deactivates its authorizations or lets it expire, and
+                // none of those is on a clock the server can name. "Too many"
+                // keeps the QA extended cycle's refusal bucketing intact.
+                return AcmeError(429, AcmeErrorType.RateLimited,
+                    $"Too many open orders: this account has reached its limit of " +
+                    $"{_orderService.MaxPendingOrdersPerAccount} orders that are pending or " +
+                    "ready. Finalize them, deactivate their authorizations, or let them " +
+                    "expire before placing another.");
+        }
+
         // 4. Validate identifiers. The vocabulary lives in AcmeIdentifierTypes;
         // a permanent-identifier (draft-ietf-acme-device-attest-08) skips the
         // dns shape checks, because a device serial is not a host name and

@@ -1,5 +1,6 @@
 import { forwardRef, useImperativeHandle, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMonitorMode } from '@/hooks/useSystemInfo';
 import {
   AlertTriangle,
   BadgeCheck,
@@ -8,6 +9,7 @@ import {
   ShieldAlert,
   ShieldCheck,
 } from 'lucide-react';
+import { errorText } from '@/api/client';
 import {
   applyHttpsCertificate,
   fetchHttpsCertificate,
@@ -51,6 +53,9 @@ export const HttpsCertificateSection = forwardRef<HttpsCertificateSectionHandle>
   function HttpsCertificateSection(_props, ref) {
     const queryClient = useQueryClient();
     const containerRef = useRef<HTMLDivElement>(null);
+    // Monitor mode never enrolls or renews (issue #470): the certificate is
+    // shown, the controls that would request one are not.
+    const monitorMode = useMonitorMode();
 
     const { data: cert, isLoading, isError } = useQuery({
       queryKey: ['settings', 'https-certificate'],
@@ -66,6 +71,7 @@ export const HttpsCertificateSection = forwardRef<HttpsCertificateSectionHandle>
       ref,
       () => ({
         beginProvision: () => {
+          if (monitorMode) return;
           setMessage(null);
           // Only step into the confirmation when there is a template to enroll
           // from; otherwise just reveal the section, which explains why it
@@ -74,7 +80,7 @@ export const HttpsCertificateSection = forwardRef<HttpsCertificateSectionHandle>
           containerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
         },
       }),
-      [cert?.renewTemplate],
+      [cert?.renewTemplate, monitorMode],
     );
 
     const handleRenew = async () => {
@@ -110,7 +116,7 @@ export const HttpsCertificateSection = forwardRef<HttpsCertificateSectionHandle>
         await queryClient.invalidateQueries({ queryKey: ['settings', 'https-certificate'] });
         setPhase(applied ? 'done' : 'manual-restart');
       } catch (err) {
-        setMessage(err instanceof Error ? err.message : 'Certificate enrollment failed.');
+        setMessage(errorText(err, 'Certificate enrollment failed.'));
         setPhase('view');
       }
     };
@@ -135,7 +141,7 @@ export const HttpsCertificateSection = forwardRef<HttpsCertificateSectionHandle>
         await queryClient.invalidateQueries({ queryKey: ['settings', 'https-certificate'] });
         setPhase(applied ? 'done' : 'manual-restart');
       } catch (err) {
-        setMessage(err instanceof Error ? err.message : 'The certificate could not be applied.');
+        setMessage(errorText(err, 'The certificate could not be applied.'));
         setPhase('view');
       }
     };
@@ -213,18 +219,39 @@ export const HttpsCertificateSection = forwardRef<HttpsCertificateSectionHandle>
                     <dt className="text-muted min-w-[130px]">Template:</dt>
                     <dd className="text-ink text-xs pt-0.5">
                       {cert.template ??
-                        (cert.renewTemplate
-                          ? `${cert.renewTemplate} (first enabled template; none was recorded at setup)`
-                          : 'unknown')}
+                        (cert.installedByService === false
+                          ? cert.renewTemplate
+                            ? `not recorded; Renew would enroll from ${cert.renewTemplate}`
+                            : 'not recorded'
+                          : cert.renewTemplate
+                            ? `${cert.renewTemplate} (first enabled template; none was recorded at setup)`
+                            : 'unknown')}
                     </dd>
                   </div>
+                  {typeof cert.installedByService === 'boolean' && (
+                    <div className="flex gap-2">
+                      <dt className="text-muted min-w-[130px]">Installed by:</dt>
+                      <dd className="text-ink text-xs pt-0.5">
+                        {cert.installedByService
+                          ? 'Ducks in a Row'
+                          : 'someone else, so whoever issued it renews it, for example Windows ' +
+                            'autoenrolment. When the renewed certificate comes from the same ' +
+                            'template, the service serves it from its next start.'}
+                      </dd>
+                    </div>
+                  )}
                   {cert.autoRenewal && (
                     <div className="flex gap-2">
                       <dt className="text-muted min-w-[130px]">Automatic renewal:</dt>
                       <dd className="text-ink text-xs pt-0.5">
                         {cert.autoRenewal.enabled
-                          ? `on, within ${cert.autoRenewal.windowDays} days of expiry`
-                          : 'off'}
+                          ? cert.autoRenewal.renewsThisCertificate
+                            ? `on, within ${cert.autoRenewal.windowDays} days of expiry`
+                            : 'on, but it renews only certificates Ducks in a Row installed, so ' +
+                              'this one gets expiry alerts like any other'
+                          : monitorMode
+                            ? 'off in monitor mode, so this certificate gets expiry alerts like any other'
+                            : 'off'}
                         {cert.autoRenewal.lastAttemptAt && (
                           <span className="text-muted">
                             {' '}
@@ -257,8 +284,8 @@ export const HttpsCertificateSection = forwardRef<HttpsCertificateSectionHandle>
                     <ShieldAlert className="h-4 w-4 text-amber-600 mt-0.5" />
                     <p className="text-xs text-amber-800 dark:text-amber-300">
                       The configured certificate is no longer in the machine store; the
-                      service falls back to its self signed certificate. Renewing enrolls
-                      a fresh one.
+                      service falls back to its self signed certificate.
+                      {monitorMode ? '' : ' Renewing enrolls a fresh one.'}
                     </p>
                   </div>
                 )}
@@ -284,11 +311,14 @@ export const HttpsCertificateSection = forwardRef<HttpsCertificateSectionHandle>
             ) : (
               <p className="text-xs text-muted">
                 No CA issued HTTPS certificate is configured; the service serves its self
-                signed fallback. Enroll one from the connected CA.
+                signed fallback.
+                {monitorMode
+                  ? ' Monitor mode never enrolls one; a local administrator can point the service at a certificate already in the machine store.'
+                  : ' Enroll one from the connected CA.'}
               </p>
             )}
 
-            {phase === 'view' && cert.renewTemplate && (
+            {!monitorMode && phase === 'view' && cert.renewTemplate && (
               <button
                 onClick={() => setPhase('confirm')}
                 className="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold
@@ -304,7 +334,7 @@ export const HttpsCertificateSection = forwardRef<HttpsCertificateSectionHandle>
               </button>
             )}
 
-            {phase === 'view' && !cert.renewTemplate && (
+            {!monitorMode && phase === 'view' && !cert.renewTemplate && (
               <p className="text-xs text-muted">
                 No template is enabled to enroll a webserver certificate from. Enable one,
                 then reload this page.
@@ -320,6 +350,13 @@ export const HttpsCertificateSection = forwardRef<HttpsCertificateSectionHandle>
                   service then restarts briefly to serve it; this page and ACME clients
                   lose their connection for a few seconds.
                 </p>
+                {cert.installedByService === false && (
+                  <p className="text-xs text-amber-800 dark:text-amber-300">
+                    The certificate in use now was installed by someone else. From then on
+                    Ducks in a Row renews the new certificate itself, and the current one
+                    stays in the machine store.
+                  </p>
+                )}
                 <div className="flex gap-2">
                   <button
                     onClick={handleRenew}

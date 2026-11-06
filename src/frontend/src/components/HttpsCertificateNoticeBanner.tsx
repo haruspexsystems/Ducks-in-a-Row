@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Loader2, RefreshCw, ShieldAlert } from 'lucide-react';
+import { errorText } from '@/api/client';
 import {
   applyHttpsCertificate,
   fetchHttpsCertificate,
@@ -72,7 +73,7 @@ export function HttpsCertificateNoticeBanner() {
       await queryClient.invalidateQueries({ queryKey: ['settings', 'https-certificate'] });
       setPhase(applied ? 'idle' : 'manual-restart');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'The certificate could not be applied.');
+      setError(errorText(err, 'The certificate could not be applied.'));
       setPhase('idle');
     }
   };

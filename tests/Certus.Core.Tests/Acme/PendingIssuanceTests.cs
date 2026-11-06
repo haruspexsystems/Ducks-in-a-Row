@@ -387,6 +387,85 @@ public class PendingIssuanceTests : IDisposable
             "the breach path revokes what the CA issued");
     }
 
+    [Fact]
+    public async Task ResolveHeldOrder_AfterASwitchToAnotherCa_NeverRevokesThatCasCertificate()
+    {
+        // Issue #604. A request id is unique only within one CA, and the sweep
+        // asks whichever CA is configured now, so an order held at the CA the
+        // install was pointed away from collects the new CA's request of the
+        // same number: a certificate somebody else enrolled. Its names are not
+        // the order's, so since #548 the issued name check refused it, and that
+        // breach arm revokes. Revoking it would take down a stranger's service.
+        var order = await FinalizeIntoHeldStateAsync("held.example.com");
+        var requestId = (await ReadOrderAsync(order.Id)).AdcsRequestId!.Value;
+
+        var newCa = new MockAdcsClient();
+        await IssueThroughRequestIdAsync(newCa, requestId, "unrelated.example.org");
+        using var repointed = NewProviderOn(newCa);
+
+        await ResolveAsync(order.Id, repointed);
+
+        newCa.RevokedSerials.Should().BeEmpty(
+            "the certificate under that request id is not this order's to revoke");
+        var stored = await ReadOrderAsync(order.Id);
+        stored.Status.Should().Be("invalid");
+        stored.CertificateId.Should().BeNull();
+        stored.ErrorJson.Should().Contain(AcmeErrorType.ServerInternal);
+
+        await using var verify = NewDbContext();
+        (await verify.AcmeCertificates.AnyAsync(c => c.OrderId == order.Id))
+            .Should().BeFalse("nothing may be recorded as issued by Ducks in a Row");
+    }
+
+    [Fact]
+    public async Task ResolveHeldOrder_AfterASwitchToAnotherCa_NeverDeliversThatCasCertificateForTheSameNames()
+    {
+        // The half no name check can catch, before #548 or since: the new CA's
+        // request of the same number was enrolled for the order's own name, under
+        // a key the ACME client does not hold. Delivered, it would be recorded as
+        // issued by Ducks in a Row, enter the ducks-managed revocation scope, and
+        // be revocable by this client through revoke-cert.
+        var order = await FinalizeIntoHeldStateAsync("same-name.example.com");
+        var requestId = (await ReadOrderAsync(order.Id)).AdcsRequestId!.Value;
+
+        var newCa = new MockAdcsClient();
+        await IssueThroughRequestIdAsync(newCa, requestId, "same-name.example.com");
+        using var repointed = NewProviderOn(newCa);
+
+        await ResolveAsync(order.Id, repointed);
+
+        var stored = await ReadOrderAsync(order.Id);
+        stored.Status.Should().Be("invalid");
+        stored.CertificateId.Should().BeNull();
+        newCa.RevokedSerials.Should().BeEmpty();
+
+        await using var verify = NewDbContext();
+        (await verify.AcmeCertificates.AnyAsync(c => c.OrderId == order.Id))
+            .Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task ResolveHeldOrder_TheStoredCsrWasErased_NeitherDeliversNorRevokes()
+    {
+        // Erasing a deactivated account drops the CSRs of all its orders, a held
+        // one included (#637), and then nothing says which key the certificate
+        // should carry. Undetermined refuses, as it does at every leaf check, but
+        // without the revoke: the certificate may well be this order's own.
+        var order = await FinalizeIntoHeldStateAsync("erased.example.com");
+        var requestId = (await ReadOrderAsync(order.Id)).AdcsRequestId!.Value;
+        await using (var db = NewDbContext())
+            await db.AcmeOrders.Where(o => o.Id == order.Id)
+                .ExecuteUpdateAsync(s => s.SetProperty(o => o.CsrDer, (string?)null));
+
+        _adcs.ApproveRequest(requestId);
+        await ResolveAsync(order.Id);
+
+        var stored = await ReadOrderAsync(order.Id);
+        stored.Status.Should().Be("invalid");
+        stored.CertificateId.Should().BeNull();
+        _adcs.RevokedSerials.Should().BeEmpty();
+    }
+
     // ---------------------------------------------------------------------
     // The worker half: one sweep over whatever is claimed for issuance.
     // ---------------------------------------------------------------------
@@ -532,11 +611,34 @@ public class PendingIssuanceTests : IDisposable
     /// asserting on the row afterwards cannot be served a stale identity map
     /// copy of what the conditional UPDATEs wrote.
     /// </summary>
-    private async Task<HeldOrderResolution> ResolveAsync(int orderId)
+    private async Task<HeldOrderResolution> ResolveAsync(
+        int orderId, IServiceProvider? provider = null)
     {
-        using var scope = _serviceProvider.CreateScope();
+        using var scope = (provider ?? _serviceProvider).CreateScope();
         return await scope.ServiceProvider.GetRequiredService<OrderService>()
             .ResolveHeldOrderAsync(orderId);
+    }
+
+    /// <summary>
+    /// Issues certificates at <paramref name="ca"/> until it has used
+    /// <paramref name="requestId"/>, so that id names one of that CA's own
+    /// certificates. Every CA numbers its requests from 1, which is the root of
+    /// issue #604: this is the state of the CA an install is pointed at after
+    /// its orders were submitted to another.
+    /// </summary>
+    private static async Task IssueThroughRequestIdAsync(
+        MockAdcsClient ca, int requestId, string dnsName)
+    {
+        SubmitResult submitted;
+        do
+        {
+            submitted = await ca.SubmitCertificateRequestAsync(
+                "WebServer", BuildCsr(dnsName), CancellationToken.None);
+        }
+        while (submitted.RequestId < requestId);
+
+        submitted.RequestId.Should().Be(requestId);
+        submitted.Status.Should().Be(SubmitStatus.Issued);
     }
 
     private async Task<AcmeOrder> ReadOrderAsync(int orderId)

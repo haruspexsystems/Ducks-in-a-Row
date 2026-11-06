@@ -2,6 +2,7 @@ import type { ReactNode } from 'react';
 import { CheckCircle2, XCircle, AlertCircle, Clock, Minus } from 'lucide-react';
 import type { AlertThresholdState, CertificateAlertThreshold } from '@/api/alerts';
 import { formatDateTime } from '@/types';
+import { describeChannelOutcome, type ChannelOutcome } from '@/lib/alerts';
 
 /**
  * How one threshold reads. Every variant carries its own icon and its own words,
@@ -58,9 +59,34 @@ const outcomes: Record<
   },
 };
 
+/**
+ * A failed row on which some channel still delivered (issue #206). Not a wire
+ * state: the server reports 'failed', because a channel did fail. Amber rather
+ * than red, so a webhook that broke beside an email that arrived does not read
+ * as nobody being told.
+ */
+const partlySent = {
+  label: 'Partly sent',
+  badge: 'bg-amber-100 dark:bg-amber-500/15 text-amber-800 dark:text-amber-300',
+  Icon: AlertCircle,
+  iconClass: 'text-amber-600',
+};
+
+function outcomeFor(state: AlertThresholdState, partial: boolean) {
+  if (partial && state === 'failed') return partlySent;
+  return outcomes[state] ?? outcomes.notApplicable;
+}
+
 /** The outcome of one threshold, as a badge. Shared with the fleet wide list. */
-export function AlertOutcomeBadge({ state }: { state: AlertThresholdState }) {
-  const outcome = outcomes[state] ?? outcomes.notApplicable;
+export function AlertOutcomeBadge({
+  state,
+  partial = false,
+}: {
+  state: AlertThresholdState;
+  /** True when a failed row still reached at least one channel. */
+  partial?: boolean;
+}) {
+  const outcome = outcomeFor(state, partial);
 
   return (
     <span
@@ -75,14 +101,13 @@ export function AlertOutcomeBadge({ state }: { state: AlertThresholdState }) {
  * One rung of the alert ladder, rendered for both the per certificate block
  * (issue #160) and, via the certificate slot, a fleet wide list.
  *
- * Two wordings here are load bearing, because the underlying row cannot support
- * the obvious phrasing:
+ * Two wordings here are load bearing:
  *
- * A row aggregates every channel in one batch, so Success is false when *any*
- * channel failed and Channels lists what was attempted rather than what
- * delivered. An email that arrived alongside a webhook that 500'd records
- * identically to both failing. So a failure says at least one channel failed and
- * never claims the alert was not delivered.
+ * A row says which channels delivered (issue #206), so an email that arrived
+ * beside a webhook that 500'd reads as sent by email and failed by webhook, not
+ * as nobody being told. A failed row written before that cannot say which
+ * channel failed, so describeChannelOutcome keeps the old "at least one channel
+ * failed" wording for it.
  *
  * And the expiry monitor's duplicate check does not filter on Success, so a
  * recorded failure permanently suppresses that threshold. A failed rung is a
@@ -97,7 +122,16 @@ export function AlertHistoryEntry({
   /** Optional slot for a fleet wide list to name the certificate. */
   certificate?: ReactNode;
 }) {
-  const outcome = outcomes[entry.state] ?? outcomes.notApplicable;
+  const delivery =
+    entry.state === 'sent' || entry.state === 'failed'
+      ? describeChannelOutcome({
+          channels: entry.channels,
+          deliveredChannels: entry.deliveredChannels,
+          success: entry.state === 'sent',
+        })
+      : null;
+  const partial = delivery?.partial ?? false;
+  const outcome = outcomeFor(entry.state, partial);
   const { Icon } = outcome;
 
   return (
@@ -109,18 +143,14 @@ export function AlertHistoryEntry({
           <span className="text-sm font-medium text-ink">
             {entry.thresholdDays} day warning
           </span>
-          <AlertOutcomeBadge state={entry.state} />
+          <AlertOutcomeBadge state={entry.state} partial={partial} />
           {certificate}
         </div>
 
-        <p className="text-sm text-ink-mid mt-1">{timing(entry)}</p>
+        <p className="text-sm text-ink-mid mt-1">{timing(entry, delivery?.verb)}</p>
 
-        {entry.channels && (
-          <p className="text-sm text-ink-mid mt-1">
-            {/* "Attempted", not "delivered". The row records which notifiers ran,
-                not which of them the recipient actually heard from. */}
-            Attempted over {entry.channels.split(',').filter(Boolean).join(', ')}.
-          </p>
+        {delivery && entry.channels && (
+          <p className="text-sm text-ink-mid mt-1">{delivery.channels}</p>
         )}
 
         {entry.state === 'failed' && (
@@ -130,10 +160,9 @@ export function AlertHistoryEntry({
                 {entry.errorMessage}
               </p>
             )}
-            <p className="text-sm text-red-700 dark:text-red-300 mt-1">
-              At least one channel failed. Ducks does not retry a threshold it has
-              already recorded, so this warning will not be sent again.
-            </p>
+            {delivery?.failure && (
+              <p className="text-sm text-red-700 dark:text-red-300 mt-1">{delivery.failure}</p>
+            )}
           </>
         )}
 
@@ -163,15 +192,15 @@ const NOTABLE_DELAY_MS = 24 * 60 * 60 * 1000;
  * apart to be worth showing together. Two bare timestamps in a row read as a
  * rendering fault rather than as two different facts.
  */
-function timing(entry: CertificateAlertThreshold): string {
+function timing(entry: CertificateAlertThreshold, verb: ChannelOutcome['verb'] = 'Sent'): string {
   const due = formatDateTime(entry.dueAt);
 
   switch (entry.state) {
     case 'sent':
     case 'failed': {
-      // Not "Attempted": the channel line below already carries that word, and
-      // the two together read as a stutter.
-      const verb = entry.state === 'sent' ? 'Sent' : 'Failed';
+      // Not "Attempted": the channel line below can carry that word, and the
+      // two together read as a stutter. "Sent" when any channel delivered, so
+      // a partial failure does not open with "Failed".
       if (!entry.sentAt) return `Came due ${due}.`;
 
       const late = new Date(entry.sentAt).getTime() - new Date(entry.dueAt).getTime();

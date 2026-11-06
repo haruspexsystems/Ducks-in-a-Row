@@ -356,13 +356,19 @@ export interface CertificateAlertThreshold {
   dueAt: string;
   /** Present only when a row exists. */
   sentAt?: string;
-  /**
-   * The channels that were *attempted*, not the ones that delivered. The row
-   * aggregates the whole batch, so on a failure this does not say which channel
-   * failed and nothing rendered from it may imply that it does.
-   */
+  /** The channels that were *attempted*, comma separated, not the ones that delivered. */
   channels?: string;
-  /** The last failing channel's error, which is all the row carries. */
+  /**
+   * The attempted channels that delivered, comma separated, empty when none did.
+   * Absent on a failed row written before the outcome was kept per channel: that
+   * row says only that at least one channel failed, and nothing rendered from it
+   * may imply which.
+   */
+  deliveredChannels?: string;
+  /**
+   * The failing channels' errors: the error alone when one channel failed, one
+   * line per channel, named, when several did.
+   */
   errorMessage?: string;
 }
 
@@ -397,8 +403,11 @@ export interface AlertHistoryItem {
   sentAt: string;
   /** The channels that were attempted, comma separated, not the ones that delivered. */
   channels: string;
+  /** As on CertificateAlertThreshold: absent on an older failed row. */
+  deliveredChannels?: string;
+  /** True only when every attempted channel delivered. */
   success: boolean;
-  /** The last failing channel's error, which is all the row carries. */
+  /** As on CertificateAlertThreshold. */
   errorMessage?: string;
 }
 

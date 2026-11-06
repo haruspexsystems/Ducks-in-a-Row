@@ -8,7 +8,8 @@ public class TlsCapabilityCeilingTests
     private static CertificateCapability Capability(
         IReadOnlyList<string>? ekus = null,
         X509KeyUsageFlags? keyUsage = null,
-        bool? isCa = null) => new(ekus, keyUsage, isCa);
+        bool? isCa = null,
+        IReadOnlyList<string>? applicationPolicies = null) => new(ekus, keyUsage, isCa, applicationPolicies);
 
     // ── The allowed shapes ──────────────────────────────────────────────
 
@@ -139,6 +140,67 @@ public class TlsCapabilityCeilingTests
 
         verdict.Allowed.Should().BeFalse();
         verdict.ReasonCode.Should().Be("ca-certificate");
+    }
+
+    // ── Application Policies (ESC15, issue #548) ────────────────────────
+
+    [Fact]
+    public void Evaluate_AbsentApplicationPolicies_Allows()
+    {
+        // The common TLS leaf: a serverAuth EKU and no Application Policies at
+        // all. Absence must not refuse, unlike an absent EKU.
+        var verdict = TlsCapabilityCeiling.Evaluate(
+            Capability(ekus: [TlsEkuOids.ServerAuth], applicationPolicies: null));
+
+        verdict.Allowed.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Evaluate_ServerAuthApplicationPolicy_Allows()
+    {
+        var verdict = TlsCapabilityCeiling.Evaluate(Capability(
+            ekus: [TlsEkuOids.ServerAuth], applicationPolicies: [TlsEkuOids.ServerAuth]));
+
+        verdict.Allowed.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Evaluate_SmartCardLogonApplicationPolicy_Refuses()
+    {
+        // The lab Run 4 shape: a serverAuth EKU that passes, but a smart card
+        // logon Application Policy Windows honours over it. The EKU only ceiling
+        // missed this; now it does not.
+        var verdict = TlsCapabilityCeiling.Evaluate(Capability(
+            ekus: [TlsEkuOids.ServerAuth],
+            applicationPolicies: [TlsEkuOids.SmartCardLogon]));
+
+        verdict.Allowed.Should().BeFalse();
+        verdict.ReasonCode.Should().Be("blacklisted-application-policy");
+        verdict.Message.Should().Contain("smart card logon").And.Contain(TlsEkuOids.SmartCardLogon);
+    }
+
+    [Fact]
+    public void Evaluate_UnknownApplicationPolicy_RefusesAsOutsideTheCeiling()
+    {
+        var verdict = TlsCapabilityCeiling.Evaluate(Capability(
+            ekus: [TlsEkuOids.ServerAuth], applicationPolicies: ["1.2.3.4.5.6"]));
+
+        verdict.Allowed.Should().BeFalse();
+        verdict.ReasonCode.Should().Be("application-policy-outside-ceiling");
+        verdict.Message.Should().Contain("1.2.3.4.5.6");
+    }
+
+    [Fact]
+    public void Evaluate_EkuStillJudgedBeforeApplicationPolicies()
+    {
+        // A dangerous EKU refuses on its own reason even when an Application
+        // Policy would also refuse, so the EKU verdict is not masked.
+        var verdict = TlsCapabilityCeiling.Evaluate(Capability(
+            ekus: [TlsEkuOids.CodeSigning],
+            applicationPolicies: [TlsEkuOids.SmartCardLogon]));
+
+        verdict.Allowed.Should().BeFalse();
+        verdict.ReasonCode.Should().Be("blacklisted-eku");
     }
 
     [Fact]

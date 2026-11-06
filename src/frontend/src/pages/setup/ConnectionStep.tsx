@@ -99,9 +99,11 @@ export function ConnectionStep({ state, onUpdate }: ConnectionStepProps) {
       <div>
         <h2 className="text-xl font-bold text-ink">Connect to Certificate Authority</h2>
         <p className="text-sm text-muted mt-1">
-          Pick the ADCS CA to issue certificates from, then test the connection. Ducks in a
-          Row connects over DCOM/RPC, which requires this server to be domain joined with
-          appropriate permissions on the CA.
+          {state.mode === 'monitor'
+            ? 'Pick the ADCS CA to watch, then test the connection. '
+            : 'Pick the ADCS CA to issue certificates from, then test the connection. '}
+          Ducks in a Row connects over DCOM/RPC, which requires this server to be domain joined
+          with appropriate permissions on the CA.
         </p>
       </div>
 
@@ -188,13 +190,28 @@ export function ConnectionStep({ state, onUpdate }: ConnectionStepProps) {
       <div className="bg-sunken border border-hairline rounded-lg p-4">
         <div className="flex items-start gap-3">
           <Server className="h-5 w-5 text-faint mt-0.5 shrink-0" />
-          <p className="text-xs text-muted">
-            The CA sees this server's computer account. It needs <strong>Request Certificates</strong>{' '}
-            on the CA, <strong>Enroll</strong> on each template you expose, <strong>Read</strong> on
-            the CA for the certificate inventory, and <strong>Issue and Manage Certificates</strong>{' '}
-            only if Ducks in a Row should revoke. Test Connection proves the first; once it passes,
-            the rights check below reports on the rest.
-          </p>
+          {state.mode === 'monitor' ? (
+            // Read is what monitor mode is for. Request Certificates stays on the
+            // list because every read of the CA's own properties, Test Connection
+            // included, goes through the request interface (#470; #531 would
+            // retire it).
+            <p className="text-xs text-muted">
+              The CA sees this server's computer account. In monitor mode it needs{' '}
+              <strong>Read</strong> on the CA for the certificate inventory, plus{' '}
+              <strong>Request Certificates</strong>, which a default CA already grants: every read
+              of the CA's own properties goes through it. It never needs <strong>Enroll</strong> or{' '}
+              <strong>Issue and Manage Certificates</strong>. Test Connection proves Request
+              Certificates; once it passes, the rights check below reports on Read.
+            </p>
+          ) : (
+            <p className="text-xs text-muted">
+              The CA sees this server's computer account. It needs <strong>Request Certificates</strong>{' '}
+              on the CA, <strong>Enroll</strong> on each template you expose, <strong>Read</strong> on
+              the CA for the certificate inventory, and <strong>Issue and Manage Certificates</strong>{' '}
+              only if Ducks in a Row should revoke, the automatic revocation at finalize included. Test
+              Connection proves the first; once it passes, the rights check below reports on the rest.
+            </p>
+          )}
         </div>
       </div>
 

@@ -35,6 +35,9 @@ public class CertusDbContext : DbContext
     public DbSet<MonitoredCrl> MonitoredCrls => Set<MonitoredCrl>();
     public DbSet<CrlAlertSent> CrlAlertsSent => Set<CrlAlertSent>();
 
+    // Licence alerts (issue #494): the (licence id, stage) pairs already sent
+    public DbSet<LicenceAlertSent> LicenceAlertsSent => Set<LicenceAlertSent>();
+
     // Domain policy audit: orders refused by the allowed domain list
     public DbSet<DomainPolicyRejection> DomainPolicyRejections => Set<DomainPolicyRejection>();
 
@@ -46,6 +49,12 @@ public class CertusDbContext : DbContext
     public DbSet<DeviceAttestationProfile> DeviceAttestationProfiles => Set<DeviceAttestationProfile>();
     public DbSet<DeviceAllowlistEntry> DeviceAllowlistEntries => Set<DeviceAllowlistEntry>();
     public DbSet<AttestationTrustAnchor> AttestationTrustAnchors => Set<AttestationTrustAnchor>();
+
+    // The administrator audit trail (issue #634, CRA risk R07): every action
+    // taken through the dashboard API, and failed dashboard sign ins counted
+    // per source address and hour
+    public DbSet<AdminAuditEntry> AdminAuditEntries => Set<AdminAuditEntry>();
+    public DbSet<AdminSignInFailure> AdminSignInFailures => Set<AdminSignInFailure>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -230,6 +239,8 @@ public class CertusDbContext : DbContext
             entity.HasIndex(e => new { e.CertificateId, e.ThresholdDays }).IsUnique();
 
             entity.Property(e => e.Channels).HasMaxLength(50).IsRequired();
+            // A subset of Channels, so whatever fits there fits here.
+            entity.Property(e => e.DeliveredChannels).HasMaxLength(50);
             entity.Property(e => e.ErrorMessage).HasMaxLength(1000);
 
             entity.HasOne(e => e.Certificate)
@@ -277,6 +288,22 @@ public class CertusDbContext : DbContext
             entity.Property(e => e.IssuerName).HasMaxLength(512).IsRequired();
             entity.Property(e => e.Channels).HasMaxLength(50).IsRequired();
             entity.Property(e => e.ErrorMessage).HasMaxLength(1000);
+        });
+
+        modelBuilder.Entity<LicenceAlertSent>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+
+            // One alert per licence per stage. A renewed licence has a new id and
+            // starts again; a restored one finds its stages already here.
+            entity.HasIndex(e => new { e.LicenceId, e.Stage }).IsUnique();
+
+            // Newest first, like the other alert histories, for a list that may read it.
+            entity.HasIndex(e => e.SentAt);
+
+            entity.Property(e => e.LicenceId).HasMaxLength(36).IsRequired();
+            entity.Property(e => e.Stage).HasMaxLength(20).IsRequired();
+            entity.Property(e => e.Channels).HasMaxLength(50).IsRequired();
         });
 
         modelBuilder.Entity<DomainPolicyRejection>(entity =>
@@ -328,6 +355,33 @@ public class CertusDbContext : DbContext
             entity.Property(e => e.Name).HasMaxLength(200).IsRequired();
             entity.Property(e => e.CertificatePem).IsRequired();
             entity.Property(e => e.Sha256Fingerprint).HasMaxLength(64).IsRequired();
+        });
+
+        modelBuilder.Entity<AdminAuditEntry>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+            // Newest first is the only order the page and the retention pass
+            // ask for; the actor filter walks the same index's rows.
+            entity.HasIndex(e => e.OccurredAt);
+            entity.HasIndex(e => e.Actor);
+            // The widths are enforced in AdminAuditTrail.Bound, not here
+            // (.claude/rules/ef-data.md); these only declare them.
+            entity.Property(e => e.Actor).HasMaxLength(256).IsRequired();
+            entity.Property(e => e.Action).HasMaxLength(100).IsRequired();
+            entity.Property(e => e.Target).HasMaxLength(500);
+            entity.Property(e => e.BeforeValue).HasMaxLength(4000);
+            entity.Property(e => e.AfterValue).HasMaxLength(4000);
+        });
+
+        modelBuilder.Entity<AdminSignInFailure>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+            // One row per source, status and hour: the recorder's upsert adds
+            // to it, and the unique index settles a race between two first
+            // failures in the same hour.
+            entity.HasIndex(e => new { e.SourceAddress, e.StatusCode, e.BucketStart }).IsUnique();
+            entity.HasIndex(e => e.BucketStart); // the window query and the retention pass
+            entity.Property(e => e.SourceAddress).HasMaxLength(64).IsRequired();
         });
     }
 

@@ -52,6 +52,16 @@ public static class CertificateTextSanitizer
     public const int MaxTemplateNameLength = 200;
 
     /// <summary>
+    /// The widest requester name we keep, matching the
+    /// <c>SyncedCertificate.Requestor</c> column. The CA writes a domain and an
+    /// account name here, which in practice runs to a few dozen characters, while
+    /// its own schema allows far more. As with the subject and the template,
+    /// SQLite would not refuse an over width value, so the bound has to be applied
+    /// here or nowhere.
+    /// </summary>
+    public const int MaxRequestorLength = 256;
+
+    /// <summary>
     /// The longest download file name we build, before the .pem or .cer
     /// extension is appended.
     ///
@@ -227,10 +237,44 @@ public static class CertificateTextSanitizer
     ///
     /// Returns null when nothing usable is left. The column is not nullable, so
     /// every writer coalesces to the empty string, which reads downstream as the
-    /// template being unknown and matches no configured set.
+    /// template being unknown and matches no configured set, a blank entry
+    /// included (TemplateInSetAsync refuses it outright, issue #545).
     /// </summary>
     public static string? SanitizeTemplateName(string? raw) =>
         StripAndBound(raw, MaxTemplateNameLength,
+            keepLineBreaks: false, preserveCommonName: false);
+
+    /// <summary>
+    /// Prepares the CA's requester name for storage and display (issue #429).
+    ///
+    /// The CA composes this value rather than copying it from the request: it is
+    /// the Windows identity that submitted, written as domain and account name.
+    /// That makes it less requester authored than the subject, but not authored by
+    /// Ducks. Whoever names an account names this column, and an ordinary domain
+    /// user can create computer accounts and choose what they are called, while an
+    /// enrollment agent can submit on behalf of another account. Whether the
+    /// directory accepts a format character in an account name has not been
+    /// measured, so this strip is defensive rather than a fix for an observed
+    /// value.
+    ///
+    /// It is persisted to <c>SyncedCertificate.Requestor</c>, which is indexed,
+    /// and reaches an administrator in three places: the certificate list, the
+    /// detail page, and the supersession links, where the requester is the
+    /// evidence that tells a renewal apart from two teams asking for the same
+    /// name. A bidirectional override there makes an admin read an identity that
+    /// is not the one that enrolled. Nothing in the product compares this value,
+    /// so unlike the template the strip changes no decision.
+    ///
+    /// The strip has one cost worth stating. Two names that differ only by an
+    /// invisible character read the same once it is gone. They already read the
+    /// same when rendered raw, so this is no loss of what an admin can see.
+    ///
+    /// Returns null when nothing usable is left, and that null is stored as it is:
+    /// the column is nullable and already means "the CA recorded no requester", so
+    /// unlike the template no writer coalesces it to the empty string.
+    /// </summary>
+    public static string? SanitizeRequestor(string? raw) =>
+        StripAndBound(raw, MaxRequestorLength,
             keepLineBreaks: false, preserveCommonName: false);
 
     /// <summary>

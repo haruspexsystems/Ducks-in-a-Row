@@ -183,6 +183,13 @@ public sealed class CertificateQueryService
 
         q = ordered.ThenBy(c => c.Id);
 
+        // The ACME to inventory bridge, as one captured query that the two
+        // correlated subqueries below inline. There is no foreign key between
+        // the synced inventory and the ACME tables, and the request id alone is
+        // not an identity once the install has been pointed at another CA, so
+        // a pair must agree on the serial too (issue #442).
+        var bridged = AcmeInventoryBridge.Pairs(_db.AcmeCertificates, _db.SyncedCertificates);
+
         // Pagination
         var rows = await q
             .Skip(query.Skip)
@@ -207,28 +214,26 @@ public sealed class CertificateQueryService
                     // The same value bridge as ContactJson below, asked as an
                     // existence question instead. Inside the projection on
                     // purpose: it translates to a correlated EXISTS in this one
-                    // statement, served by IX_AcmeCertificates_AdcsRequestId, so
-                    // the paged list gains no extra round trip.
-                    IssuedByAcme = _db.AcmeCertificates
-                        .Any(a => a.AdcsRequestId == c.RequestId),
+                    // statement, served by the primary key and
+                    // IX_AcmeCertificates_AdcsRequestId, so the paged list gains
+                    // no extra round trip.
+                    IssuedByAcme = bridged.Any(p => p.Inventory.Id == c.Id),
                     // Already on the row, computed once per sync by
                     // SupersessionLinker, so badging the list costs no extra
                     // query and cannot become an N plus 1.
                     SupersededById = c.SupersededByCertificateId
                 },
                 // Correlated scalar subquery: the contact JSON of the ACME
-                // account whose order produced this CA request, when one
-                // exists. There is no foreign key between the synced inventory
-                // and the ACME tables; the value bridge is
-                // SyncedCertificate.RequestId == AcmeCertificate.AdcsRequestId.
+                // account whose order produced this certificate, when one
+                // exists, across the bridge described above.
                 //
                 // Read by the table's last column only. See
                 // CertificateSummary.AcmeContactEmail for why this and the
                 // parse below are expected to leave with issue #156.
-                ContactJson = _db.AcmeCertificates
-                    .Where(a => a.AdcsRequestId == c.RequestId)
-                    .OrderBy(a => a.Id)
-                    .Select(a => a.Order.Account.ContactJson)
+                ContactJson = bridged
+                    .Where(p => p.Inventory.Id == c.Id)
+                    .OrderBy(p => p.Acme.Id)
+                    .Select(p => p.Acme.Order.Account.ContactJson)
                     .FirstOrDefault()
             })
             .ToListAsync(cancellationToken);
@@ -256,19 +261,20 @@ public sealed class CertificateQueryService
         if (entity == null)
             return null;
 
-        // Same value bridge as the list projection: RequestId links the synced
-        // inventory row to the ACME certificate that produced it, when one exists.
+        // Same bridge as the list projection, through the same rule: the request
+        // id and the serial link the synced inventory row to the ACME
+        // certificate that produced it, when one exists (issue #442).
         var contactJson = await _db.AcmeCertificates
-            .Where(a => a.AdcsRequestId == entity.RequestId)
+            .Where(AcmeInventoryBridge.AcmeRowsFor(entity))
             .OrderBy(a => a.Id)
             .Select(a => a.Order.Account.ContactJson)
             .FirstOrDefaultAsync(cancellationToken);
 
         // Asked separately rather than folded into the lookup above so it uses
-        // the identical predicate to the list projection and the two endpoints
+        // the identical rule to the list projection and the two endpoints
         // cannot drift. One indexed EXISTS on a single certificate page.
         var issuedByAcme = await _db.AcmeCertificates
-            .AnyAsync(a => a.AdcsRequestId == entity.RequestId, cancellationToken);
+            .AnyAsync(AcmeInventoryBridge.AcmeRowsFor(entity), cancellationToken);
 
         // Both ends of the inferred supersession relationship (issue #154). Two
         // small queries on one row's behalf, which is what a detail page is for;

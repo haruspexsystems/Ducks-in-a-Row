@@ -422,12 +422,14 @@ public class DatabaseInitializerTests : IDisposable
     }
 
     /// <summary>A synced row with the given subject, otherwise minimally valid.</summary>
-    private static SyncedCertificate SyncedRow(int requestId, string subject) => new()
+    private static SyncedCertificate SyncedRow(
+        int requestId, string subject, string? requestor = null, string templateName = "WebServer") => new()
     {
         RequestId = requestId,
         SerialNumber = $"44000000{requestId:X2}",
         Subject = subject,
-        TemplateName = "WebServer",
+        TemplateName = templateName,
+        Requestor = requestor,
         Status = "Issued",
         NotBefore = new DateTime(2026, 7, 1, 0, 0, 0, DateTimeKind.Utc),
         NotAfter = new DateTime(2028, 7, 1, 0, 0, 0, DateTimeKind.Utc),
@@ -489,6 +491,138 @@ public class DatabaseInitializerTests : IDisposable
         var row = db.SyncedCertificates.Single();
         row.Subject.Should().Be("CN=clean.example.com");
         row.LastSyncedAt.Should().Be(before);
+    }
+
+    [Fact]
+    public void StoredRequestors_AreSanitizedAtStartup()
+    {
+        // The rows the sync never heals on its own (issue #429): a request
+        // resolved before the request history window, and a row the CA no longer
+        // returns. Unlike the subject, null is kept as null and a requester that
+        // sanitizes away becomes null, because the column is nullable.
+        var rlo = (char)0x202e;
+        var zwsp = (char)0x200b;
+
+        using (var seed = CreateContext())
+        {
+            DatabaseInitializer.Initialize(seed, enableWalMode: false, NullLogger.Instance);
+            seed.SyncedCertificates.AddRange(
+                SyncedRow(1, "CN=one.example.com", "HOME\\web" + rlo + "01$"),
+                SyncedRow(2, "CN=two.example.com", "HOME\\" + new string('x', 9000)),
+                SyncedRow(3, "CN=three.example.com", rlo.ToString() + zwsp),
+                SyncedRow(4, "CN=four.example.com", null),
+                SyncedRow(5, "CN=five.example.com", "HOME\\certus-svc"));
+            seed.SaveChanges();
+        }
+
+        var logger = new RecordingLogger();
+        using var db = CreateContext();
+        DatabaseInitializer.Initialize(db, enableWalMode: false, logger);
+
+        var rows = db.SyncedCertificates.OrderBy(c => c.RequestId).ToList();
+        rows[0].Requestor.Should().Be("HOME\\web01$");
+        rows[1].Requestor.Should().HaveLength(CertificateTextSanitizer.MaxRequestorLength);
+        rows[2].Requestor.Should().BeNull(
+            "a requester that is nothing but format characters has no name left, and the "
+            + "column is nullable, so null is the established no requester value");
+        rows[3].Requestor.Should().BeNull("a missing requester must stay missing");
+        rows[4].Requestor.Should().Be("HOME\\certus-svc", "a clean row must be left alone");
+        logger.Informations.Should().ContainSingle(m => m.StartsWith("Sanitized 3 stored certificate requester"),
+            "exactly the three poisoned rows were rewritten, not the null one or the clean one");
+    }
+
+    [Fact]
+    public void StoredRequestors_SanitizingIsANoOpOnCleanData()
+    {
+        // Runs unconditionally on every start, like the subject sweep, so it has
+        // to cost nothing once the data is clean, null requesters included. The
+        // sweep logs only when it rewrites something, so a silent log is the
+        // witness that nothing was written.
+        using (var seed = CreateContext())
+        {
+            DatabaseInitializer.Initialize(seed, enableWalMode: false, NullLogger.Instance);
+            seed.SyncedCertificates.AddRange(
+                SyncedRow(1, "CN=one.example.com", "HOME\\certus-svc"),
+                SyncedRow(2, "CN=two.example.com", null));
+            seed.SaveChanges();
+        }
+
+        var logger = new RecordingLogger();
+        using var db = CreateContext();
+        DatabaseInitializer.Initialize(db, enableWalMode: false, logger);
+
+        var rows = db.SyncedCertificates.OrderBy(c => c.RequestId).ToList();
+        rows[0].Requestor.Should().Be("HOME\\certus-svc");
+        rows[1].Requestor.Should().BeNull();
+        logger.Informations.Should().NotContain(m => m.Contains("requester"));
+    }
+
+    [Fact]
+    public void StoredTemplateNames_AreSanitizedAtStartup()
+    {
+        // The rows the sync never heals on its own (issue #545), the same two the
+        // requester sweep names: a request resolved before the request history
+        // window, which the first row stands for, and a row the CA no longer
+        // returns. Like the subject and unlike the requester, a name that
+        // sanitizes away becomes the empty string, because the column is
+        // required; empty reads as an unknown template and matches no scope.
+        var rlo = (char)0x202e;
+        var zwsp = (char)0x200b;
+
+        using (var seed = CreateContext())
+        {
+            DatabaseInitializer.Initialize(seed, enableWalMode: false, NullLogger.Instance);
+            var deniedLongAgo = SyncedRow(1, "CN=one.example.com", templateName: "Web" + rlo + "Server");
+            deniedLongAgo.Status = "Denied";
+            deniedLongAgo.SerialNumber = "";
+            seed.SyncedCertificates.AddRange(
+                deniedLongAgo,
+                SyncedRow(2, "CN=two.example.com", templateName: new string('x', 9000)),
+                SyncedRow(3, "CN=three.example.com", templateName: rlo.ToString() + zwsp),
+                SyncedRow(4, "CN=four.example.com", templateName: "WebServer"));
+            seed.SaveChanges();
+        }
+
+        var logger = new RecordingLogger();
+        using var db = CreateContext();
+        DatabaseInitializer.Initialize(db, enableWalMode: false, logger);
+
+        var rows = db.SyncedCertificates.OrderBy(c => c.RequestId).ToList();
+        rows[0].TemplateName.Should().Be("WebServer");
+        rows[1].TemplateName.Should().HaveLength(CertificateTextSanitizer.MaxTemplateNameLength);
+        rows[2].TemplateName.Should().BeEmpty(
+            "a template name that is nothing but format characters has no name left, and the "
+            + "column is required, so empty is the established unknown template value");
+        rows[3].TemplateName.Should().Be("WebServer", "a clean row must be left alone");
+        logger.Informations.Should().ContainSingle(m => m.StartsWith("Sanitized 3 stored certificate template"),
+            "exactly the three poisoned rows were rewritten, not the clean one");
+    }
+
+    [Fact]
+    public void StoredTemplateNames_SanitizingIsANoOpOnCleanData()
+    {
+        // Runs unconditionally on every start, like the other two sweeps, so it
+        // has to cost nothing once the data is clean. An empty template name is
+        // clean data too: the sanitizer answers null for it and the coalesce
+        // turns that back into the same empty string, so it must not read as a
+        // change on every start.
+        using (var seed = CreateContext())
+        {
+            DatabaseInitializer.Initialize(seed, enableWalMode: false, NullLogger.Instance);
+            seed.SyncedCertificates.AddRange(
+                SyncedRow(1, "CN=one.example.com", templateName: "WebServer"),
+                SyncedRow(2, "CN=two.example.com", templateName: ""));
+            seed.SaveChanges();
+        }
+
+        var logger = new RecordingLogger();
+        using var db = CreateContext();
+        DatabaseInitializer.Initialize(db, enableWalMode: false, logger);
+
+        var rows = db.SyncedCertificates.OrderBy(c => c.RequestId).ToList();
+        rows[0].TemplateName.Should().Be("WebServer");
+        rows[1].TemplateName.Should().BeEmpty();
+        logger.Informations.Should().NotContain(m => m.Contains("template"));
     }
 
     /// <summary>

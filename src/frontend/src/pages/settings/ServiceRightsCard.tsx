@@ -1,8 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, KeyRound, Loader2, RefreshCw } from 'lucide-react';
+import { AlertTriangle, HelpCircle, KeyRound, Loader2, RefreshCw } from 'lucide-react';
 import { ApiError } from '@/api/client';
 import { fetchServiceRights, recheckServiceRights } from '@/api/serviceRights';
 import { ServiceRightsReportView } from '@/components/ServiceRightsReport';
+import { templatesNotCheckedText } from '@/lib/serviceRights';
 
 /**
  * Settings card with the service rights check for the configured CA and the
@@ -32,6 +33,7 @@ export function ServiceRightsCard() {
 
   const unconfigured = error instanceof ApiError && error.status === 409;
   const failure = recheck.error ?? (unconfigured ? null : error);
+  const notChecked = data ? templatesNotCheckedText(data) : null;
 
   return (
     <div className="bg-surface border border-hairline rounded-lg p-6 space-y-4">
@@ -82,6 +84,14 @@ export function ServiceRightsCard() {
       {data && (
         <>
           <ServiceRightsReportView report={data} />
+          {/* Templates past what one check reads have no rows, and their
+              absence must not read as a clean answer (issue #478). */}
+          {notChecked && (
+            <div className="flex items-start gap-2 rounded-lg border border-hairline bg-sunken p-2.5">
+              <HelpCircle className="h-4 w-4 text-faint mt-0.5 shrink-0" aria-hidden="true" />
+              <p className="text-xs text-muted">{notChecked}</p>
+            </div>
+          )}
           <p className="text-xs text-faint border-t border-hairline-soft pt-3">
             Checked {new Date(data.checkedAt).toLocaleString()}
           </p>

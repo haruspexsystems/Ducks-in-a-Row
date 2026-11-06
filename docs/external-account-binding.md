@@ -12,14 +12,23 @@ Administration lives on the **ACME** tab of the dashboard.
 
 | Mode | What a registering client needs |
 |---|---|
-| Off | Nothing. A presented binding is ignored. This is the default |
+| Off | Nothing. A presented binding is ignored. The default for an install upgraded from a version without this setting |
 | Optional | Nothing, but a presented binding is verified and recorded |
-| Required | A valid credential. Registration without one is refused with `externalAccountRequired` |
+| Required | A valid credential. Registration without one is refused with `externalAccountRequired`. The default for a new install |
+
+**A new install requires binding.** The setup wizard's Client Access step
+arrives with it switched on, and switching it off there is an explicit choice
+with a one line warning. Leave it on: in an Active Directory domain an ordinary
+user can create the DNS records a challenge asks for, so without binding a
+passed challenge proves little about who is asking (see
+[hardening](hardening.md#active-directory-integrated-dns-and-dns-01)). The cost
+is one step before the first certificate, issuing a credential, which the
+[quickstart](quickstart.md#issue-a-credential) walks through.
 
 The mode applies immediately when you change it. There is no restart, and an
-upgrade from a version without this feature reads as Off, so nothing changes
+upgrade from a version without this setting reads as Off, so nothing changes
 underneath an existing install. Re-running the setup wizard on a configured
-server does not reset it either.
+server keeps the mode it already has, and shows it on the Client Access step.
 
 **Raising the mode to Required does not lock out accounts that already exist.**
 Accounts registered before the change keep working, and the ACME page lists

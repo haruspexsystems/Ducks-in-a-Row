@@ -23,6 +23,7 @@ public sealed class StartupValidator
     private readonly AcmeRateLimitOptions _rateLimitOptions;
     private readonly AcmeOptions _acmeOptions;
     private readonly RevocationScopePolicy _revocationScope;
+    private readonly CertusInstanceMode _instanceMode;
     private readonly IConfiguration _configuration;
     private readonly ILogger<StartupValidator> _logger;
 
@@ -32,6 +33,7 @@ public sealed class StartupValidator
         IOptions<AcmeRateLimitOptions> rateLimitOptions,
         IOptions<AcmeOptions> acmeOptions,
         RevocationScopePolicy revocationScope,
+        CertusInstanceMode instanceMode,
         IConfiguration configuration,
         ILogger<StartupValidator> logger)
     {
@@ -40,6 +42,7 @@ public sealed class StartupValidator
         _rateLimitOptions = rateLimitOptions.Value;
         _acmeOptions = acmeOptions.Value;
         _revocationScope = revocationScope;
+        _instanceMode = instanceMode;
         _configuration = configuration;
         _logger = logger;
     }
@@ -48,10 +51,23 @@ public sealed class StartupValidator
     /// Run all startup validation checks. Returns the number of warnings.
     /// Throws <see cref="InvalidOperationException"/> when authentication is
     /// disabled while a real CA is configured (issue #27, SEC-F1): the
-    /// development bypass must never expose a production CA inventory.
+    /// development bypass must never expose a production CA inventory. Also
+    /// throws when the instance mode value cannot be honoured (issue #470).
     /// </summary>
     public int Validate()
     {
+        // First, because every other check assumes a mode, and because the host
+        // has been registering its services as for monitor mode while it waited
+        // for this refusal. See CertusInstanceMode for why it waits until here.
+        if (_instanceMode.InvalidReason is { } invalidMode)
+        {
+            throw new InvalidOperationException(
+                $"The instance mode in {_instanceMode.Source} cannot be used: {invalidMode}. " +
+                $"Set it to '{CertusInstanceMode.MonitorValue}' to watch the CA without ever " +
+                $"writing to it, to '{CertusInstanceMode.FullValue}' for issuance and " +
+                "revocation, or delete the value for full mode, then start the service again.");
+        }
+
         if (_authOptions.IsDisabled && !string.IsNullOrEmpty(_options.CaConnectionString))
         {
             throw new InvalidOperationException(
@@ -78,15 +94,28 @@ public sealed class StartupValidator
             warnings++;
         }
 
-        // Check external URL
+        // Check external URL. In monitor mode no ACME directory is served, so
+        // the URL only names the dashboard's address and the lines say so
+        // rather than sending an operator after ACME clients (issue #532).
         if (string.IsNullOrEmpty(_options.ExternalUrl))
         {
-            _logger.LogWarning("ExternalUrl is not configured — ACME directory URLs will use relative paths");
-            warnings++;
+            if (_instanceMode.IsMonitor)
+            {
+                _logger.LogInformation(
+                    "ExternalUrl is not configured. Monitor mode serves no ACME directory, so it " +
+                    "only names the address the dashboard is reached at");
+            }
+            else
+            {
+                _logger.LogWarning("ExternalUrl is not configured — ACME directory URLs will use relative paths");
+                warnings++;
+            }
         }
         else if (_options.ExternalUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
         {
-            _logger.LogWarning("ExternalUrl uses HTTP — ACME clients may require HTTPS for production use");
+            _logger.LogWarning(_instanceMode.IsMonitor
+                ? "ExternalUrl uses HTTP, so browsers opening the dashboard at that address connect without TLS"
+                : "ExternalUrl uses HTTP — ACME clients may require HTTPS for production use");
             warnings++;
         }
 
@@ -165,13 +194,25 @@ public sealed class StartupValidator
 
         // Check the ACME template exposure override (issue #101). The template
         // policy fails closed without it, so the open posture must be visible
-        // on every boot, not only on the first ACME request.
+        // on every boot, not only on the first ACME request. In monitor mode
+        // nothing is exposed whatever it says, so it is named without being
+        // counted (issue #532): a warning would send an operator to close an
+        // exposure that cannot happen, and it comes back after a switch to full.
         if (_acmeOptions.ExposeAllTemplates)
         {
-            _logger.LogWarning(
-                "Certus:Acme:ExposeAllTemplates is true — every CA published template is " +
-                "exposed via ACME regardless of the wizard's template selection");
-            warnings++;
+            if (_instanceMode.IsMonitor)
+            {
+                _logger.LogInformation(
+                    "Certus:Acme:ExposeAllTemplates is true, which has no effect in monitor mode, " +
+                    "where no template is exposed via ACME. It applies again after a switch to full mode");
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "Certus:Acme:ExposeAllTemplates is true — every CA published template is " +
+                    "exposed via ACME regardless of the wizard's template selection");
+                warnings++;
+            }
         }
 
         // The revocation scope's wide posture must be as visible as the
@@ -181,7 +222,15 @@ public sealed class StartupValidator
         // disabled entirely); it fails safe, so an Information line rather
         // than a warning.
         var revocationScope = _revocationScope.GetSnapshot();
-        if (revocationScope.Mode == RevocationScopeMode.All)
+        if (revocationScope.Mode == RevocationScopeMode.All && _instanceMode.IsMonitor)
+        {
+            // Monitor mode revokes nothing, so the same reasoning as the template
+            // override above (issue #532).
+            _logger.LogInformation(
+                "The revocation scope is all, which has no effect in monitor mode, where " +
+                "nothing is revocable from the dashboard. It applies again after a switch to full mode");
+        }
+        else if (revocationScope.Mode == RevocationScopeMode.All)
         {
             _logger.LogWarning(
                 "The revocation scope is all: every certificate the TLS capability " +
@@ -263,6 +312,28 @@ public sealed class StartupValidator
                     "NAT gateway, every ACME client counts as one caller against a shared limit. " +
                     "Set Auth:TrustedProxies to the proxy's address so the real client address is used.");
             }
+        }
+
+        // The resource caps (issue #632) apply whether or not the per address
+        // limiter is enabled: they bound what one request or one account can
+        // make the server store, not how often it may ask. A cap below 1 is
+        // either clamped (the nonce store) or refuses every order, so say so.
+        if (_rateLimitOptions.MaxStoredNonces < 1)
+        {
+            _logger.LogWarning("Certus:RateLimiting:MaxStoredNonces is less than 1: the nonce store needs at least one entry, so 1 is being used instead");
+            warnings++;
+        }
+
+        if (_rateLimitOptions.MaxIdentifiersPerOrder < 1)
+        {
+            _logger.LogWarning("Certus:RateLimiting:MaxIdentifiersPerOrder is less than 1: every ACME new order request will be refused as malformed");
+            warnings++;
+        }
+
+        if (_rateLimitOptions.MaxPendingOrdersPerAccount < 1)
+        {
+            _logger.LogWarning("Certus:RateLimiting:MaxPendingOrdersPerAccount is less than 1: every ACME new order request will be refused as rate limited");
+            warnings++;
         }
 
         // Check authentication configuration

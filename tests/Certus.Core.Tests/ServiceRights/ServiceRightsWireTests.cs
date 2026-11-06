@@ -77,4 +77,41 @@ public class ServiceRightsWireTests
         wire.Rows.Should().ContainSingle().Which.Should().BeEquivalentTo(new ServiceRightsRowWire(
             "ca-read", "ca", "View", "failed", "exercised", ["inventory"], "refused", "grant Read", false, null));
     }
+
+    /// <summary>
+    /// Issue #470. A row is not needed in monitor mode only when everything it is needed
+    /// for is something monitor mode never does. A row that also serves the inventory or
+    /// CRL watching stays needed, and so does a row that lists nothing, because marking it
+    /// would tell an operator not to ask for a right nobody has decided about.
+    /// </summary>
+    [Theory]
+    [InlineData(RightNeededFor.Issuance, true)]
+    [InlineData(RightNeededFor.Revocation, true)]
+    [InlineData(RightNeededFor.Issuance | RightNeededFor.Revocation, true)]
+    [InlineData(RightNeededFor.None, false)]
+    [InlineData(RightNeededFor.Inventory, false)]
+    [InlineData(RightNeededFor.CrlWatching, false)]
+    [InlineData(RightNeededFor.Revocation | RightNeededFor.Inventory, false)]
+    [InlineData(RightNeededFor.Issuance | RightNeededFor.CrlWatching, false)]
+    public void NotNeededInMonitorMode_OnlyWhenEveryUseIsIssuanceOrRevocation(RightNeededFor neededFor, bool expected)
+    {
+        ServiceRightsReport.IsNotNeededInMonitorMode(neededFor).Should().Be(expected);
+    }
+
+    [Fact]
+    public void TheMarking_RidesOnlyOnAMonitorModeWire()
+    {
+        var report = new ServiceRightsReport(
+            @"ca\CA",
+            new ServiceRightsIdentity(@"NT AUTHORITY\SYSTEM", true, @"CORP\DUCKS01$", "S-1-5-21-1-2-3-1105", "CORP", 3),
+            [new ServiceRightsRow("template:WebServer", RightsGroup.Template, "Enroll", RightsStatus.Failed,
+                RightsBasis.ReadFromAcl, RightNeededFor.Issuance, "no Enroll", Remedy: "grant Enroll")],
+            Simulated: false,
+            CheckedAt: DateTimeOffset.UnixEpoch);
+
+        report.ToWire().Rows.Single().NotNeeded.Should().BeNull();
+        report.ToWire(Certus.Core.Configuration.CertusInstanceMode.Full).Rows.Single().NotNeeded.Should().BeNull();
+        report.ToWire(Certus.Core.Configuration.CertusInstanceMode.Monitor).Rows.Single().NotNeeded
+            .Should().Be(ServiceRightsWire.NotNeededInMonitorMode);
+    }
 }

@@ -33,10 +33,19 @@ public static class TlsEkuOids
 /// <param name="ExtendedKeyUsageOids">EKU OIDs; null means no EKU extension.</param>
 /// <param name="KeyUsage">Raw key usage flags; null means no KU extension.</param>
 /// <param name="IsCa">BasicConstraints cA; null means no extension.</param>
+/// <param name="ApplicationPolicyOids">
+/// Microsoft Application Policy OIDs (szOID_APPLICATION_CERT_POLICIES,
+/// 1.3.6.1.4.1.311.21.10); null means no such extension. Windows honours
+/// Application Policies over the EKU, so a certificate can carry a dangerous
+/// capability here that its EKU does not show (ESC15, issue #548). They are
+/// judged against the same ceiling as the EKU. Absence is routine and passes;
+/// the constraint applies only when the extension is present.
+/// </param>
 public sealed record CertificateCapability(
     IReadOnlyList<string>? ExtendedKeyUsageOids,
     X509KeyUsageFlags? KeyUsage,
-    bool? IsCa);
+    bool? IsCa,
+    IReadOnlyList<string>? ApplicationPolicyOids = null);
 
 /// <summary>
 /// The ceiling's verdict: allowed, or a machine readable reason plus a human
@@ -63,11 +72,15 @@ public sealed record CeilingVerdict(bool Allowed, string? ReasonCode, string? Me
 ///      covers these; the explicit list exists for the precise message.
 ///   5. Any EKU outside serverAuth plus clientAuth is refused, so an unknown
 ///      or custom OID can never widen what Ducks touches.
+///   6. A present Application Policies extension is judged by the same blacklist
+///      and subset rules as the EKU, because Windows honours Application
+///      Policies over the EKU (ESC15, issue #548). An absent one passes.
 ///
 /// An absent key usage extension passes rule 2 and an absent BasicConstraints
 /// passes rule 1: both absences are routine on real TLS leaves, and the EKU
-/// subset rule stays the primary gate. The ceiling is unconditional by
-/// design; no administrator setting may widen it, and the revocation scope
+/// subset rule stays the primary gate. An absent Application Policies extension
+/// passes rule 6, the common case for a TLS leaf. The ceiling is unconditional
+/// by design; no administrator setting may widen it, and the revocation scope
 /// modes only ever narrow within it.
 /// </summary>
 public static class TlsCapabilityCeiling
@@ -112,22 +125,50 @@ public static class TlsCapabilityCeiling
                 "There is no extended key usage restriction, so the certificate is valid for every purpose.");
         }
 
-        foreach (var oid in ekus)
+        var ekuVerdict = JudgeUsageOids(ekus, "extended key usage", "eku");
+        if (!ekuVerdict.Allowed)
+            return ekuVerdict;
+
+        // Application Policies are judged only when present. Unlike the EKU,
+        // their absence is routine on a TLS leaf and is not "valid for every
+        // purpose": the EKU already restricts the certificate. When present,
+        // they are held to the same ceiling, because Windows honours them over
+        // the EKU (ESC15, issue #548).
+        if (capability.ApplicationPolicyOids is { Count: > 0 } policies)
+        {
+            var policyVerdict = JudgeUsageOids(policies, "application policy", "application-policy");
+            if (!policyVerdict.Allowed)
+                return policyVerdict;
+        }
+
+        return CeilingVerdict.Ok;
+    }
+
+    /// <summary>
+    /// The blacklist and subset rules (4 and 5 above) over one set of usage
+    /// OIDs, shared by the EKU and the Application Policies so the two cannot
+    /// drift. <paramref name="label"/> and <paramref name="reasonPrefix"/>
+    /// shape the message and the machine readable reason code.
+    /// </summary>
+    private static CeilingVerdict JudgeUsageOids(
+        IReadOnlyList<string> oids, string label, string reasonPrefix)
+    {
+        foreach (var oid in oids)
         {
             if (BlacklistedEkuNames.TryGetValue(oid, out var name))
             {
-                return new CeilingVerdict(false, "blacklisted-eku",
-                    $"The extended key usage includes {name} ({oid}).");
+                return new CeilingVerdict(false, $"blacklisted-{reasonPrefix}",
+                    $"The {label} includes {name} ({oid}).");
             }
         }
 
-        foreach (var oid in ekus)
+        foreach (var oid in oids)
         {
             if (!string.Equals(oid, TlsEkuOids.ServerAuth, StringComparison.Ordinal) &&
                 !string.Equals(oid, TlsEkuOids.ClientAuth, StringComparison.Ordinal))
             {
-                return new CeilingVerdict(false, "eku-outside-ceiling",
-                    $"The extended key usage {oid} is outside the TLS ceiling (server and client authentication only).");
+                return new CeilingVerdict(false, $"{reasonPrefix}-outside-ceiling",
+                    $"The {label} {oid} is outside the TLS ceiling (server and client authentication only).");
             }
         }
 

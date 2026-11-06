@@ -3,6 +3,7 @@ import { AlertTriangle, Landmark, Loader2 } from 'lucide-react';
 import { fetchCaCertificates, type CaCertificateSummary } from '@/api/settings';
 import { ApiError } from '@/api/client';
 import { DownloadLink } from '@/components/DownloadLink';
+import { describeChainLoadFailure } from '@/lib/caCertificates';
 import { extractCN } from '@/types';
 
 /**
@@ -19,7 +20,7 @@ export function CaCertificatesCard() {
     retry: false,
   });
 
-  const caUnavailable = error instanceof ApiError && error.status === 503;
+  const failureText = describeChainLoadFailure(error instanceof ApiError ? error : undefined);
 
   return (
     <div className="bg-surface border border-hairline rounded-lg p-6 space-y-4">
@@ -44,11 +45,7 @@ export function CaCertificatesCard() {
       {!isLoading && error != null && (
         <div className="bg-red-50 dark:bg-red-500/10 border border-red-200 dark:border-red-500/30 rounded-lg p-3 flex items-start gap-2">
           <AlertTriangle className="h-4 w-4 text-red-500 mt-0.5" />
-          <p className="text-xs text-red-700 dark:text-red-300">
-            {caUnavailable
-              ? 'The certificate authority is unavailable. Try again shortly.'
-              : 'The CA certificate chain could not be loaded. Check the service log.'}
-          </p>
+          <p className="text-xs text-red-700 dark:text-red-300">{failureText}</p>
         </div>
       )}
 

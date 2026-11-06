@@ -11,8 +11,8 @@ using Certus.Core.ServiceRights;
 /// own account do, measured rather than read off an access list or a
 /// specification.
 ///
-/// Every call here is a read. The questions it settles, one state of the CA's
-/// permissions at a time:
+/// Every call here is a read except question 9, which runs only when asked for.
+/// The questions it settles, one state of the CA's permissions at a time:
 ///
 ///   1. Does the wizard's Test Connection (GetCAProperty 6 and 22 through
 ///      CertRequest) need a right at all, and which one? [MS-CSRA] lists the
@@ -42,6 +42,9 @@ using Certus.Core.ServiceRights;
 ///   8. Issue #469: does the template read the product makes over LDAP answer?
 ///      Directory permissions govern it, not the CA's, so it is read in every
 ///      state to show that rather than assert it.
+///   9. Issue #566: when the CA refuses the account, does Submit itself throw,
+///      and with which HRESULT, or does it return a denied disposition? Opt in
+///      through CERTUS_PROBE_SUBMIT, because it writes a request to the CA.
 ///
 /// Questions 5 and 8 only mean something as SYSTEM, which reaches the directory
 /// as the computer account. Run as the lab administrator inside a WinRM session
@@ -184,6 +187,7 @@ internal static class RightsProbe
         ReportCollectIssued(caConfig, "collect.issued", collectId,
             "set CERTUS_PROBE_COLLECT_ID to one of the account's own request ids");
         ReportCollectIssued(caConfig, "collect.other", requestId, "");
+        ReportSubmit(caConfig);
 
         Console.WriteLine();
         if (isSystem)
@@ -1026,6 +1030,71 @@ internal static class RightsProbe
     {
         foreach (var value in result.Properties[property])
             yield return Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? "";
+    }
+
+    /// <summary>CR_IN_BASE64 and CR_IN_PKCS10, the flags the product submits with.</summary>
+    private const int InBase64 = 0x1;
+    private const int InPkcs10 = 0x100;
+
+    /// <summary>
+    /// Issue #566: what Submit itself does when the CA refuses the account, in the
+    /// product's call shape (SubmitCertificateRequestAsync: base64 PKCS#10, one
+    /// CertificateTemplate attribute). A refusal can come back as a thrown
+    /// HRESULT or as a denied disposition, and the product maps the two
+    /// differently, so the line says which shape arrived.
+    ///
+    /// The probe's only write: in a state that lets the account enroll it adds a
+    /// request row to the CA, which a lab revert takes away. So it runs only when
+    /// CERTUS_PROBE_SUBMIT names the template. The key is made here and never
+    /// leaves the process.
+    /// </summary>
+    private static void ReportSubmit(string caConfig)
+    {
+        var template = Environment.GetEnvironmentVariable("CERTUS_PROBE_SUBMIT")?.Trim();
+        if (string.IsNullOrEmpty(template))
+        {
+            Line("submit", "skipped", "reason=set CERTUS_PROBE_SUBMIT to a template name; the submit writes a request to the CA");
+            return;
+        }
+        if (!System.Text.RegularExpressions.Regex.IsMatch(template, "^[A-Za-z0-9_-]+$"))
+        {
+            Line("submit", "skipped", "reason=CERTUS_PROBE_SUBMIT must be a programmatic template name (letters, digits, '_' and '-')");
+            return;
+        }
+
+        object? raw = null;
+        var returned = false;
+        try
+        {
+            using var key = RSA.Create(2048);
+            var csr = new System.Security.Cryptography.X509Certificates.CertificateRequest(
+                $"CN=certus-probe-submit.{Environment.MachineName.ToLowerInvariant()}", key,
+                HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            var csrBase64 = Convert.ToBase64String(csr.CreateSigningRequest());
+
+            raw = Activator.CreateInstance(Type.GetTypeFromCLSID(CertRequestClsid)!);
+            dynamic request = raw!;
+            var disposition = (int)request.Submit(InBase64 | InPkcs10, csrBase64, $"CertificateTemplate:{template}", caConfig);
+            returned = true;
+
+            string status;
+            try { status = $"0x{(int)request.GetLastStatus():X8}"; }
+            catch (Exception ex) { status = $"unread(0x{Marshal.GetHRForException(ex):X8})"; }
+            string requestId;
+            try { requestId = ((int)request.GetRequestId()).ToString(System.Globalization.CultureInfo.InvariantCulture); }
+            catch (Exception ex) { requestId = $"unread(0x{Marshal.GetHRForException(ex):X8})"; }
+
+            Line("submit", "returned", $"template={template} disposition={disposition} requestId={requestId} lastStatus={status}");
+        }
+        catch (Exception ex)
+        {
+            // Which side of the Submit line it failed on is the whole question.
+            Fail(returned ? "submit.after" : "submit", ex);
+        }
+        finally
+        {
+            Release(raw);
+        }
     }
 
     private static IEnumerable<string> ReadTemplates()

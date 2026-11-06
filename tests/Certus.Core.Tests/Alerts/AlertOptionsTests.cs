@@ -44,6 +44,66 @@ public class AlertOptionsTests
         options.ThresholdDays.Should().Equal(99, 7, 1);
     }
 
+    // ── A list with no usable value falls back like an empty one (issue #465) ──
+
+    [Theory]
+    [InlineData(new[] { 0 })]
+    [InlineData(new[] { -1 })]
+    [InlineData(new[] { 0, -3 })]
+    [InlineData(new[] { 0, 0, -1, -30 })]
+    public void Normalize_NoPositiveThreshold_AppliesDefaults(int[] configured)
+    {
+        // The list is not empty, so a length test on the input passes it, and
+        // filtering then leaves nothing. Stored as an empty array, the expiry
+        // monitor and the CRL ladder iterate it and send no warning at all,
+        // while ExpiryWarningDays falls back to 30 on its own guard and the
+        // dashboard keeps showing a 30 day window nothing warns about.
+        var options = new AlertOptions { ThresholdDays = configured };
+
+        options.NormalizeThresholdDays();
+
+        options.ThresholdDays.Should().Equal(30, 14, 7, 1);
+        options.ExpiryWarningDays.Should().Be(AlertOptions.DefaultExpiryWarningDays);
+    }
+
+    [Fact]
+    public void Binding_AllZeroArray_FallsBackToTheDefaults()
+    {
+        // The real route in: a configuration source supplying only zero, the
+        // way an environment variable Certus__Alerts__ThresholdDays__0=0 does.
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["Certus:Alerts:ThresholdDays:0"] = "0",
+            })
+            .Build();
+
+        var options = new AlertOptions();
+        config.GetSection(AlertOptions.SectionName).Bind(options);
+        options.ThresholdDays.Should().Equal(0);
+
+        options.NormalizeThresholdDays();
+
+        options.ThresholdDays.Should().Equal(30, 14, 7, 1);
+    }
+
+    [Fact]
+    public void ApplyOverlay_HandEditedAllNegativeList_IsCaughtByNormalize()
+    {
+        // ApplyOverlay replaces the array wholesale and validates nothing, on
+        // purpose, so a settings.json edited by hand to [-1] reaches the
+        // normalizer as it stands. The dashboard refuses to save such a list;
+        // the normalizer is what must catch one that arrived another way.
+        var options = new AlertOptions { ThresholdDays = [30, 14, 7, 1] };
+
+        options.ApplyOverlay(
+            new SettingsOverlay.AlertOverlaySettings(ThresholdDays: [-1]),
+            NothingOutranked);
+        options.NormalizeThresholdDays();
+
+        options.ThresholdDays.Should().Equal(30, 14, 7, 1);
+    }
+
     // ── ExpiryWarningDays: the one window the whole UI reads (issue #152) ──
 
     [Fact]

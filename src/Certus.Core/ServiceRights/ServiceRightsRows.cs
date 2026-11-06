@@ -273,11 +273,23 @@ public static class ServiceRightsRows
         }
     }
 
+    /// <summary>
+    /// Every revocation the product makes. All three call the CA's
+    /// RevokeCertificate as the service's account: <c>CertificateRevocationService</c>
+    /// for the dashboard, and <c>OrderService</c> for ACME revoke-cert and for the
+    /// automatic revocation of a certificate the finalize guard refuses (issue
+    /// #515). The automatic one is named without the guard's reason for refusing,
+    /// so the words stay true whichever checks the guard runs.
+    /// </summary>
+    private const string EveryRevocation =
+        "from the dashboard, through ACME revoke-cert, and automatically at finalize";
+
     internal static ServiceRightsRow IssueAndManage(
         CaRolesReading? roles, CaCallObservation connect, ServiceRightsFindings findings, string account)
     {
         const string title = "Issue and Manage Certificates on the CA";
-        var needed = findings.ViewOpenProvesInventory
+        var inventoryProven = findings.ViewOpenProvesInventory;
+        var needed = inventoryProven
             ? RightNeededFor.Revocation
             : RightNeededFor.Revocation | RightNeededFor.Inventory;
 
@@ -285,13 +297,30 @@ public static class ServiceRightsRows
             return new("ca-officer", RightsGroup.Ca, title, RightsStatus.Skipped, RightsBasis.NotChecked, needed,
                 "The CA could not be reached, so it was not asked.", Optional: true);
 
+        // What else needs the right rests on the same finding as NeededFor above:
+        // until a view that opens was seen to show every certificate, the row
+        // must not promise that the inventory works without it.
+        var held = inventoryProven
+            ? $"Only revocation uses it, and every revocation does: {EveryRevocation}."
+            : $"Every revocation uses it: {EveryRevocation}. Whether the inventory sees every " +
+              "certificate without it is not established.";
+        var worksWithout = inventoryProven
+            ? "Issuance, the inventory and alerts keep working without it."
+            : "Issuance keeps working without it, but whether the inventory sees every certificate without it " +
+              "is not established.";
+        var grantWhen = inventoryProven
+            ? "only if Ducks in a Row should revoke, the automatic revocation at finalize included"
+            : "if Ducks in a Row should revoke, the automatic revocation at finalize included, or if the " +
+              "inventory misses certificates";
+
         return FromRoles(roles, CaAccessRoles.Officer, "ca-officer", title, needed, findings,
-            remedy: $"Grant {account} Issue and Manage Certificates on the CA ({SecurityTab}) only if Ducks in a Row " +
-                    "should revoke. It also lets the account approve and deny requests, so it is a real decision.",
+            remedy: $"Grant {account} Issue and Manage Certificates on the CA ({SecurityTab}) {grantWhen}. " +
+                    "It also lets the account approve and deny requests, so it is a real decision.",
             optional: true,
-            heldDetail: "The CA reports this right for the service's account. Only revocation uses it.",
-            missingDetail: "The CA reports that the service's account does not hold this right, so revoking from the " +
-                           "dashboard and through ACME revoke-cert will fail. Everything else works without it.");
+            heldDetail: $"The CA reports this right for the service's account. {held}",
+            missingDetail: "The CA reports that the service's account does not hold this right, so every revocation " +
+                           $"will fail: {EveryRevocation}. A certificate the finalize check refuses is still never " +
+                           $"delivered, but it then stays valid at the CA until someone revokes it by hand. {worksWithout}");
     }
 
     internal static ServiceRightsRow Template(

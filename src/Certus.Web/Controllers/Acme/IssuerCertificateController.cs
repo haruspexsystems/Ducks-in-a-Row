@@ -1,6 +1,7 @@
 using Certus.Core.Acme.Crypto;
 using Certus.Core.Acme.Models;
 using Certus.Core.Acme.Services;
+using Certus.Core.Adcs;
 using Certus.Core.Security;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
@@ -120,12 +121,25 @@ public sealed class IssuerCertificateController : AcmeControllerBase
 
     /// <summary>
     /// Reads the cached PEM chain. A CA outage is never cached, so recovery is immediate;
-    /// both arms answer it the same way the rest of the ACME surface answers one.
+    /// both arms answer it the same way the rest of the ACME surface answers one. A CA
+    /// that refuses the service the chain is not cached either, because the refusal leaves
+    /// the cache as an exception, and it is answered like the template gate's refusal
+    /// (issue #476): 503 serviceUnavailable with the remedy kept to the log.
     /// </summary>
     private async Task<(string? Pem, IActionResult? Error)> ReadChainAsync(
         CancellationToken cancellationToken)
     {
-        var pem = await _chainCache.GetPemChainAsync(cancellationToken);
+        string? pem;
+        try
+        {
+            pem = await _chainCache.GetPemChainAsync(cancellationToken);
+        }
+        catch (CaAccessDeniedException)
+        {
+            return (null, AcmeError(503, AcmeErrorType.ServiceUnavailable,
+                "The server could not read the CA certificate chain. Try again shortly."));
+        }
+
         if (pem == null)
             return (null, AcmeError(503, AcmeErrorType.ServiceUnavailable,
                 "The ADCS Certificate Authority is unavailable. Try again shortly."));

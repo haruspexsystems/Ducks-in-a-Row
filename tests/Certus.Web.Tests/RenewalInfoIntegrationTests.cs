@@ -176,7 +176,7 @@ public class RenewalInfoIntegrationTests
             db.SyncedCertificates.Add(new SyncedCertificate
             {
                 RequestId = seeded.AdcsRequestId,
-                SerialNumber = "SYNCED" + seeded.AdcsRequestId,
+                SerialNumber = seeded.CaSerial,
                 Subject = "CN=ari.example.com",
                 Status = "Revoked",
                 RevokedAt = DateTime.UtcNow.AddMinutes(-10)
@@ -194,17 +194,19 @@ public class RenewalInfoIntegrationTests
     }
 
     [Fact]
-    public async Task PostAtTheRenewalInfoShape_StillCarriesANonce()
+    public async Task PostAtTheRenewalInfoShape_IsAFallbackAnswer_AndMintsNoNonce()
     {
-        // The nonce exemption is gated on GET and HEAD, the only methods the
-        // resource defines. An errant POST at the same shape is an error a
-        // client may harvest its next nonce from (RFC 8555 §7.2).
+        // An errant POST at the GET only shape is answered by the protocol
+        // fallback, not by an action, and since issue #632 nothing the fallback
+        // answers stores a nonce: a stored entry per anonymous miss is what an
+        // unauthenticated flood would farm. The client harvests its next nonce
+        // from new-nonce instead (RFC 8555 §7.2).
         var response = await _client.PostAsync(
             $"/acme/WebServer/renewalInfo/{UnknownButWellFormed}",
             new StringContent("{}", System.Text.Encoding.UTF8, "application/jose+json"));
 
         response.StatusCode.Should().Be(HttpStatusCode.MethodNotAllowed);
-        response.Headers.Contains("Replay-Nonce").Should().BeTrue();
+        response.Headers.Contains("Replay-Nonce").Should().BeFalse();
     }
 
     private static DateTimeOffset ParseRfc3339(string value)
@@ -213,8 +215,14 @@ public class RenewalInfoIntegrationTests
             DateTimeStyles.RoundtripKind);
     }
 
+    /// <param name="CaSerial">
+    /// The leaf's serial as the CA view spells it, lowercase with no pad, which is
+    /// what the synced twin of this certificate carries. The bridge to that twin
+    /// matches the serial as well as the request id (issue #442).
+    /// </param>
     private sealed record SeededCertificate(
-        string AriId, int AdcsRequestId, DateTimeOffset NotBefore, DateTimeOffset NotAfter);
+        string AriId, int AdcsRequestId, DateTimeOffset NotBefore, DateTimeOffset NotAfter,
+        string CaSerial);
 
     /// <summary>
     /// Seeds the shape production leaves behind after an ACME issuance: an
@@ -284,6 +292,7 @@ public class RenewalInfoIntegrationTests
         await db.SaveChangesAsync();
 
         return new SeededCertificate(
-            AriCertificateId.FromCertificate(leaf)!, adcsRequestId, notBefore, notAfter);
+            AriCertificateId.FromCertificate(leaf)!, adcsRequestId, notBefore, notAfter,
+            leaf.SerialNumber.TrimStart('0').ToLowerInvariant());
     }
 }

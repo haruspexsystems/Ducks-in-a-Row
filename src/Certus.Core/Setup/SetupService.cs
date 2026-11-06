@@ -29,6 +29,7 @@ public sealed class SetupService
     private readonly ICaDiscoveryService _caDiscovery;
     private readonly IExternalUrlProbe _externalUrlProbe;
     private readonly CertusOptions _certusOptions;
+    private readonly CertusInstanceMode _instanceMode;
     private readonly ILogger<SetupService> _logger;
 
     /// <summary>HRESULT for "class not registered" COM activation failures.</summary>
@@ -46,12 +47,14 @@ public sealed class SetupService
         ICaDiscoveryService caDiscovery,
         IExternalUrlProbe externalUrlProbe,
         IOptions<CertusOptions> certusOptions,
+        CertusInstanceMode instanceMode,
         ILogger<SetupService> logger)
     {
         _clientFactory = clientFactory;
         _caDiscovery = caDiscovery;
         _externalUrlProbe = externalUrlProbe;
         _certusOptions = certusOptions.Value;
+        _instanceMode = instanceMode;
         _logger = logger;
     }
 
@@ -103,10 +106,33 @@ public sealed class SetupService
     /// ran the mock (the pre fix behavior) report incomplete here, so the
     /// wizard opens again — prefilled from the previously saved value — instead
     /// of leaving them stranded.
+    ///
+    /// A second case reopens it the same way (issue #471): a server that
+    /// finished setup in monitor mode, where no template is recorded, and has
+    /// since been switched to full mode by a local administrator. See
+    /// <see cref="AwaitsTemplateChoice"/>.
     /// </summary>
     public bool IsSetupEffectivelyComplete()
     {
-        return GetStatus().SetupCompleted && IsCaEffectivelyConfigured;
+        var status = GetStatus();
+        return status.SetupCompleted && IsCaEffectivelyConfigured && !AwaitsTemplateChoice(status);
+    }
+
+    /// <summary>
+    /// True when this full mode server finished setup without recording a
+    /// template (issue #471). Full mode completion always records at least one,
+    /// so the only way to reach this state is to finish setup in monitor mode
+    /// and then switch the registry value to full. The wizard then reopens at
+    /// the Templates step, prefilled with the CA it already has, and the
+    /// dashboard sends the administrator there until a template is chosen.
+    ///
+    /// Not a security boundary: with no template recorded, ACME exposes nothing
+    /// (the template policy fails closed) whether or not the wizard is open.
+    /// </summary>
+    public bool AwaitsTemplateChoice(SetupStatus status)
+    {
+        ArgumentNullException.ThrowIfNull(status);
+        return !_instanceMode.IsMonitor && status.SetupCompleted && status.EnabledTemplates is not { Count: > 0 };
     }
 
     /// <summary>
@@ -331,15 +357,39 @@ public sealed class SetupService
         if (string.IsNullOrWhiteSpace(templateName))
             return null;
 
+        var resolved = await ResolvePublishedTemplateNamesAsync(
+            caConnectionString, [templateName], cancellationToken);
+        return resolved[0];
+    }
+
+    /// <summary>
+    /// <see cref="ResolvePublishedTemplateNameAsync"/> for several names against
+    /// one read of the published list, answering in the order given, with null
+    /// for a name the CA does not publish (or a blank one). Setup completion
+    /// resolves the whole recorded set this way (issue #271), so what the
+    /// wizard records is the CA's own name rather than whichever of the two
+    /// forms the browser sent.
+    /// </summary>
+    public async Task<IReadOnlyList<string?>> ResolvePublishedTemplateNamesAsync(
+        string caConnectionString,
+        IReadOnlyList<string> templateNames,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(templateNames);
+
         var client = _clientFactory.Create(caConnectionString);
         try
         {
             var published = await client.GetTemplatesAsync(cancellationToken);
-            return published
-                .FirstOrDefault(t =>
-                    t.Name.Equals(templateName, StringComparison.OrdinalIgnoreCase)
-                    || t.DisplayName.Equals(templateName, StringComparison.OrdinalIgnoreCase))
-                ?.Name;
+            return templateNames
+                .Select(name => string.IsNullOrWhiteSpace(name)
+                    ? null
+                    : published
+                        .FirstOrDefault(t =>
+                            t.Name.Equals(name, StringComparison.OrdinalIgnoreCase)
+                            || t.DisplayName.Equals(name, StringComparison.OrdinalIgnoreCase))
+                        ?.Name)
+                .ToList();
         }
         finally
         {
@@ -369,7 +419,11 @@ public sealed class SetupService
 
         var warnings = new List<string>();
         if (uri.Scheme == "http")
-            warnings.Add("HTTP is not recommended for production. ACME clients may require HTTPS.");
+        {
+            warnings.Add(_instanceMode.IsMonitor
+                ? "HTTP is not recommended for production. Browsers opening the dashboard will connect without TLS."
+                : "HTTP is not recommended for production. ACME clients may require HTTPS.");
+        }
 
         if (uri.Host == "localhost" || uri.Host == "127.0.0.1")
             warnings.Add("localhost URL will only work for clients on this machine.");
@@ -410,7 +464,12 @@ public sealed class SetupService
         if (_certusOptions.UseMockCa)
             return result with { Probe = ExternalUrlProbeResult.Skipped(authority) };
 
-        var probe = await _externalUrlProbe.ProbeAsync(uri, templateName, cancellationToken);
+        // In monitor mode every ACME directory answers 404, so the probe targets
+        // the setup status endpoint instead, whatever template a caller names
+        // (issue #471): a server switched from full to monitor still has its old
+        // templates recorded.
+        var probe = await _externalUrlProbe.ProbeAsync(
+            uri, _instanceMode.IsMonitor ? null : templateName, cancellationToken);
 
         // The certificate warning stays on the probe result only. The wizard
         // and the settings card render it as its own notice (with the wizard
@@ -442,12 +501,12 @@ public sealed class SetupService
             ExternalUrl = config.ExternalUrl,
         });
 
-        // Completion writes a fresh status record, and the EAB enforcement
-        // mode is not part of the wizard's configuration, so carry it forward
-        // from the prior file: without this, re-running setup on a stranded
-        // install would silently reset enforcement to off. Under the shared
-        // write lock so the read, modify, save cannot interleave with a
-        // settings page update.
+        // Completion writes a fresh status record, so the EAB enforcement mode
+        // the wizard did not choose is carried forward from the prior file:
+        // without this, re-running setup on a stranded install would silently
+        // reset enforcement. A fresh install has nothing to carry and completes
+        // with binding required (issue #631). Under the shared write lock so the
+        // read, modify, save cannot interleave with a settings page update.
         SetupStatus status;
         lock (StatusFileWriteLock)
         {
@@ -456,13 +515,13 @@ public sealed class SetupService
             {
                 // Completion cannot be refused for a transient read failure,
                 // but resetting these must never be silent. Both reset to
-                // their safe defaults: enforcement to off, the revocation
-                // scope to ducks-managed.
+                // their fresh install defaults: enforcement to required unless
+                // the wizard chose, the revocation scope to ducks-managed.
                 _logger.LogWarning(
                     "The wizard status file could not be read while completing setup; " +
                     "the EAB enforcement mode and the revocation scope could not be " +
-                    "carried forward and read as their defaults until an administrator " +
-                    "sets them again");
+                    "carried forward and read as their fresh install defaults until an " +
+                    "administrator sets them again");
             }
             else if (File.Exists(statusPath) && !TrustedFile.Check(statusPath).IsTrusted)
             {
@@ -475,8 +534,8 @@ public sealed class SetupService
                 _logger.LogWarning(
                     "The wizard status file at {Path} is not trusted while completing " +
                     "setup, so the EAB enforcement mode and the revocation scope could " +
-                    "not be carried forward and read as their defaults until an " +
-                    "administrator sets them again",
+                    "not be carried forward and read as their fresh install defaults " +
+                    "until an administrator sets them again",
                     statusPath);
             }
             status = new SetupStatus
@@ -488,7 +547,7 @@ public sealed class SetupService
                 ExternalUrl = config.ExternalUrl,
                 AllowedDomainsEnabled = config.AllowedDomainsEnabled,
                 AllowedDomains = config.AllowedDomains?.ToList() ?? [],
-                EabEnforcement = prior.EabEnforcement,
+                EabEnforcement = CompletionEabEnforcement(config, prior),
                 RevocationScope = prior.RevocationScope,
                 RevocableTemplates = prior.RevocableTemplates.ToList(),
             };
@@ -498,17 +557,79 @@ public sealed class SetupService
 
         _logger.LogInformation(
             "Setup completed. CA: {Ca}, Templates: {Templates}, External URL: {Url}, " +
-            "Domain restriction: {DomainRestriction}; configuration written to {Overlay}",
+            "Domain restriction: {DomainRestriction}, External account binding: {Eab}; " +
+            "configuration written to {Overlay}",
             config.CaConnectionString,
-            string.Join(", ", config.EnabledTemplates),
+            config.EnabledTemplates.Count == 0 && _instanceMode.IsMonitor
+                ? "none (monitor mode)"
+                : string.Join(", ", config.EnabledTemplates),
             config.ExternalUrl,
             config.AllowedDomainsEnabled
                 ? $"on ({string.Join(", ", config.AllowedDomains ?? [])})"
                 : "off",
+            status.EabEnforcement,
             overlayPath);
 
         return status;
     }
+
+    /// <summary>
+    /// The binding mode a fresh install completes with when the wizard made no
+    /// choice: required, so a new server issues only to a client an administrator
+    /// handed a credential (Sean's decision on issue #631). An upgraded install is
+    /// never fresh, so it keeps off; see <see cref="RecordedEabEnforcement"/>.
+    /// </summary>
+    public const EabEnforcementMode FreshInstallEabEnforcement = EabEnforcementMode.Required;
+
+    /// <summary>
+    /// The binding mode the status file already records, for the wizard to prefill
+    /// and for a rewrite of the file to keep. A present value is returned as written,
+    /// so a hand edited value still reaches <see cref="EabEnforcementPolicy"/> and its
+    /// warning. A completed file without the field is an install upgraded from before
+    /// the field existed, which <see cref="EabEnforcementPolicy"/> reads as off, so
+    /// this says "off" outright: a draft that rewrites the file with
+    /// <c>SetupCompleted</c> false would otherwise turn it into a fresh install and
+    /// switch binding on behind the administrator's back. Null means nothing was ever
+    /// recorded: a fresh install, or a file that could not be read or trusted.
+    /// </summary>
+    public static string? RecordedEabEnforcement(SetupStatus status)
+    {
+        ArgumentNullException.ThrowIfNull(status);
+        if (!string.IsNullOrWhiteSpace(status.EabEnforcement))
+            return status.EabEnforcement;
+        return status.SetupCompleted ? EabEnforcementPolicy.ModeName(EabEnforcementMode.Off) : null;
+    }
+
+    /// <summary>
+    /// The binding mode the wizard offers before anyone chooses: what the file
+    /// records, else <see cref="FreshInstallEabEnforcement"/>. GET /api/setup/config
+    /// serves this, so the wizard prefills the server's default rather than
+    /// keeping one of its own.
+    /// </summary>
+    public string EabEnforcementPrefill() =>
+        RecordedEabEnforcement(GetStatus()) ?? EabEnforcementPolicy.ModeName(FreshInstallEabEnforcement);
+
+    /// <summary>
+    /// The mode completion would write for <paramref name="config"/> against the
+    /// file as it reads now. The setup controller records it in the audit row,
+    /// which is written before the file and so cannot read the outcome back.
+    /// </summary>
+    public string EabEnforcementAtCompletion(SetupConfiguration config) =>
+        CompletionEabEnforcement(config, GetStatus());
+
+    /// <summary>
+    /// The mode a draft writes: the wizard's explicit choice, else what the prior
+    /// file records. Null only on a fresh install with no choice, which a draft
+    /// keeps undecided.
+    /// </summary>
+    private static string? WrittenEabEnforcement(SetupConfiguration config, SetupStatus prior) =>
+        config.EabEnforcement is { } chosen
+            ? EabEnforcementPolicy.ModeName(chosen)
+            : RecordedEabEnforcement(prior);
+
+    /// <summary>The mode a completion writes: as a draft would, and a fresh install's default otherwise.</summary>
+    private static string CompletionEabEnforcement(SetupConfiguration config, SetupStatus prior) =>
+        WrittenEabEnforcement(config, prior) ?? EabEnforcementPolicy.ModeName(FreshInstallEabEnforcement);
 
     /// <summary>
     /// Change the external URL after setup (issue #93). The overlay is read
@@ -683,13 +804,13 @@ public sealed class SetupService
     {
         lock (StatusFileWriteLock)
         {
-            // The draft rewrites the whole status file, and neither the EAB
-            // enforcement mode nor the revocation scope is wizard state
-            // (they cannot ride through SetupConfiguration the way the
-            // allowed domain choice does), so carry both forward from the
-            // prior file exactly like CompleteSetup. Without this, a draft
+            // The draft rewrites the whole status file. The revocation scope is
+            // not wizard state, and the EAB enforcement mode is only when the
+            // wizard sent a choice, so carry what it did not send forward from
+            // the prior file exactly like CompleteSetup. Without this, a draft
             // saved while recovering a stranded install would silently reset
-            // them to their defaults.
+            // them, and an upgraded install's unrecorded off would turn into a
+            // fresh install's required at completion (issue #631).
             var prior = GetStatus();
             var status = new SetupStatus
             {
@@ -699,7 +820,7 @@ public sealed class SetupService
                 ExternalUrl = config.ExternalUrl,
                 AllowedDomainsEnabled = config.AllowedDomainsEnabled,
                 AllowedDomains = config.AllowedDomains?.ToList() ?? [],
-                EabEnforcement = prior.EabEnforcement,
+                EabEnforcement = WrittenEabEnforcement(config, prior),
                 RevocationScope = prior.RevocationScope,
                 RevocableTemplates = prior.RevocableTemplates.ToList(),
                 WizardStep = wizardStep,
@@ -747,18 +868,88 @@ public sealed class SetupService
         }
 
         var overlayPath = SettingsOverlayPath;
-        SettingsOverlay.Mutate(overlayPath, current => current with
-        {
-            HttpsCertificateThumbprint = thumbprint,
-            HttpsCertificateTemplate = string.IsNullOrWhiteSpace(templateName)
-                ? current.HttpsCertificateTemplate
-                : templateName,
-        });
+        SettingsOverlay.Mutate(overlayPath, RecordHttpsCertificate(thumbprint, templateName));
 
         _logger.LogInformation(
             "HTTPS certificate thumbprint {Thumbprint} written to {Overlay}",
             thumbprint,
             overlayPath);
+    }
+
+    /// <summary>
+    /// Throw what <see cref="SetHttpsCertificateThumbprint"/> would throw from the
+    /// overlay for a certificate enrolled with <paramref name="templateName"/>, and
+    /// write nothing (issue #553). Every caller that enrolls the server's own
+    /// certificate and then records it asks this first, on the line above the
+    /// enrolment, because a record refused after the CA issued and the store installed
+    /// leaves a live certificate nothing names.
+    ///
+    /// <para>
+    /// The refusal that matters is a <see cref="SettingsOverlayConflictException"/>: a
+    /// key the record writes, such as <c>Certus:HttpsCertificateTemplate</c>, also
+    /// written by hand in the colon form at the top level of settings.json. That is
+    /// refused rather than resolved, by the decision on issue #550, so the record can
+    /// never succeed until an administrator keeps one of the two.
+    /// </para>
+    ///
+    /// <para>
+    /// It runs the record's own change, not a copy of it, with
+    /// <see cref="PlaceholderThumbprint"/> standing in for the thumbprint nobody has
+    /// yet. That is faithful because a save writes a value it manages whenever the
+    /// value is not null and its content never decides which keys the file holds.
+    /// </para>
+    /// </summary>
+    public void EnsureHttpsCertificateCanBeRecorded(string? templateName = null) =>
+        SettingsOverlay.EnsureCanMutate(
+            SettingsOverlayPath, RecordHttpsCertificate(PlaceholderThumbprint, templateName));
+
+    /// <summary>
+    /// What <see cref="EnsureHttpsCertificateCanBeRecorded"/> records in place of a
+    /// thumbprint it cannot know before the enrolment. Never written: the dry run
+    /// builds the file and discards it.
+    /// </summary>
+    private const string PlaceholderThumbprint = "0000000000000000000000000000000000000000";
+
+    /// <summary>
+    /// The one change both the record and its dry run make, so the dry run cannot
+    /// drift from what is written. A blank template keeps the one the overlay already
+    /// records; see <see cref="SetHttpsCertificateThumbprint"/> for why.
+    /// </summary>
+    private static Func<SettingsOverlay.OverlaySettings, SettingsOverlay.OverlaySettings> RecordHttpsCertificate(
+        string thumbprint, string? templateName) =>
+        current => current with
+        {
+            HttpsCertificateThumbprint = thumbprint,
+            HttpsCertificateTemplate = string.IsNullOrWhiteSpace(templateName)
+                ? current.HttpsCertificateTemplate
+                : templateName,
+        };
+
+    /// <summary>
+    /// Forget the recorded HTTPS certificate, so the next start serves the self
+    /// signed one again. The monitor mode wizard's "keep the self signed
+    /// certificate" choice (issue #471), after an earlier pick: the only way back
+    /// that does not mean editing settings.json by hand. The template recorded with
+    /// it goes too, since it described that certificate. Returns false when no
+    /// thumbprint was recorded, and then writes nothing.
+    /// </summary>
+    public bool ClearHttpsCertificateThumbprint()
+    {
+        var overlayPath = SettingsOverlayPath;
+        if (string.IsNullOrWhiteSpace(SettingsOverlay.Load(overlayPath).HttpsCertificateThumbprint))
+            return false;
+
+        SettingsOverlay.Mutate(overlayPath, current => current with
+        {
+            HttpsCertificateThumbprint = null,
+            HttpsCertificateTemplate = null,
+        });
+
+        _logger.LogInformation(
+            "HTTPS certificate thumbprint cleared from {Overlay}; the next start serves the self " +
+            "signed certificate",
+            overlayPath);
+        return true;
     }
 }
 
@@ -810,12 +1001,19 @@ public sealed record ExternalUrlValidation(
     ExternalUrlProbeResult? Probe = null);
 
 /// <summary>Configuration submitted at the end of the setup wizard.</summary>
+/// <param name="EabEnforcement">
+/// The binding choice the wizard made, or null when it made none (an API caller,
+/// or monitor mode, where the wizard does not ask). Null keeps the recorded mode,
+/// and on a fresh install that has none it completes as
+/// <see cref="SetupService.FreshInstallEabEnforcement"/> (issue #631).
+/// </param>
 public sealed record SetupConfiguration(
     string CaConnectionString,
     IReadOnlyList<string> EnabledTemplates,
     string ExternalUrl,
     bool AllowedDomainsEnabled = false,
-    IReadOnlyList<string>? AllowedDomains = null);
+    IReadOnlyList<string>? AllowedDomains = null,
+    EabEnforcementMode? EabEnforcement = null);
 
 /// <summary>
 /// A certificate template as presented by the setup wizard, with the server

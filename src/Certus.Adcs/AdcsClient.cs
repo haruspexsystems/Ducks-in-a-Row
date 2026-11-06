@@ -132,27 +132,81 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
     }
 
     /// <summary>
-    /// The exception a failed <see cref="GetCaInfoAsync"/> leaves with, or null
-    /// when the failure stays an ordinary "not accessible" answer. Internal for
-    /// unit tests.
+    /// The typed exception a failed call on the CA's request interface leaves
+    /// with, or null when the failure is neither a refusal nor an outage and the
+    /// caller answers it its own way. Internal for unit tests.
     ///
     /// Access denied arrives three ways: as UnauthorizedAccessException, the
     /// usual shape through IDispatch; as a COMException carrying E_ACCESSDENIED;
     /// or as CERTSRV_E_ENROLL_DENIED, which a CA answers when the caller lacks
     /// its Enroll right or when it refuses remote requests altogether
     /// (IF_NOREMOTEICERTREQUEST). All three mean the CA refused the service,
-    /// and none of them means the CA is down.
+    /// and none of them means the CA is down. Lab 2019 (#440) and lab 2025 (#469)
+    /// measured the third for every request interface read the product makes, so
+    /// a path that tested E_ACCESSDENIED alone reported a missing right as a
+    /// generic failure (issues #467, #476 and #477).
+    ///
+    /// The paths below each pass their own message, because the right is the
+    /// same and what stops is not. Each has a named wrapper so a test can pin
+    /// which message a path carries.
     /// </summary>
-    internal static Exception? ClassifyConnectFailure(Exception ex) => ex switch
+    internal static Exception? ClassifyRequestInterfaceFailure(Exception ex, string refusalMessage) => ex switch
     {
         UnauthorizedAccessException =>
-            new CaAccessDeniedException(CaAccessDeniedException.ConnectPermissionMessage, ex),
+            new CaAccessDeniedException(refusalMessage, ex),
         COMException com when CaAccessDeniedException.IsRefusal(com) =>
-            new CaAccessDeniedException(CaAccessDeniedException.ConnectPermissionMessage, com),
+            new CaAccessDeniedException(refusalMessage, com),
         COMException com when CaUnavailableException.IsRpcUnavailable(com) =>
             new CaUnavailableException("ADCS Certificate Authority is unavailable (CertSvc RPC unreachable).", com),
         _ => null,
     };
+
+    /// <summary>
+    /// <see cref="ClassifyRequestInterfaceFailure"/> for <see cref="GetCaInfoAsync"/>,
+    /// the wizard's Test Connection. Null keeps the failure an ordinary "not
+    /// accessible" answer.
+    /// </summary>
+    internal static Exception? ClassifyConnectFailure(Exception ex) =>
+        ClassifyRequestInterfaceFailure(ex, CaAccessDeniedException.ConnectPermissionMessage);
+
+    /// <summary>
+    /// <see cref="ClassifyRequestInterfaceFailure"/> for the template list read
+    /// (CR_PROP_TEMPLATES).
+    /// </summary>
+    internal static Exception? ClassifyTemplateReadFailure(Exception ex) =>
+        ClassifyRequestInterfaceFailure(ex, CaAccessDeniedException.TemplateReadPermissionMessage);
+
+    /// <summary>
+    /// <see cref="ClassifyRequestInterfaceFailure"/> for the CA signing chain read
+    /// (CR_PROP_CASIGCERTCOUNT and CR_PROP_CASIGCERTCHAIN).
+    /// </summary>
+    internal static Exception? ClassifyChainReadFailure(Exception ex) =>
+        ClassifyRequestInterfaceFailure(ex, CaAccessDeniedException.ChainReadPermissionMessage);
+
+    /// <summary>
+    /// <see cref="ClassifyRequestInterfaceFailure"/> for collecting an issued
+    /// certificate (GetIssuedCertificate and GetCertificate).
+    /// </summary>
+    internal static Exception? ClassifyCollectFailure(Exception ex) =>
+        ClassifyRequestInterfaceFailure(ex, CaAccessDeniedException.CollectPermissionMessage);
+
+    /// <summary>
+    /// <see cref="ClassifyRequestInterfaceFailure"/> for the Submit, but only
+    /// while <paramref name="submitReturned"/> is false. Both typed exceptions
+    /// promise the ACME finalize that nothing reached the CA, which is what lets
+    /// it release its claim; past the Submit the CA holds a request for the CSR,
+    /// so a failure there takes the plain path and null is the answer.
+    ///
+    /// Submit throws CERTSRV_E_ENROLL_DENIED itself when the account lacks
+    /// Request Certificates: measured on lab 2019b on 2026-10-31 (#566), state S2
+    /// of Set-LabCaRights.ps1, as SYSTEM on the Certus host. Before, the submit
+    /// tested E_ACCESSDENIED alone, so that refusal left as a plain failure and
+    /// the finalize invalidated an order it should have left retryable.
+    /// </summary>
+    internal static Exception? ClassifySubmitFailure(Exception ex, bool submitReturned) =>
+        submitReturned
+            ? null
+            : ClassifyRequestInterfaceFailure(ex, CaAccessDeniedException.EnrollPermissionMessage);
 
     /// <summary>
     /// A COM class that is not registered (REGDB_E_CLASSNOTREG), or one that
@@ -179,6 +233,56 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
     /// </summary>
     private IReadOnlyList<TemplateInfo> ReadTemplates()
     {
+        var templates = ReadPublishedTemplates();
+
+        // Issue #17: CR_PROP_TEMPLATES returns programmatic names only.
+        // Enrich each entry from its AD object: the displayName ACME
+        // clients address templates by, the EKU set the wizard filters
+        // on, and the raw viability attributes behind the wizard's ACME
+        // checklist. Templates without an AD entry keep null EKU and
+        // viability, which the wizard reads as "could not verify".
+        //
+        // Outside the CA read's catch on purpose (issue #476). The lookup
+        // swallows its own failures today, but a directory refusal reaching
+        // that catch would be reported as the CA refusing the service, and
+        // send an operator to the CA's Security tab for an AD problem.
+        var adInfo = GetTemplateAdInfo();
+        if (adInfo.Count > 0)
+        {
+            for (var i = 0; i < templates.Count; i++)
+            {
+                if (!adInfo.TryGetValue(templates[i].Name, out var info))
+                    continue;
+
+                templates[i] = templates[i] with
+                {
+                    DisplayName = string.IsNullOrWhiteSpace(info.DisplayName)
+                        ? templates[i].DisplayName
+                        : info.DisplayName,
+                    ExtendedKeyUsages = info.Ekus,
+                    Viability = TemplateAcmeViability.FromAdAttributes(
+                        info.EnrollmentFlags,
+                        info.RaSignatureCount,
+                        info.CertificateNameFlags,
+                        info.SchemaVersion,
+                        info.PrivateKeyFlags,
+                        info.RaApplicationPolicies ?? Array.Empty<string>(),
+                        info.DefaultCsps ?? Array.Empty<string>(),
+                        info.MinimalKeySize),
+                };
+            }
+        }
+
+        _logger.LogInformation("Found {Count} templates on CA", templates.Count);
+        return templates;
+    }
+
+    /// <summary>
+    /// The CA half of <see cref="ReadTemplates"/>: the published list as the CA
+    /// reports it, before any directory enrichment.
+    /// </summary>
+    private List<TemplateInfo> ReadPublishedTemplates()
+    {
         _logger.LogDebug("Querying templates from {Config}", _caConnectionString);
 
         object? certRequest = null;
@@ -196,51 +300,23 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                 PropertyType.String,
                 0);
 
-            var templates = ParseTemplateString(templatesRaw);
-
-            // Issue #17: CR_PROP_TEMPLATES returns programmatic names only.
-            // Enrich each entry from its AD object: the displayName ACME
-            // clients address templates by, the EKU set the wizard filters
-            // on, and the raw viability attributes behind the wizard's ACME
-            // checklist. Templates without an AD entry keep null EKU and
-            // viability, which the wizard reads as "could not verify".
-            var adInfo = GetTemplateAdInfo();
-            if (adInfo.Count > 0)
-            {
-                for (var i = 0; i < templates.Count; i++)
-                {
-                    if (!adInfo.TryGetValue(templates[i].Name, out var info))
-                        continue;
-
-                    templates[i] = templates[i] with
-                    {
-                        DisplayName = string.IsNullOrWhiteSpace(info.DisplayName)
-                            ? templates[i].DisplayName
-                            : info.DisplayName,
-                        ExtendedKeyUsages = info.Ekus,
-                        Viability = TemplateAcmeViability.FromAdAttributes(
-                            info.EnrollmentFlags,
-                            info.RaSignatureCount,
-                            info.CertificateNameFlags,
-                            info.SchemaVersion,
-                            info.PrivateKeyFlags,
-                            info.RaApplicationPolicies ?? Array.Empty<string>(),
-                            info.DefaultCsps ?? Array.Empty<string>(),
-                            info.MinimalKeySize),
-                    };
-                }
-            }
-
-            _logger.LogInformation("Found {Count} templates on CA", templates.Count);
-            return templates;
+            return ParseTemplateString(templatesRaw);
+        }
+        catch (Exception ex) when (ClassifyTemplateReadFailure(ex) is { } mapped)
+        {
+            // A refusal or an outage, each as the typed exception every caller
+            // already has an arm for. The reason rides on the log line so the
+            // remedy reaches the log even where a best effort caller swallows
+            // the exception and logs it at Debug.
+            _logger.LogError(ex,
+                "Failed to query templates from {Config}. HRESULT: 0x{HResult:X8}. {Reason}",
+                _caConnectionString, ex.HResult, mapped.Message);
+            throw mapped;
         }
         catch (COMException ex)
         {
             _logger.LogError(ex, "Failed to query templates from {Config}. HRESULT: 0x{HResult:X8}",
                 _caConnectionString, ex.HResult);
-            if (CaUnavailableException.IsRpcUnavailable(ex))
-                throw new CaUnavailableException(
-                    "ADCS Certificate Authority is unavailable (CertSvc RPC unreachable).", ex);
             throw new InvalidOperationException(
                 $"Failed to query templates from ADCS CA: {ex.Message}", ex);
         }
@@ -260,7 +336,9 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
     /// signing certificates the CA has had (renewals add one), then the full
     /// PKCS#7 chain of the newest one, ordered CA certificate first and self
     /// signed root last. Same dynamic IDispatch route and COM error mapping
-    /// as <see cref="ReadTemplates"/>.
+    /// as <see cref="ReadPublishedTemplates"/>. The parse below the two reads
+    /// can throw only types the classifier does not map, so a malformed chain
+    /// is never mistaken for a refusal.
     /// </summary>
     private IReadOnlyList<byte[]> ReadCaCertificateChain()
     {
@@ -316,14 +394,18 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                     certificate.Dispose();
             }
         }
+        catch (Exception ex) when (ClassifyChainReadFailure(ex) is { } mapped)
+        {
+            _logger.LogError(ex,
+                "Failed to query the CA certificate chain from {Config}. HRESULT: 0x{HResult:X8}. {Reason}",
+                _caConnectionString, ex.HResult, mapped.Message);
+            throw mapped;
+        }
         catch (COMException ex)
         {
             _logger.LogError(ex,
                 "Failed to query the CA certificate chain from {Config}. HRESULT: 0x{HResult:X8}",
                 _caConnectionString, ex.HResult);
-            if (CaUnavailableException.IsRpcUnavailable(ex))
-                throw new CaUnavailableException(
-                    "ADCS Certificate Authority is unavailable (CertSvc RPC unreachable).", ex);
             throw new InvalidOperationException(
                 $"Failed to query the CA certificate chain: {ex.Message}", ex);
         }
@@ -451,26 +533,21 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                 // for this CSR, so a denial out of GetRequestId or GetDispositionMessage
                 // leaves a request nobody can name: that takes the plain path, and the
                 // order is invalidated with the orphan logged, which is right for it.
-                if (!submitReturned)
-                    throw new CaAccessDeniedException(
-                        CaAccessDeniedException.EnrollPermissionMessage, ex);
-                throw new InvalidOperationException(
-                    $"Failed to submit certificate request: {ex.Message}", ex);
+                throw ClassifySubmitFailure(ex, submitReturned)
+                    ?? new InvalidOperationException(
+                        $"Failed to submit certificate request: {ex.Message}", ex);
             }
             catch (COMException ex)
             {
                 _logger.LogError(ex, "Failed to submit CSR for template {Template}. HRESULT: 0x{HResult:X8}",
                     templateName, ex.HResult);
-                if (!submitReturned && CaUnavailableException.IsRpcUnavailable(ex))
-                    throw new CaUnavailableException(
-                        "ADCS Certificate Authority is unavailable (CertSvc RPC unreachable).", ex);
-                // The same denial arriving as a COMException instead. Same gate, same
-                // promise; only the shape the CLR chose differs.
-                if (!submitReturned && CaAccessDeniedException.IsAccessDenied(ex))
-                    throw new CaAccessDeniedException(
-                        CaAccessDeniedException.EnrollPermissionMessage, ex);
-                throw new InvalidOperationException(
-                    $"Failed to submit certificate request: {ex.Message}", ex);
+                // The outage, and the same denial arriving as a COMException instead:
+                // E_ACCESSDENIED, or CERTSRV_E_ENROLL_DENIED, which is what Submit
+                // throws for an account without Request Certificates (#566). Same
+                // gate, same promise; only the shape the CLR chose differs.
+                throw ClassifySubmitFailure(ex, submitReturned)
+                    ?? new InvalidOperationException(
+                        $"Failed to submit certificate request: {ex.Message}", ex);
             }
             finally
             {
@@ -722,37 +799,37 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                     CertificateDer: certDer,
                     CertificatePem: chainPem);
             }
-            catch (UnauthorizedAccessException ex)
+            catch (Exception ex) when (ClassifyCollectFailure(ex) is { } mapped)
             {
-                // ICertRequest::GetIssuedCertificate needs the caller to be the
-                // request's own submitter or to hold "Read" on the CA, the same ACL
-                // CCertView::OpenConnection needs below. No gate here, unlike the
-                // submit: this call writes nothing and decides nothing, so there is no
-                // "past this point" to protect. The certificate exists at the CA
-                // either way and is collected by the pending issuance sweep once the
-                // right is restored.
+                // ICertRequest::GetIssuedCertificate needs Request Certificates on the
+                // CA, the same right as every other call on this interface, and not
+                // Read: lab 2025 collected the account's own request with Request
+                // Certificates alone and was refused CERTSRV_E_ENROLL_DENIED under
+                // Read alone (issue #477). That refusal is why this decides with
+                // IsRefusal rather than E_ACCESSDENIED alone; before, it left as a
+                // plain InvalidOperationException and the finalize demoted an order
+                // whose certificate was live at the CA.
+                //
+                // Read matters in one case only. Without it, a request another
+                // identity submitted does not fail here: it comes back as disposition
+                // 2, denied, with no certificate. The product collects only its own
+                // requests, so that bites only if the service's identity changed
+                // between the submit and the collect, such as a move to another host.
+                //
+                // No gate here, unlike the submit: this call writes nothing and
+                // decides nothing, so there is no "past this point" to protect. The
+                // certificate exists at the CA either way and is collected by the
+                // pending issuance sweep once the right is restored.
                 _logger.LogError(ex,
-                    "CA collection access denied for RequestId={RequestId}. HRESULT: 0x{HResult:X8}",
-                    requestId, ex.HResult);
-                throw new CaAccessDeniedException(
-                    CaAccessDeniedException.CollectPermissionMessage, ex);
-            }
-            catch (COMException ex) when (CaAccessDeniedException.IsAccessDenied(ex))
-            {
-                _logger.LogError(ex,
-                    "CA collection access denied for RequestId={RequestId}. HRESULT: 0x{HResult:X8}",
-                    requestId, ex.HResult);
-                throw new CaAccessDeniedException(
-                    CaAccessDeniedException.CollectPermissionMessage, ex);
+                    "Failed to retrieve certificate for RequestId={RequestId}. HRESULT: 0x{HResult:X8}. {Reason}",
+                    requestId, ex.HResult, mapped.Message);
+                throw mapped;
             }
             catch (COMException ex)
             {
                 _logger.LogError(ex,
                     "Failed to retrieve certificate for RequestId={RequestId}. HRESULT: 0x{HResult:X8}",
                     requestId, ex.HResult);
-                if (CaUnavailableException.IsRpcUnavailable(ex))
-                    throw new CaUnavailableException(
-                        "ADCS Certificate Authority is unavailable (CertSvc RPC unreachable).", ex);
                 throw new InvalidOperationException(
                     $"Failed to retrieve certificate: {ex.Message}", ex);
             }
@@ -842,7 +919,10 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                 // schema name the deployed certcli does not recognise otherwise
                 // throws straight out of the loop and takes the whole query with
                 // it, for every disposition pass. Degrading to a missing column
-                // is survivable; a dead sync is not.
+                // is survivable; a dead sync is not. It is survivable only while
+                // nothing downstream reads the gap as an empty value, which is
+                // why the requester's absence travels out as its own flag
+                // (CertificateInfo.RequestorColumnMissing, issue #547).
                 //
                 // RequestID and Disposition are the exception. MapToCertificateInfo
                 // drops any row missing either one, so losing them turns every
@@ -1591,7 +1671,16 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
             var template = ResolveTemplateName(rawTemplate, templateMap);
             var notBefore = values.GetValueOrDefault(ColumnName.NotBefore) is DateTime nb ? nb : DateTime.MinValue;
             var notAfter = values.GetValueOrDefault(ColumnName.NotAfter) is DateTime na ? na : DateTime.MinValue;
-            var requester = values.GetValueOrDefault(ColumnName.RequesterName)?.ToString();
+            // Sanitized like the names above it (issue #429). The CA composes it
+            // from the submitting account, and whoever names an account names it.
+            var requester = CertificateTextSanitizer.SanitizeRequestor(
+                values.GetValueOrDefault(ColumnName.RequesterName)?.ToString());
+            // Told apart by the key, never by the null (issue #547). A column the
+            // view did not resolve was never registered, so ReadColumnValues files
+            // no key for it on any row. A resolved column whose value is empty or
+            // could not be read still has its key, with a null value, and that is
+            // the CA's answer for this row, which the sync takes at its word.
+            var requesterColumnMissing = !values.ContainsKey(ColumnName.RequesterName);
             var submitted = values.GetValueOrDefault(ColumnName.SubmittedWhen) is DateTime sw ? sw : DateTime.MinValue;
 
             // One parse of the certificate blob the view already returned, for
@@ -1707,7 +1796,8 @@ public sealed class AdcsClient : IAdcsClient, IDisposable
                 CryptoDetail: cryptoDetail,
                 DispositionMessage: dispositionMessage,
                 StatusCode: statusCode,
-                RawCertificate: rawCertificate);
+                RawCertificate: rawCertificate,
+                RequestorColumnMissing: requesterColumnMissing);
         }
         catch (Exception ex)
         {

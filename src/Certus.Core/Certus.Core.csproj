@@ -14,8 +14,18 @@
     <PackageReference Include="System.Formats.Cbor" />
     <PackageReference Include="Microsoft.AspNetCore.DataProtection.Abstractions" />
     <PackageReference Include="MailKit" />
+    <!-- Direct reference exists only to lift MimeKit's transitive Pkcs above the
+         advisory floor (issue #556); see the comment in Directory.Packages.props. -->
+    <PackageReference Include="System.Security.Cryptography.Pkcs" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Json" />
     <PackageReference Include="Serilog.AspNetCore" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The module contract (licence design section 5). Referenced here so it ships in
+         both hosts' output, where the module host shares it with a paid module from the
+         default load context. -->
+    <ProjectReference Include="..\Certus.Modules.Abstractions\Certus.Modules.Abstractions.csproj" />
   </ItemGroup>
 
   <ItemGroup>

@@ -1,5 +1,6 @@
+using System.Buffers;
 using System.Text.Json;
-using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 using Certus.Core.Security;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Configuration.Json;
@@ -91,6 +92,9 @@ public static class SettingsOverlay
     /// <summary>
     /// The instance settings the setup wizard persists. Null values are
     /// omitted from the file so they never mask a lower precedence source.
+    /// These members, and the members of the alert records nested in them, are
+    /// the only keys a save writes; every other key in the file is the
+    /// administrator's and is written back as it was read (issue #550).
     /// <see cref="HttpsCertificateThumbprint"/> selects the HTTPS certificate
     /// from the LocalMachine\My store; it is written by the wizard's TLS
     /// certificate provisioning and read by the service host at startup.
@@ -165,16 +169,25 @@ public static class SettingsOverlay
         string? FromName = null,
         string? PasswordProtected = null);
 
-    private static readonly JsonSerializerOptions WriteOptions = new()
-    {
-        WriteIndented = true,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-    };
+    /// <summary>
+    /// The contract a save walks to learn which members it manages. The
+    /// resolver is named, and the options locked, so
+    /// <see cref="JsonSerializerOptions.GetTypeInfo"/> answers with the same
+    /// member names and order the serializer itself uses.
+    /// </summary>
+    private static readonly JsonSerializerOptions WriteOptions = CreateWriteOptions();
 
     private static readonly JsonSerializerOptions ReadOptions = new()
     {
         PropertyNameCaseInsensitive = true,
     };
+
+    private static JsonSerializerOptions CreateWriteOptions()
+    {
+        var options = new JsonSerializerOptions { TypeInfoResolver = new DefaultJsonTypeInfoResolver() };
+        options.MakeReadOnly();
+        return options;
+    }
 
     /// <summary>
     /// Read the overlay back from <paramref name="overlayPath"/>. A missing
@@ -186,38 +199,22 @@ public static class SettingsOverlay
     /// overlay from an empty record would drop the CA connection string and
     /// unconfigure the CA at the next restart.
     ///
-    /// Inside the Certus section only the keys of <see cref="OverlaySettings"/>
-    /// survive a <see cref="Load"/> then <see cref="Save"/> round trip; any
-    /// other key a hand edit added there is dropped.
+    /// The record carries only the keys the service manages. That is not what a
+    /// save keeps: <see cref="Save"/> reads the file again and writes every
+    /// other key back as it was, inside the Certus section and outside it
+    /// (issue #550). An administrator's own keys, such as Auth:AdminGroup or
+    /// the challenge validation block, therefore survive every write.
     ///
     /// An overlay the service cannot trust reads as absent, as it does at
     /// startup (issue #489). So the next <see cref="Mutate"/> writes a fresh,
-    /// trusted file holding only what that change sets, which is how an
-    /// administrator recovers by saving from the wizard or the settings page.
+    /// trusted file holding only what that change sets, and carries nothing
+    /// else over from the untrusted file, which is how an administrator
+    /// recovers by saving from the wizard or the settings page.
     /// </summary>
     public static OverlaySettings Load(string overlayPath)
     {
-        if (!File.Exists(overlayPath) || !TrustedFile.Check(overlayPath).IsTrusted)
-            return new OverlaySettings(null, null);
-
-        using var document = JsonDocument.Parse(File.ReadAllText(overlayPath));
-        if (document.RootElement.ValueKind != JsonValueKind.Object)
-        {
-            throw new JsonException(
-                $"The settings overlay at {overlayPath} must be a JSON object at the top level.");
-        }
-
-        foreach (var property in document.RootElement.EnumerateObject())
-        {
-            if (string.Equals(property.Name, CertusOptions.SectionName, StringComparison.OrdinalIgnoreCase) &&
-                property.Value.ValueKind != JsonValueKind.Null)
-            {
-                return property.Value.Deserialize<OverlaySettings>(ReadOptions)
-                    ?? new OverlaySettings(null, null);
-            }
-        }
-
-        return new OverlaySettings(null, null);
+        using var document = ReadTrustedDocument(overlayPath);
+        return document is null ? new OverlaySettings(null, null) : ReadSection(document.RootElement);
     }
 
     /// <summary>
@@ -226,20 +223,31 @@ public static class SettingsOverlay
     /// settings.json that would stop the next start (a malformed optional JSON
     /// source still fails configuration build), and no one can stage the write
     /// for the service (issue #489).
+    ///
+    /// <para>
+    /// The save replaces only what <paramref name="settings"/> manages and keeps
+    /// the rest of the file (issue #550). The docs make settings.json the
+    /// administrator's file for keys well beyond the wizard's, and every write
+    /// used to drop them, so the next restart silently put the admin group back
+    /// to the built in Administrators, switched private range blocking off and
+    /// stopped webhook alerts. A key is kept only from a file the service
+    /// trusts; an untrusted one is replaced whole, as before.
+    /// </para>
+    ///
+    /// <para>
+    /// A trusted file that is not valid JSON throws <see cref="JsonException"/>
+    /// and is left alone, the same answer <see cref="Load"/> gives, because
+    /// writing over it would discard whatever it holds. So does a save the
+    /// configuration system could not load afterwards (see
+    /// <see cref="EnsureLoadsAsConfiguration"/>).
+    /// </para>
     /// </summary>
     public static void Save(OverlaySettings settings, string overlayPath)
     {
         lock (WriteLock)
         {
-            var directory = Path.GetDirectoryName(overlayPath);
-            if (!string.IsNullOrEmpty(directory))
-                ProtectedFolder.EnsureExists(directory);
-
-            var payload = new Dictionary<string, OverlaySettings>
-            {
-                [CertusOptions.SectionName] = settings,
-            };
-            AtomicFile.WriteAllText(overlayPath, JsonSerializer.Serialize(payload, WriteOptions));
+            using var existing = ReadTrustedDocument(overlayPath);
+            Write(settings, existing, overlayPath);
         }
     }
 
@@ -248,8 +256,7 @@ public static class SettingsOverlay
     /// <c>SetupService.StatusFileWriteLock</c> plays for the wizard status file.
     /// <see cref="Mutate"/> holds it across the whole read, modify, write, so
     /// two writers cannot both load the file, each change their own field, and
-    /// have the later save drop the earlier change. Monitor is reentrant, so
-    /// <see cref="Mutate"/> calling <see cref="Save"/> is fine.
+    /// have the later save drop the earlier change.
     /// </summary>
     private static readonly object WriteLock = new();
 
@@ -271,7 +278,9 @@ public static class SettingsOverlay
     /// call back into the overlay. A <see cref="JsonException"/> from the read
     /// propagates: the caller has to decide, because rewriting from an empty
     /// record would drop the CA connection string and unconfigure the CA at the
-    /// next restart.
+    /// next restart. The file is read once, and that one read is both what
+    /// <paramref name="change"/> sees and what the write keeps the
+    /// administrator's keys from, as <see cref="Save"/> describes.
     /// </para>
     /// </summary>
     public static OverlaySettings Mutate(
@@ -280,9 +289,302 @@ public static class SettingsOverlay
     {
         lock (WriteLock)
         {
-            var updated = change(Load(overlayPath));
-            Save(updated, overlayPath);
+            using var existing = ReadTrustedDocument(overlayPath);
+            var updated = change(existing is null
+                ? new OverlaySettings(null, null)
+                : ReadSection(existing.RootElement));
+            Write(updated, existing, overlayPath);
             return updated;
+        }
+    }
+
+    /// <summary>
+    /// <see cref="Mutate"/> without the write: read the overlay, apply
+    /// <paramref name="change"/>, build the file the save would write, and refuse it
+    /// exactly as the save would, but write nothing, not even the folder (issue #553).
+    ///
+    /// <para>
+    /// For a caller whose write comes after work that cannot be undone. Enrolling the
+    /// server's HTTPS certificate is the case: the CA issues it and the store installs
+    /// it before the thumbprint is recorded, so a record refused afterwards leaves a
+    /// live certificate that nothing names, one more on every attempt. Asking first
+    /// moves the refusal ahead of the enrolment. It is the same read, the same merge
+    /// and the same check as the save, not a second copy of them, so the two cannot
+    /// disagree about what the file would hold.
+    /// </para>
+    ///
+    /// <para>
+    /// Throws what <see cref="Mutate"/> throws: a <see cref="JsonException"/> for a
+    /// trusted file that cannot be read, and a <see cref="SettingsOverlayConflictException"/>
+    /// for a change that would set a key twice. Runs under the same lock as the
+    /// writers, so it never reads a file half way through another writer's change.
+    /// Passing proves only that the file allowed the change when it was read: a hand
+    /// edit made between this and the real write is refused by the write, as before.
+    /// </para>
+    /// </summary>
+    public static void EnsureCanMutate(
+        string overlayPath,
+        Func<OverlaySettings, OverlaySettings> change)
+    {
+        lock (WriteLock)
+        {
+            using var existing = ReadTrustedDocument(overlayPath);
+            var updated = change(existing is null
+                ? new OverlaySettings(null, null)
+                : ReadSection(existing.RootElement));
+            _ = Build(updated, existing, overlayPath);
+        }
+    }
+
+    /// <summary>
+    /// The overlay parsed, or null when there is nothing the service may read:
+    /// no file, or one it does not trust (issue #489). <see cref="Load"/> and
+    /// both writers read through this, so a key is carried forward only from a
+    /// file the service would itself have honoured at startup.
+    /// </summary>
+    private static JsonDocument? ReadTrustedDocument(string overlayPath)
+    {
+        if (!File.Exists(overlayPath) || !TrustedFile.Check(overlayPath).IsTrusted)
+            return null;
+
+        var document = JsonDocument.Parse(File.ReadAllText(overlayPath));
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+        {
+            document.Dispose();
+            throw new JsonException(
+                $"The settings overlay at {overlayPath} must be a JSON object at the top level.");
+        }
+
+        return document;
+    }
+
+    private static OverlaySettings ReadSection(JsonElement root)
+    {
+        var index = FindSection(root);
+        if (index < 0)
+            return new OverlaySettings(null, null);
+
+        var section = root.EnumerateObject().ElementAt(index).Value;
+        return section.ValueKind == JsonValueKind.Null
+            ? new OverlaySettings(null, null)
+            : section.Deserialize<OverlaySettings>(ReadOptions) ?? new OverlaySettings(null, null);
+    }
+
+    /// <summary>
+    /// The position of the Certus member at the top level of the file: the
+    /// first one, matched ignoring case, whose value is not null, else the first
+    /// null one, else -1. The read takes its values from this member and the
+    /// write puts them back into the same one, so the two never disagree about
+    /// which section the record is.
+    /// </summary>
+    private static int FindSection(JsonElement root)
+    {
+        var index = 0;
+        var firstNull = -1;
+        foreach (var property in root.EnumerateObject())
+        {
+            if (string.Equals(property.Name, CertusOptions.SectionName, StringComparison.OrdinalIgnoreCase))
+            {
+                if (property.Value.ValueKind != JsonValueKind.Null)
+                    return index;
+                if (firstNull < 0)
+                    firstNull = index;
+            }
+
+            index++;
+        }
+
+        return firstNull;
+    }
+
+    /// <summary>
+    /// Write <paramref name="settings"/> into <paramref name="existing"/>, or into
+    /// a new file when there is none, and save the result.
+    /// </summary>
+    private static void Write(OverlaySettings settings, JsonDocument? existing, string overlayPath)
+    {
+        var bytes = Build(settings, existing, overlayPath);
+
+        var directory = Path.GetDirectoryName(overlayPath);
+        if (!string.IsNullOrEmpty(directory))
+            ProtectedFolder.EnsureExists(directory);
+
+        AtomicFile.WriteAllBytes(overlayPath, bytes);
+    }
+
+    /// <summary>
+    /// The file a save of <paramref name="settings"/> over <paramref name="existing"/>
+    /// would write, refused through <see cref="EnsureLoadsAsConfiguration"/> when the
+    /// configuration system could not load it. Touches nothing on disk, which is what
+    /// lets <see cref="EnsureCanMutate"/> share it with the save. Members outside the
+    /// Certus section are written back as they were read; the section itself is
+    /// merged by <see cref="WriteManaged"/>, and appended when the file has none.
+    /// </summary>
+    private static byte[] Build(OverlaySettings settings, JsonDocument? existing, string overlayPath)
+    {
+        var contract = WriteOptions.GetTypeInfo(typeof(OverlaySettings));
+        var buffer = new ArrayBufferWriter<byte>();
+        using (var writer = new Utf8JsonWriter(buffer, new JsonWriterOptions { Indented = true }))
+        {
+            writer.WriteStartObject();
+
+            var section = existing is null ? -1 : FindSection(existing.RootElement);
+            if (existing is not null)
+            {
+                var index = 0;
+                foreach (var property in existing.RootElement.EnumerateObject())
+                {
+                    if (index++ == section)
+                    {
+                        writer.WritePropertyName(property.Name);
+                        WriteManaged(writer, contract, settings, property.Value);
+                    }
+                    else
+                    {
+                        WriteVerbatim(writer, property);
+                    }
+                }
+            }
+
+            if (section < 0)
+            {
+                writer.WritePropertyName(CertusOptions.SectionName);
+                WriteManaged(writer, contract, settings, existing: null);
+            }
+
+            writer.WriteEndObject();
+        }
+
+        var bytes = buffer.WrittenSpan.ToArray();
+        EnsureLoadsAsConfiguration(bytes, overlayPath);
+        return bytes;
+    }
+
+    /// <summary>
+    /// Write one object a record manages: <paramref name="value"/>'s members over
+    /// <paramref name="existing"/>. A member <paramref name="contract"/> names is
+    /// the record's to decide, matched ignoring case as <see cref="Load"/> reads
+    /// it: written where the file had it, or appended, and left out when null,
+    /// which is the rule that keeps an unset value from masking a lower
+    /// precedence source. Every other member is the administrator's and is
+    /// written back as it was read.
+    ///
+    /// <para>
+    /// A nested record recurses rather than replacing the block, because a block
+    /// the dashboard manages can hold keys it does not: the webhook lives in
+    /// Certus:Alerts beside the members the alert card saves. A nested record the
+    /// value leaves null is still merged when the file has the block, so its own
+    /// members go and the administrator's stay.
+    /// </para>
+    /// </summary>
+    private static void WriteManaged(
+        Utf8JsonWriter writer, JsonTypeInfo contract, object? value, JsonElement? existing)
+    {
+        writer.WriteStartObject();
+
+        var written = new HashSet<JsonPropertyInfo>();
+        if (existing is { ValueKind: JsonValueKind.Object } current)
+        {
+            foreach (var property in current.EnumerateObject())
+            {
+                // A second spelling of a member already written is not the
+                // record's to drop: it goes back as it was, and
+                // EnsureLoadsAsConfiguration refuses the save if the two collide.
+                var member = FindMember(contract, property.Name);
+                if (member is not null && written.Add(member))
+                    WriteMember(writer, member, value, property.Value);
+                else
+                    WriteVerbatim(writer, property);
+            }
+        }
+
+        foreach (var member in contract.Properties)
+        {
+            if (written.Add(member))
+                WriteMember(writer, member, value, existing: null);
+        }
+
+        writer.WriteEndObject();
+    }
+
+    private static void WriteMember(
+        Utf8JsonWriter writer, JsonPropertyInfo member, object? owner, JsonElement? existing)
+    {
+        var value = owner is null ? null : member.Get!(owner);
+        var contract = WriteOptions.GetTypeInfo(member.PropertyType);
+
+        if (contract.Kind == JsonTypeInfoKind.Object)
+        {
+            if (value is null && existing is not { ValueKind: JsonValueKind.Object })
+                return;
+
+            writer.WritePropertyName(member.Name);
+            WriteManaged(writer, contract, value, existing);
+        }
+        else if (value is not null)
+        {
+            // Arrays are leaves: once saved, a list is the record's outright,
+            // the rule AlertOptions.ApplyOverlay applies when it reads one back.
+            writer.WritePropertyName(member.Name);
+            JsonSerializer.Serialize(writer, value, member.PropertyType, WriteOptions);
+        }
+    }
+
+    private static JsonPropertyInfo? FindMember(JsonTypeInfo contract, string name)
+    {
+        foreach (var member in contract.Properties)
+        {
+            if (string.Equals(member.Name, name, StringComparison.OrdinalIgnoreCase))
+                return member;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Write a member the service does not manage exactly as the file had it.
+    /// The value goes back as its raw text, so its escapes, its number format
+    /// and its inner layout are unchanged: a group name carrying a non ASCII
+    /// letter is not rewritten as a \u escape the administrator did not type.
+    /// </summary>
+    private static void WriteVerbatim(Utf8JsonWriter writer, JsonProperty property)
+    {
+        writer.WritePropertyName(property.Name);
+        writer.WriteRawValue(property.Value.GetRawText());
+    }
+
+    /// <summary>
+    /// Refuse a save the configuration system could not load (issue #550).
+    /// Keeping keys the service does not manage means one added by hand can now
+    /// meet one the service writes. A top level "Certus:ExternalUrl", the colon
+    /// form the docs use for nested keys, is the same configuration key as
+    /// ExternalUrl inside the Certus section, and the JSON provider refuses a
+    /// file that sets a key twice, so that file would stop the next start. The
+    /// writer is told instead, through a <see cref="SettingsOverlayConflictException"/>,
+    /// which is the <see cref="JsonException"/> every caller already handles for an
+    /// overlay it cannot read, and nothing is written.
+    ///
+    /// <para>
+    /// The message serves the save and its dry run alike (issue #553), so it says the
+    /// change was refused rather than that a save failed, and asks for a retry rather
+    /// than a save: the change may be a certificate renewal, not a form.
+    /// </para>
+    /// </summary>
+    private static void EnsureLoadsAsConfiguration(byte[] json, string overlayPath)
+    {
+        try
+        {
+            using var stream = new MemoryStream(json, writable: false);
+            _ = new ConfigurationBuilder().AddJsonStream(stream).Build();
+        }
+        catch (FormatException ex)
+        {
+            throw new SettingsOverlayConflictException(
+                $"The settings overlay at {overlayPath} cannot take this change, because the result " +
+                $"would not load as configuration: {ex.Message} The file would set that key twice, " +
+                "usually once inside a section and once in the colon form at the top level. Keep one " +
+                "of them and try again.",
+                ex);
         }
     }
 

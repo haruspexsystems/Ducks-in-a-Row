@@ -63,7 +63,11 @@ checksum is the only check.
 | Create the data folder | `C:\ProgramData\Ducks in a Row\`, or the folder you choose. Its location is recorded in the registry so the service can find it |
 | Create the log folder | `logs\` inside the data folder |
 | Register the service | `DucksInARow`, display name "Ducks in a Row Certificate Proxy", starts automatically, runs as LocalSystem |
+| Set service recovery | Restart after the first and second failures, nothing after the third, failure count reset after a day. See [if the service stops](#if-the-service-stops) |
 | Start the service | Immediately after install, unless you clear the option |
+| Record the instance mode | The registry value `Mode`, `monitor` or `full`, beside the data folder's location. See [monitor mode](monitor-mode.md) |
+| Create the modules folder | `modules\` inside the application folder, empty, with the application folder's permissions. The [paid module](licence.md) installs into it |
+| Record the module contract | The registry value `ModuleContractVersion`, for example `1.0`, beside the data folder's location. The paid module's installer reads it to check that the module fits this release |
 | Open firewall rules | Inbound TCP 5000 and TCP 5001 |
 | Add a Start Menu shortcut | Opens the web interface |
 
@@ -72,15 +76,33 @@ The data folder is not removed when you uninstall. See
 
 ## The install wizard
 
-Running either installer interactively gives you four choices:
+Running either installer interactively gives you five choices:
 
 1. The destination folder, default `C:\Program Files\Ducks in a Row\`.
 2. The data folder for the database, logs and runtime configuration, default
    `C:\ProgramData\Ducks in a Row\`.
 3. Whether to start the service immediately.
-4. Whether to open the setup page in your browser from the final screen.
+4. Whether to run in [monitor mode](monitor-mode.md): watch the CA, never issue
+   or revoke. Unchecked by default. It is the low risk way to start on a
+   production CA, and switching to issuance later needs no reinstall.
+5. Whether to open the setup page in your browser from the final screen.
 
 Choose the data folder now. Moving it during a later upgrade is not supported.
+It holds the database too, which cannot be moved out of it on its own, so if
+the data belongs on another disk, choose a folder on that disk here. Use a
+local disk: a network share is not supported.
+
+An upgrade keeps the folders and the mode chosen before, and on a monitor mode
+server the monitor mode box is already ticked. If someone set the registry value
+`Mode` by hand to something the service cannot use, setup stops and names it;
+see [troubleshooting](troubleshooting.md#setup-stops-the-registry-value-mode-cannot-be-used).
+
+If the server has the [paid module](licence.md) installed, and the new release
+needs a module built for it, the wizard opens with a warning page before
+anything else. After such an upgrade the installed module does not load, so the
+paid features stay off until you install the module built for the new release.
+Certificate issuance and renewal are not affected. **Continue** upgrades anyway;
+**Cancel** leaves the installed version as it is.
 
 ## Unattended install
 
@@ -97,53 +119,71 @@ msiexec /i Ducks-in-a-Row.msi /qn `
 | `INSTALLFOLDER` | `C:\Program Files\Ducks in a Row` | Where the application goes |
 | `DATAFOLDER` | `C:\ProgramData\Ducks in a Row` | Where the database, logs and settings go |
 | `START_SERVICE` | `1` | `0` registers the service but leaves it stopped until the next boot or a manual start |
+| `MONITOR_ONLY` | not set | `1` installs in [monitor mode](monitor-mode.md). Leave it out for full mode; on an upgrade, leaving it out keeps the mode the server already has. Any other value is refused |
+| `ALLOW_INCOMPATIBLE_MODULE` | not set | `1` lets an unattended upgrade go ahead although the installed [paid module](licence.md) will not load after it. Without it such an upgrade stops and says why. It is never remembered, and any other value is refused |
 
 The prompt to open the setup page appears only in the interactive wizard, so a
-`/qn` install never launches a browser.
+`/qn` install never launches a browser. The same goes for the paid module
+warning page: an install with no wizard, which includes the setup bundle's
+`/quiet` and `/passive`, stops instead of asking, unless you pass
+`ALLOW_INCOMPATIBLE_MODULE=1`.
 
-The setup bundle accepts the same silent switches through its own command line:
+The setup bundle passes the same five properties to the MSI. Give them on its own
+command line:
 
 ```powershell
-Ducks-in-a-Row-Setup.exe /quiet /log "C:\temp\ducks-bundle.log"
+Ducks-in-a-Row-Setup.exe /quiet MONITOR_ONLY=1 START_SERVICE=0 /log "C:\temp\ducks-bundle.log"
 ```
 
 ## If the service stops
 
-**The installer deliberately does not configure automatic service recovery.** A
-service that stops stays stopped until something starts it.
+The installer sets the service to recover by itself, twice:
 
-The reason is what this service does when it fails. Almost every way it stops is
-a fault it found while starting, and usually that is a configuration it cannot
-work with. It writes the reason to the log, sets a nonzero exit code and stops.
-A restart policy does not help there: the configuration is still wrong, so the
-service reaches the same fault again, and you are left watching it flap instead
-of seeing it plainly down with the reason waiting in the log.
+| Failure | What Windows does |
+|---|---|
+| First | Restarts the service after 30 seconds |
+| Second | Restarts the service after 30 seconds |
+| Third and later | Nothing: the service stays stopped |
 
-There is a second reason, and it decides whether a restart policy does anything
-at all. Windows runs recovery actions when a service dies without reporting that
-it stopped. A service that does report stopped, and carries an error code with
-it, counts as a failure only once you turn the failure flag on as well. Which of
-those two a fault here produces is worth checking on your own box before you
-rely on a restart policy, because the difference decides whether it ever fires.
-
-If you want the restart policy anyway, set it yourself, once, after installing:
+Windows forgets the count once a day passes with no failure. Check what is set
+with:
 
 ```powershell
-sc.exe failure DucksInARow reset= 86400 `
-  actions= restart/5000/restart/10000/restart/30000
+sc.exe qfailure DucksInARow
 ```
 
-That restarts the service after five seconds on the first failure, ten on the
-second and thirty thereafter, and forgets the failure count after a day. Add the
-failure flag if you also want a stop that reports an error to count:
+**Why two restarts.** The [paid module](licence.md) runs inside the service. A
+fault in it can end the service's process outright, and the service notes each
+time that happens while the module is starting up. After the second time it sets
+that version of the module aside, and starts without it from then on. So two
+restarts bring the service back with certificate issuance and renewal working,
+whatever the module did. The paid features stay off until the module is fixed,
+and the licence page says so.
 
-```powershell
-sc.exe failureflag DucksInARow 1
-```
+**Why not more.** Almost every other way this service stops is a fault it found
+while starting, usually a configuration it cannot work with. It writes the
+reason to the log and stops. A restart does not fix a configuration, so a third
+restart would only have it reach the same fault again, and you would be left
+watching it flap rather than seeing it plainly down with the reason in the log.
 
-Neither is a substitute for reading the log. A service that keeps failing on a
-bad configuration keeps failing after a restart, and the reason is in
-`logs\ducks-<date>.log` in the data folder.
+**A configuration the service refuses at startup is not restarted at all.**
+Windows records it as a service that failed to start (System log events 7009 and
+7000 from the Service Control Manager) rather than one that ended unexpectedly
+(7031), and runs no recovery action for it. The service stays stopped, with the
+reason in its log. This was measured with a `Mode` value the service refuses,
+not reasoned about.
+
+**The failure flag stays off.** Windows runs these actions when a service ends
+without reporting that it stopped. A service that does report stopped, with an
+error code, counts as a failure only when the failure flag is on, and the
+installer leaves it off.
+
+Every install, repair and upgrade sets these actions again, and replaces any you
+set yourself with `sc.exe failure`. None of this is a substitute for reading the
+log. The reason the service stopped is in `logs\ducks-<date>.log` in the data
+folder.
+
+Releases before 1.1 configured no recovery at all.
 
 ## After installing
 
@@ -153,3 +193,65 @@ through the wizard; the [quickstart](quickstart.md) walks through each step.
 
 Then confirm the install is healthy with [verifying your
 installation](verifying.md).
+
+## Upgrading
+
+Ducks in a Row never checks for a new release and never installs one by itself.
+It makes no connection to us or to anyone else, so there is no automatic update
+setting to turn off. You learn that a release exists from the
+[releases page](https://github.com/haruspexsystems/Ducks-in-a-Row/releases), the
+repository's security advisories, the [changelog](../CHANGELOG.md), or the
+security notices list you can sign up for; [SUPPORT.md](../SUPPORT.md) says
+how. A security fix ships as its own patch release of the latest release where
+that is feasible, and upgrading to it is free of charge; see
+[SECURITY.md](../SECURITY.md).
+
+To upgrade:
+
+1. Take a copy of the data folder first, as
+   [backup and restore](backup-and-restore.md) describes. An upgrade keeps it,
+   and the copy is what you fall back on if anything goes wrong.
+2. [Check the download](#check-the-download): the signature, the signer and
+   the checksum, exactly as for a first install.
+3. Run the new `Ducks-in-a-Row-Setup.exe` on the server, over the existing
+   installation, interactively or unattended with the same command as a fresh
+   install. The bundle installs the ASP.NET Core runtime first when the server
+   has none of the major version the release needs; the bare MSI never does,
+   so with the MSI, install the runtime the release notes name before you run
+   it. The wizard shows the
+   folders chosen before and the monitor mode box as the server has it, so
+   nothing has to be chosen again; leaving `MONITOR_ONLY` out of an unattended
+   upgrade keeps the mode. Moving the data folder during an upgrade is not
+   supported.
+4. If the server has the [paid module](licence.md) installed and the new
+   release needs a module built for it, the wizard opens with a warning page
+   first, and an unattended upgrade stops unless you pass
+   `ALLOW_INCOMPATIBLE_MODULE=1`. See [the install wizard](#the-install-wizard)
+   for what the warning means; certificate issuance and renewal are not
+   affected either way.
+5. The installer stops the service, removes the previous version, installs the
+   new one, and starts the service again. ACME clients and the dashboard lose
+   their connection while that runs, and a client retries on its next renewal
+   attempt. An older release cannot be
+   installed over a newer one; the installer refuses with "A newer version of
+   Ducks in a Row is already installed".
+
+What an upgrade keeps:
+
+- The data folder, with the database, the logs, `settings.json`,
+  `ducks-setup.json` and the Data Protection keyring in `keys\`. Your CA
+  connection, templates, policies, ACME accounts, alert settings and history
+  all live there.
+- The install folder and the data folder you chose, and the instance mode.
+- The server's HTTPS certificate in the machine store, and the thumbprint in
+  `settings.json` that names it.
+- The firewall rules, the service registration and its recovery actions, which
+  the installer sets again.
+- A paid module in the `modules\` folder, which loads again only if it was
+  built for the new release.
+
+Afterwards, run [verifying your installation](verifying.md): the first check
+confirms the installed files carry our signature, and the health check that the
+service is up. Then read the [changelog](../CHANGELOG.md) entry for the
+release, and `logs\ducks-<date>.log` once: a setting the new release finds
+wrong is reported there as a startup warning that names it.

@@ -21,6 +21,13 @@ public interface IAdcsClient
     /// <summary>
     /// Lists certificate templates available on the CA.
     /// </summary>
+    /// <exception cref="CaAccessDeniedException">
+    /// The CA refused the service account, carrying
+    /// <see cref="CaAccessDeniedException.TemplateReadPermissionMessage"/> (issue #476).
+    /// The remedy names the service's own account, so a caller answering an ACME
+    /// client keeps it to the log, as the finalize does.
+    /// </exception>
+    /// <exception cref="CaUnavailableException">The CA could not be reached, or none is configured.</exception>
     Task<IReadOnlyList<TemplateInfo>> GetTemplatesAsync(CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -62,7 +69,9 @@ public interface IAdcsClient
     /// </summary>
     /// <exception cref="CaAccessDeniedException">
     /// The CA was reached and refused this service's credentials, so the certificate
-    /// could not be collected. Makes no promise about state and needs none: this call
+    /// could not be collected. Carries
+    /// <see cref="CaAccessDeniedException.CollectPermissionMessage"/>, which names
+    /// Request Certificates since issue #477. Makes no promise about state and needs none: this call
     /// decides nothing and writes nothing, and the request stays exactly as it was at
     /// the CA. A caller holding an order for it must leave that order alone and let
     /// the pending issuance sweep collect it once the permission is restored; failing
@@ -120,6 +129,12 @@ public interface IAdcsClient
     /// <c>CR_PROP_CASIGCERTCHAIN</c> for the newest CA certificate. Used by
     /// the settings page trust anchor downloads.
     /// </summary>
+    /// <exception cref="CaAccessDeniedException">
+    /// The CA refused the service account, carrying
+    /// <see cref="CaAccessDeniedException.ChainReadPermissionMessage"/> (issue #476).
+    /// The same rule about ACME clients applies as for <see cref="GetTemplatesAsync"/>.
+    /// </exception>
+    /// <exception cref="CaUnavailableException">The CA could not be reached, or none is configured.</exception>
     Task<IReadOnlyList<byte[]>> GetCaCertificateChainAsync(CancellationToken cancellationToken = default);
 
     /// <summary>

@@ -5,7 +5,10 @@ using Certus.Core.Adcs;
 using Certus.Core.Configuration;
 using Certus.Core.Services;
 using Certus.Core.Setup;
+using Certus.Web.Audit;
 using Certus.Web.Authentication;
+using Certus.Web.Configuration;
+using Certus.Web.Controllers.Dashboard;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Options;
@@ -34,6 +37,9 @@ public sealed class SettingsController : ControllerBase
     private readonly IHttpsCertificateStore _certificateStore;
     private readonly CertusOptions _certusOptions;
     private readonly IConfiguration _configuration;
+    private readonly CertusInstanceMode _instanceMode;
+    private readonly ReleaseAgeOptions _releaseAge;
+    private readonly TimeProvider _time;
     private readonly ILogger<SettingsController> _logger;
 
     public SettingsController(
@@ -44,7 +50,10 @@ public sealed class SettingsController : ControllerBase
         IHttpsCertificateStore certificateStore,
         IOptions<CertusOptions> certusOptions,
         IConfiguration configuration,
-        ILogger<SettingsController> logger)
+        CertusInstanceMode instanceMode,
+        IOptions<ReleaseAgeOptions> releaseAge,
+        ILogger<SettingsController> logger,
+        TimeProvider? timeProvider = null)
     {
         _setupService = setupService;
         _serviceRestarter = serviceRestarter;
@@ -53,6 +62,11 @@ public sealed class SettingsController : ControllerBase
         _certificateStore = certificateStore;
         _certusOptions = certusOptions.Value;
         _configuration = configuration;
+        _instanceMode = instanceMode;
+        _releaseAge = releaseAge.Value;
+        // Both hosts register TimeProvider.System through AddCertusModuleHost;
+        // the fallback keeps a bare test host working and is never a fake.
+        _time = timeProvider ?? TimeProvider.System;
         _logger = logger;
     }
 
@@ -72,6 +86,21 @@ public sealed class SettingsController : ControllerBase
     ///
     /// commit is null on a build with no stamp, which is a supported build
     /// (the release source snapshot has no .git). The page hides the row.
+    ///
+    /// mode is "full" or "monitor" (issue #470). It is the one place the
+    /// dashboard learns the mode, which it uses for its badge and to hide the
+    /// controls that would write to the CA. Reported, never accepted: the mode
+    /// is a local administrator's registry value and no endpoint changes it.
+    ///
+    /// The release age fields (issue #623) are the one in product aid against
+    /// staying on an old release that the no internet rule allows. commitDate
+    /// is the date of the commit the build was stamped from (null without a
+    /// stamp, like commit), releaseAgeDays how old that is by this server's
+    /// clock, releaseAgeWarningDays the threshold in force (0 when disabled),
+    /// and releaseOutdated whether the age passed it. runtimeVersion and
+    /// aspNetCoreVersion name the shared frameworks the process runs on,
+    /// which Windows Update patches independently of the installer. Nothing
+    /// here is fetched from anywhere: every value is read off the process.
     /// </summary>
     [HttpGet("info")]
     public IActionResult GetInfo()
@@ -88,7 +117,22 @@ public sealed class SettingsController : ControllerBase
                 ?? "unknown";
         }
 
-        return Ok(new { version, commit });
+        var commitDate = InstalledRelease.ReadCommitDate(typeof(SettingsController).Assembly);
+        var warningDays = _releaseAge.EffectiveWarningDays;
+        var age = InstalledRelease.Evaluate(commitDate, _time.GetUtcNow(), warningDays);
+
+        return Ok(new
+        {
+            version,
+            commit,
+            mode = _instanceMode.WireName,
+            commitDate = commitDate?.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+            releaseAgeDays = age.AgeDays,
+            releaseAgeWarningDays = warningDays,
+            releaseOutdated = age.Outdated,
+            runtimeVersion = InstalledRelease.RuntimeVersion(),
+            aspNetCoreVersion = InstalledRelease.AspNetCoreVersion(),
+        });
     }
 
     /// <summary>
@@ -147,6 +191,7 @@ public sealed class SettingsController : ControllerBase
     /// nothing.
     /// </summary>
     [HttpPut("external-url")]
+    [AdminAudit("settings.external-url.changed")]
     public async Task<IActionResult> UpdateExternalUrl(
         [FromBody] UpdateExternalUrlRequest request, CancellationToken ct)
     {
@@ -179,6 +224,12 @@ public sealed class SettingsController : ControllerBase
 
         try
         {
+            // The audit row first, then the file (issue #634): a crash between
+            // the two leaves a record of what was about to change rather than
+            // a changed file nobody is on record for.
+            var previousUrl = SettingsOverlay.Load(_setupService.SettingsOverlayPath).ExternalUrl;
+            await this.AdminAudit().RecordBeforeFileWriteAsync(
+                "Certus:ExternalUrl", previousUrl ?? "(not set)", request.Url, ct);
             _setupService.UpdateExternalUrl(request.Url);
         }
         catch (JsonException ex)
@@ -244,7 +295,9 @@ public sealed class SettingsController : ControllerBase
     /// involved.
     /// </summary>
     [HttpPut("allowed-domains")]
-    public IActionResult UpdateAllowedDomains([FromBody] UpdateAllowedDomainsRequest request)
+    [AdminAudit("settings.allowed-domains.changed")]
+    public async Task<IActionResult> UpdateAllowedDomains(
+        [FromBody] UpdateAllowedDomainsRequest request, CancellationToken ct)
     {
         // Before setup the wizard is the single write path for the status
         // file; this endpoint exists for the life of the install after it.
@@ -265,6 +318,13 @@ public sealed class SettingsController : ControllerBase
 
         if (request.Enabled && normalized.Count == 0)
             return BadRequest(new { error = "Add at least one domain, or turn the restriction off." });
+
+        // The audit row before the file write (issue #634); the filter appends
+        // a "not applied" row if the write below is refused.
+        await this.AdminAudit().RecordBeforeFileWriteAsync(
+            "allowed domains",
+            DescribeAllowedDomains(status.AllowedDomainsEnabled, status.AllowedDomains),
+            DescribeAllowedDomains(request.Enabled, normalized), ct);
 
         if (!_setupService.UpdateAllowedDomains(request.Enabled, normalized))
             return Conflict(new
@@ -319,7 +379,9 @@ public sealed class SettingsController : ControllerBase
     /// immediately: RevocationScopePolicy hot reads the file.
     /// </summary>
     [HttpPut("revocation-scope")]
-    public IActionResult UpdateRevocationScope([FromBody] UpdateRevocationScopeRequest request)
+    [AdminAudit("settings.revocation-scope.changed")]
+    public async Task<IActionResult> UpdateRevocationScope(
+        [FromBody] UpdateRevocationScopeRequest request, CancellationToken ct)
     {
         // Before setup the wizard is the single write path for the status
         // file; this endpoint exists for the life of the install after it.
@@ -350,6 +412,14 @@ public sealed class SettingsController : ControllerBase
             });
         }
 
+        var previousMode = RevocationScopePolicy.TryParseMode(status.RevocationScope, out var parsedPrevious)
+            ? parsedPrevious
+            : RevocationScopeMode.DucksManaged;
+        await this.AdminAudit().RecordBeforeFileWriteAsync(
+            "revocation scope",
+            DescribeRevocationScope(previousMode, status.RevocableTemplates),
+            DescribeRevocationScope(mode, templates), ct);
+
         if (!_setupService.UpdateRevocationScope(mode, templates))
             return Conflict(new
             {
@@ -374,6 +444,14 @@ public sealed class SettingsController : ControllerBase
     /// would use (the recorded one, or the first enabled template for
     /// installs that predate the recorded field). restartPending is true when
     /// the overlay thumbprint differs from the one this process serves.
+    ///
+    /// installedByService says who owns the certificate (issue #535): true when
+    /// it carries this service's friendly name, false when somebody else
+    /// installed it, null when it is not in the store and the question cannot
+    /// be asked. autoRenewal.renewsThisCertificate is the automatic renewal's
+    /// own rule applied to it: switched on, and not a certificate somebody else
+    /// installed. A missing certificate counts as renewed, because the renewal
+    /// replaces it.
     /// </summary>
     [HttpGet("https-certificate")]
     public IActionResult GetHttpsCertificate()
@@ -420,12 +498,16 @@ public sealed class SettingsController : ControllerBase
                 : null;
 
         var attempt = _autoRenewal.LastAttempt;
+        bool? installedByService = certificate is null
+            ? null
+            : HttpsCertificateOwnership.InstalledByService(certificate);
 
         return Ok(new
         {
             configured = true,
             thumbprint,
             inStore = certificate is not null,
+            installedByService,
             subject = certificate?.Subject,
             subjectNames = certificate is null
                 ? null
@@ -441,6 +523,7 @@ public sealed class SettingsController : ControllerBase
             autoRenewal = new
             {
                 enabled = _autoRenewal.Enabled,
+                renewsThisCertificate = _autoRenewal.Enabled && installedByService != false,
                 windowDays = _autoRenewal.RenewalWindowDays,
                 lastAttemptAt = attempt?.AttemptedAt,
                 lastOutcome = attempt is null ? null : Describe(attempt.Outcome),
@@ -452,6 +535,15 @@ public sealed class SettingsController : ControllerBase
                     && attempt.Outcome != HttpsCertificateRenewalOutcome.NotApplicable,
             },
         });
+    }
+
+    private ObjectResult RefuseRenewalInMonitorMode()
+    {
+        _logger.LogWarning(
+            "Refused an HTTPS certificate renewal from the settings page: this server runs in monitor mode");
+        return MonitorModeProblem.Refuse(this,
+            "This server runs in monitor mode, so it never enrolls or renews a certificate. " +
+            "Renew it at the certification authority and select it by thumbprint instead.");
     }
 
     /// <summary>The camelCase outcome name the dashboard switches on.</summary>
@@ -471,6 +563,12 @@ public sealed class SettingsController : ControllerBase
     /// setup, install it, point the overlay at it, remove the superseded
     /// certificate from the store, and schedule the restart that applies it.
     ///
+    /// On a certificate this service did not install, typically one picked in
+    /// monitor mode, this is how an administrator hands renewal to the service
+    /// (issue #535): from then on the automatic renewal renews the certificate
+    /// enrolled here. The certificate it replaces is not removed, because it is
+    /// not this service's to delete.
+    ///
     /// Unlike the wizard flow there is no "apply anyway" for a certificate
     /// that stops covering the external URL host: that is a template
     /// regression to fix (Subject Name tab), not a state to accept, so the
@@ -479,8 +577,14 @@ public sealed class SettingsController : ControllerBase
     /// exact fixes and flow through unchanged.
     /// </summary>
     [HttpPost("https-certificate/renew")]
+    [AdminAudit("settings.https-certificate.renewal-requested")]
     public async Task<IActionResult> RenewHttpsCertificate(CancellationToken ct)
     {
+        // First (issue #470). The renewal core refuses on its own too, with the
+        // MonitorMode blocker mapped below; this answers before it is asked.
+        if (_instanceMode.IsMonitor)
+            return RefuseRenewalInMonitorMode();
+
         HttpsCertificateRenewalResult result;
         try
         {
@@ -507,6 +611,8 @@ public sealed class SettingsController : ControllerBase
         switch (result.Outcome)
         {
             case HttpsCertificateRenewalOutcome.NotApplicable:
+                if (result.Blocker == HttpsCertificateRenewalBlocker.MonitorMode)
+                    return RefuseRenewalInMonitorMode();
                 return result.Blocker == HttpsCertificateRenewalBlocker.MockCa
                     ? BadRequest(new { error = result.Message })
                     : Conflict(new { error = result.Message });
@@ -514,6 +620,11 @@ public sealed class SettingsController : ControllerBase
             case HttpsCertificateRenewalOutcome.Pending:
             case HttpsCertificateRenewalOutcome.Denied:
             case HttpsCertificateRenewalOutcome.Failed:
+                // A 200 that enrolled nothing (issue #634): the CA's answer is
+                // the record, and the row says so rather than claiming a renewal.
+                this.AdminAudit().Describe(
+                    $"template {result.Template}",
+                    after: $"renewal requested, CA answered {result.Outcome.ToString().ToLowerInvariant()}: {result.Message}");
                 return Ok(new
                 {
                     outcome = result.Outcome switch
@@ -527,6 +638,9 @@ public sealed class SettingsController : ControllerBase
                 });
 
             case HttpsCertificateRenewalOutcome.SanMismatch:
+                this.AdminAudit().Describe(
+                    $"template {result.Template}",
+                    after: $"renewal issued {result.Thumbprint} but it does not cover the external URL host, so it was removed again");
                 return Ok(new
                 {
                     outcome = "sanMismatch",
@@ -541,18 +655,24 @@ public sealed class SettingsController : ControllerBase
         // restarts immediately, so the process stops serving the superseded
         // certificate within seconds. The background renewal service must
         // never do this, because its host keeps serving that certificate
-        // until an administrator applies the new one.
+        // until an administrator applies the new one. Only a certificate this
+        // service installed goes (issue #535): one picked in monitor mode is
+        // somebody else's, so it stays, with its key.
         var previousThumbprint = result.PreviousThumbprint;
         if (!string.IsNullOrWhiteSpace(previousThumbprint) &&
             !string.Equals(previousThumbprint, result.Thumbprint, StringComparison.OrdinalIgnoreCase))
         {
-            _renewal.TryRemoveFromStore(previousThumbprint, "the superseded certificate");
+            _renewal.TryRemoveSuperseded(previousThumbprint);
         }
 
         var restartScheduled = _serviceRestarter.TryScheduleRestart();
         _logger.LogInformation(
             "Webserver certificate renewed with template {Template}: {Thumbprint} replaces {Previous}",
             result.Template, result.Thumbprint, previousThumbprint ?? "(none)");
+        this.AdminAudit().Describe(
+            "HTTPS certificate",
+            before: previousThumbprint ?? "(none)",
+            after: $"{result.Thumbprint}, enrolled with template {result.Template}");
 
         return Ok(new
         {
@@ -572,6 +692,7 @@ public sealed class SettingsController : ControllerBase
     /// bounce the service for no reason.
     /// </summary>
     [HttpPost("https-certificate/apply")]
+    [AdminAudit("settings.https-certificate.applied")]
     public IActionResult ApplyHttpsCertificate()
     {
         string? overlayThumbprint;
@@ -600,6 +721,10 @@ public sealed class SettingsController : ControllerBase
             "Applying renewed webserver certificate {Thumbprint} from the dashboard; " +
             "restart scheduled: {RestartScheduled}",
             overlayThumbprint, restartScheduled);
+        this.AdminAudit().Describe(
+            "HTTPS certificate",
+            before: _certusOptions.HttpsCertificateThumbprint ?? "(none)",
+            after: $"{overlayThumbprint}, restart scheduled: {restartScheduled}");
 
         return Ok(new
         {
@@ -611,19 +736,33 @@ public sealed class SettingsController : ControllerBase
         });
     }
 
+    /// <summary>The allowed domain policy in the words the audit trail records (issue #634).</summary>
+    internal static string DescribeAllowedDomains(bool enabled, IReadOnlyList<string> domains) =>
+        enabled ? $"on: {string.Join(", ", domains)}" : "off";
+
+    /// <summary>The revocation scope in the words the audit trail records (issue #634).</summary>
+    internal static string DescribeRevocationScope(RevocationScopeMode mode, IReadOnlyList<string> customTemplates) =>
+        mode == RevocationScopeMode.Custom
+            ? $"custom: {(customTemplates.Count == 0 ? "(no templates, dashboard revocation disabled)" : string.Join(", ", customTemplates))}"
+            : RevocationScopePolicy.ModeName(mode);
+
     /// <summary>
-    /// The overlay exists but cannot be parsed. Fail loudly with the path:
+    /// The overlay exists but cannot be parsed, or a save would set one
+    /// configuration key twice (issue #550). Shared by the external URL, the
+    /// HTTPS certificate card, its Renew button and its Apply button, so the
+    /// sentence names none of them (issue #553). Fail loudly with the path:
     /// rewriting the file from scratch could silently drop the CA connection
     /// string, and a bare 500 would leave the admin no clue which file to fix.
     /// </summary>
     private ObjectResult OverlayUnreadable(JsonException ex)
     {
         var path = _setupService.SettingsOverlayPath;
-        _logger.LogError(ex, "The settings overlay at {Path} could not be parsed", path);
+        _logger.LogError(ex, "The settings overlay at {Path} could not be read or saved", path);
         return StatusCode(500, new
         {
-            error = $"The settings overlay at {path} is not valid JSON and must be " +
-                    "fixed by hand before the external URL can be managed here.",
+            error = $"The settings overlay at {path} is not valid JSON, or would set a " +
+                    "configuration key twice, and must be fixed by hand before this setting " +
+                    "can be changed here. The service log names the problem.",
         });
     }
 }

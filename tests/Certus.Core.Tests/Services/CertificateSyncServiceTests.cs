@@ -393,6 +393,60 @@ public class CertificateSyncServiceTests : IDisposable
         row.StatusCode.Should().BeNull();
     }
 
+    [Theory]
+    [InlineData(CertificateStatus.Denied, "Denied by CORP\\admin", CaStatusCode.AdminDeniedRequest)]
+    [InlineData(CertificateStatus.Failed, "Error resubmitting the request", CaStatusCode.SubjectAltNameRequired)]
+    public async Task Sync_RequestDecidedAfterAgingOutWhilePending_MovesToTheDecision(
+        CertificateStatus decided, string message, int statusCode)
+    {
+        // The repro issue #187 was filed about. A request pends, is stored as
+        // Pending, ages out of the history window, and only then does the CA
+        // decide it. Bounding the denied and failed passes on SubmittedWhen
+        // never returned it again, so the local row said Pending for good.
+        SetCaCertificates(issued: Array.Empty<CertificateInfo>(),
+            revoked: Array.Empty<CertificateInfo>());
+        SetCaRequests(CertificateStatus.Pending, new[]
+        {
+            Cert(15, "CN=aged.example.com", CertificateStatus.Pending,
+                dispositionMessage: "Taken Under Submission")
+        });
+
+        await CreateService(requestHistoryDays: 30).SyncCertificatesAsync(CancellationToken.None);
+
+        (await GetDb().SyncedCertificates.SingleAsync(c => c.RequestId == 15))
+            .Status.Should().Be("Pending");
+
+        // Next cycle: submitted 40 days ago, decided yesterday. The pending pass
+        // no longer reaches it, and the decided pass answers the way the CA view
+        // does, applying whichever time restrictions the query carries to this
+        // row's two timestamps rather than to the pass as a whole.
+        var submittedWhen = DateTime.UtcNow.AddDays(-40);
+        var resolvedWhen = DateTime.UtcNow.AddDays(-1);
+        var decidedRow = Cert(15, "CN=aged.example.com", decided,
+            dispositionMessage: message,
+            statusCode: statusCode) with { RequestDate = submittedWhen };
+
+        SetCaRequests(CertificateStatus.Pending, Array.Empty<CertificateInfo>());
+        _adcs.QueryCertificatesAsync(
+                Arg.Is<CertificateQuery>(q => q.Status == decided),
+                Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                var q = call.Arg<CertificateQuery>();
+                var inWindow =
+                    (q.SubmittedAfter is null || submittedWhen >= q.SubmittedAfter) &&
+                    (q.ResolvedAfter is null || resolvedWhen >= q.ResolvedAfter);
+                return inWindow ? new[] { decidedRow } : Array.Empty<CertificateInfo>();
+            });
+
+        await CreateService(requestHistoryDays: 30).SyncCertificatesAsync(CancellationToken.None);
+
+        var row = await GetDb().SyncedCertificates.SingleAsync(c => c.RequestId == 15);
+        row.Status.Should().Be(decided.ToString());
+        row.DispositionMessage.Should().Be(message);
+        row.StatusCode.Should().Be(statusCode);
+    }
+
     [Fact]
     public async Task Sync_UnreadableDispositionColumn_KeepsTheExplanationAlreadyCaptured()
     {
@@ -1172,10 +1226,16 @@ public class CertificateSyncServiceTests : IDisposable
     /// in: no serial number, because nothing was issued, and by default no
     /// subject, because an ACME CSR carries no subject DN and the CA's request
     /// subject columns are then empty too. This is the row issue #186 is about.
+    ///
+    /// Dated now, because the orders these tests seed are created now and a
+    /// request can only be an order's own when the CA dates it inside that
+    /// order's life (issue #442, AcmeInventoryBridge.MayBeTheOrdersRequest). The
+    /// ten days back that <see cref="Cert"/> uses would have this request
+    /// submitted before the order that named it existed.
     /// </summary>
     private static CertificateInfo RequestRow(
         int requestId, CertificateStatus status, string subject = "") =>
-        Cert(requestId, subject, status) with { SerialNumber = "" };
+        Cert(requestId, subject, status) with { SerialNumber = "", RequestDate = DateTime.UtcNow };
 
     [Theory]
     [InlineData(CertificateStatus.Pending)]
@@ -1352,10 +1412,14 @@ public class CertificateSyncServiceTests : IDisposable
     [Fact]
     public async Task Sync_ExistingPoisonedTemplateRow_IsRewrittenOnTheNextPass()
     {
-        // Why this needs no startup sweep where issue #224 needed one for
-        // subjects: IsUnchanged compares the stored value against the sanitized
-        // incoming one, so a row stored before this fix reads as changed exactly
-        // once, is rewritten clean, and is cheap from then on.
+        // A row the sync revisits heals here: IsUnchanged compares the stored
+        // value against the sanitized incoming one, so a row stored before this
+        // fix reads as changed exactly once, is rewritten clean, and is cheap from
+        // then on. That is not every row. A request resolved longer ago than
+        // RequestHistoryDays, and a row the CA no longer returns, are never read
+        // again, which is why issue #224 needed a startup sweep for subjects,
+        // issue #429 added one for requesters and issue #545 one for the
+        // template (DatabaseInitializerTests.StoredTemplateNames_AreSanitizedAtStartup).
         var rlo = (char)0x202e;
 
         var seed = GetDb();
@@ -1410,6 +1474,221 @@ public class CertificateSyncServiceTests : IDisposable
         _sql.Updates.Should().BeLessThan(10,
             "the poisoned name sanitizes to what is already stored, so nothing moved");
         (await GetDb().SyncedCertificates.CountAsync(c => c.TemplateName == "WebServer"))
+            .Should().Be(rows);
+    }
+
+    // ---- The requester column takes the same guard (issue #429) -----------
+    //
+    // A screen and a sort, and nothing else: no decision in the product reads
+    // this column. What differs from the template above is the null rule. The
+    // column is nullable, so a requester that sanitizes away is stored as null.
+
+    /// <summary>A CA row whose requester carries the poison, subject clean.</summary>
+    private static CertificateInfo WithRequestor(int requestId, string? requestor) =>
+        Cert(requestId, $"CN=req{requestId:D4}.example.com", CertificateStatus.Issued)
+            with { Requestor = requestor };
+
+    [Fact]
+    public async Task Sync_PoisonedRequestorFromTheClient_IsSanitizedOnTheWayIn()
+    {
+        // The client interface, not the real client, for the reason the template
+        // test above gives: the guard has to hold at the writer for every
+        // IAdcsClient, not only for the one that strips what it reads.
+        var rlo = (char)0x202e;
+
+        SetCaCertificates(
+            issued: new[] { WithRequestor(70, "HOME\\web" + rlo + "01$") },
+            revoked: Array.Empty<CertificateInfo>());
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        var row = await GetDb().SyncedCertificates.SingleAsync(c => c.RequestId == 70);
+        row.Requestor.Should().Be("HOME\\web01$");
+    }
+
+    [Fact]
+    public async Task Sync_OverWideRequestor_IsBoundedToTheColumn()
+    {
+        // SQLite does not enforce the declared width, and this column is indexed.
+        SetCaCertificates(
+            issued: new[] { WithRequestor(71, "HOME\\" + new string('x', 9000)) },
+            revoked: Array.Empty<CertificateInfo>());
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        var row = await GetDb().SyncedCertificates.SingleAsync(c => c.RequestId == 71);
+        row.Requestor.Should().HaveLength(CertificateTextSanitizer.MaxRequestorLength);
+    }
+
+    [Fact]
+    public async Task Sync_RequestorThatSanitizesAwayEntirely_StoresNull()
+    {
+        // The opposite of the template's rule, and deliberately so: that column is
+        // required and coalesces to the empty string, this one is nullable and
+        // null is what the dashboard already renders as an unknown requester.
+        SetCaCertificates(
+            issued: new[] { WithRequestor(72, "\u202e\u200b\u2028") },
+            revoked: Array.Empty<CertificateInfo>());
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        var row = await GetDb().SyncedCertificates.SingleAsync(c => c.RequestId == 72);
+        row.Requestor.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task Sync_ExistingPoisonedRequestorRow_IsRewrittenOnTheNextPass()
+    {
+        // A row the sync revisits heals here, because IsUnchanged compares the
+        // stored value against the sanitized incoming one and so reads it as
+        // changed exactly once. A row the sync never revisits is the startup
+        // sweep's job; DatabaseInitializerTests covers that half.
+        var rlo = (char)0x202e;
+
+        var seed = GetDb();
+        seed.SyncedCertificates.Add(new SyncedCertificate
+        {
+            RequestId = 73,
+            SerialNumber = "SERIAL0073",
+            Subject = "CN=req0073.example.com",
+            TemplateName = "WebServer",
+            NotBefore = DateTime.UtcNow.AddDays(-30),
+            NotAfter = DateTime.UtcNow.AddDays(335),
+            Status = "Issued",
+            Requestor = "HOME\\web" + rlo + "01$",
+            RequestDate = DateTime.UtcNow.AddDays(-30),
+        });
+        await seed.SaveChangesAsync();
+
+        SetCaCertificates(
+            issued: new[] { WithRequestor(73, "HOME\\web" + rlo + "01$") },
+            revoked: Array.Empty<CertificateInfo>());
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        var row = await GetDb().SyncedCertificates.SingleAsync(c => c.RequestId == 73);
+        row.Requestor.Should().Be("HOME\\web01$");
+    }
+
+    [Fact]
+    public async Task Sync_PoisonedRequestorSteadyState_StillTakesTheCheapPath()
+    {
+        // The reason IsUnchanged sanitizes the incoming requester rather than
+        // comparing it raw. The stored name is clean and the CA keeps handing back
+        // the poisoned one, so a raw comparison calls every row changed on every
+        // cycle, for ever, which is the per row cost issue #184 removed. The data
+        // cannot show it, because both paths leave the same clean value behind.
+        var rlo = (char)0x202e;
+        const int rows = 250;
+        var issued = Enumerable.Range(1, rows)
+            .Select(i => FullyDetailed(i, $"CN=reqpoison{i:D4}.example.com")
+                with { Requestor = "HOME\\web" + rlo + "01$" })
+            .ToArray();
+        SetCaCertificates(issued: issued, revoked: Array.Empty<CertificateInfo>());
+
+        var sut = CreateService();
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        _sql.Reset();
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        _sql.Updates.Should().BeGreaterThan(0, "the rows were still seen");
+        _sql.Updates.Should().BeLessThan(10,
+            "the poisoned requester sanitizes to what is already stored, so nothing moved");
+        (await GetDb().SyncedCertificates.CountAsync(c => c.Requestor == "HOME\\web01$"))
+            .Should().Be(rows);
+    }
+
+    // ---- A pass with no requester column says nothing about it (issue #547) ----
+    //
+    // The real client degrades past a view column the CA build does not resolve,
+    // and then maps every row of the query with a null requester. That null is
+    // not the CA's answer, so it must not overwrite what a healthy pass stored.
+    // A requester column that did resolve and read empty still clears, which is
+    // the rule the template above keeps too.
+
+    /// <summary>A reading of the row whose CA view did not expose the requester.</summary>
+    private static CertificateInfo WithoutRequestorColumn(CertificateInfo cert) =>
+        cert with { Requestor = null, RequestorColumnMissing = true };
+
+    [Fact]
+    public async Task Sync_RequesterColumnMissing_KeepsTheStoredRequesterOnARowThatChanged()
+    {
+        // The row has to take the expensive path for this to test UpdateEntity at
+        // all: with nothing else moved, IsUnchanged would keep the row out of the
+        // update entirely. A revocation landing in the same cycle is the plainest
+        // way a row changes while the column is missing.
+        SetCaCertificates(
+            issued: new[] { WithRequestor(74, "HOME\\web01$") },
+            revoked: Array.Empty<CertificateInfo>());
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        var revoked = WithoutRequestorColumn(WithRequestor(74, "HOME\\web01$")) with
+        {
+            Status = CertificateStatus.Revoked,
+            RevokedWhen = DateTime.UtcNow.AddDays(-1),
+            RevokedReason = 4,
+        };
+        SetCaCertificates(issued: Array.Empty<CertificateInfo>(), revoked: new[] { revoked });
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        var row = await GetDb().SyncedCertificates.SingleAsync(c => c.RequestId == 74);
+        row.Status.Should().Be("Revoked", "the row was written, so the guard was what kept the requester");
+        row.Requestor.Should().Be("HOME\\web01$");
+    }
+
+    [Fact]
+    public async Task Sync_RequesterTheCaReadAsEmpty_StillClearsTheStoredOne()
+    {
+        // The genuine empty case, which the flag must leave alone: the column
+        // resolved and the CA has no requester for the row, so the pass is taken
+        // at its word and the stored value goes.
+        SetCaCertificates(
+            issued: new[] { WithRequestor(75, "HOME\\web01$") },
+            revoked: Array.Empty<CertificateInfo>());
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        SetCaCertificates(
+            issued: new[] { WithRequestor(75, null) },
+            revoked: Array.Empty<CertificateInfo>());
+
+        await CreateService().SyncCertificatesAsync(CancellationToken.None);
+
+        var row = await GetDb().SyncedCertificates.SingleAsync(c => c.RequestId == 75);
+        row.Requestor.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task Sync_RequesterColumnMissingSteadyState_StillTakesTheCheapPath()
+    {
+        // The IsUnchanged half of the guard, which the data cannot show: without
+        // it every row reads as changed for as long as the column stays missing,
+        // is loaded and written one statement at a time, and still ends up with
+        // the same requester, because UpdateEntity refuses the write. Only the
+        // statement count separates the two, as for the poisoned requester above.
+        const int rows = 250;
+        var issued = Enumerable.Range(1, rows)
+            .Select(i => FullyDetailed(i, $"CN=reqmissing{i:D4}.example.com"))
+            .ToArray();
+        SetCaCertificates(issued: issued, revoked: Array.Empty<CertificateInfo>());
+
+        var sut = CreateService();
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        SetCaCertificates(
+            issued: issued.Select(WithoutRequestorColumn).ToArray(),
+            revoked: Array.Empty<CertificateInfo>());
+
+        _sql.Reset();
+        await sut.SyncCertificatesAsync(CancellationToken.None);
+
+        _sql.Updates.Should().BeGreaterThan(0, "the rows were still seen");
+        _sql.Updates.Should().BeLessThan(10,
+            "a pass with no requester column changes nothing, so nothing moved");
+        (await GetDb().SyncedCertificates.CountAsync(c => c.Requestor == "HOME\\admin"))
             .Should().Be(rows);
     }
 

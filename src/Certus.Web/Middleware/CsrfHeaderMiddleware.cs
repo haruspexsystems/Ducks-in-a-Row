@@ -1,3 +1,4 @@
+using Certus.Web.Audit;
 using Certus.Web.Authentication;
 
 namespace Certus.Web.Middleware;
@@ -25,6 +26,10 @@ public sealed class CsrfHeaderMiddleware
         if (RequiresHeader(context.Request) &&
             !context.Request.Headers.ContainsKey(CertusPolicies.CsrfHeaderName))
         {
+            // Named so the sign in failure counter (issue #634) can tell this
+            // 403, an administrator's page missing a header, from the policy's
+            // 403 for a caller outside the administrator group.
+            context.Items[AdminSignInFailureMiddleware.CsrfRefusedItem] = true;
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
             return context.Response.WriteAsJsonAsync(new
             {

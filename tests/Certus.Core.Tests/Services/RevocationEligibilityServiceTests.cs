@@ -76,7 +76,8 @@ public class RevocationEligibilityServiceTests : IDisposable
     /// has something real to resolve against; pass a substitute client to
     /// simulate CA failures.
     /// </summary>
-    private RevocationEligibilityService BuildService(IAdcsClient? adcsClient = null)
+    private RevocationEligibilityService BuildService(
+        IAdcsClient? adcsClient = null, CertusInstanceMode? instanceMode = null)
     {
         var enabledTemplates = new EnabledTemplatesPolicy(
             Options.Create(_options), Options.Create(new AcmeOptions()),
@@ -87,6 +88,7 @@ public class RevocationEligibilityServiceTests : IDisposable
                 NullLogger<TemplateService>.Instance),
             new RevocationScopePolicy(
                 Options.Create(_options), NullLogger<RevocationScopePolicy>.Instance),
+            instanceMode ?? CertusInstanceMode.Full,
             NullLogger<RevocationEligibilityService>.Instance);
     }
 
@@ -105,17 +107,39 @@ public class RevocationEligibilityServiceTests : IDisposable
         KeyUsage = 160,
     };
 
+    /// <summary>
+    /// Issue #470. A monitor mode server never revokes, so it answers before either
+    /// gate, for a row both would pass, and without asking the CA for its template list.
+    /// </summary>
+    [Fact]
+    public async Task MonitorMode_RefusesFirst_WithoutReadingTheCa()
+    {
+        WriteStatus("all", enabled: ["Web Server"]);
+        var ca = Substitute.For<IAdcsClient>();
+
+        var verdict = await BuildService(ca, CertusInstanceMode.Monitor)
+            .EvaluateAsync(TlsRow("WebServer"));
+
+        verdict.Allowed.Should().BeFalse();
+        verdict.BlockedKind.Should().Be(RevocationEligibilityService.MonitorModeKind);
+        verdict.Detail.Should().Contain("monitor mode");
+        await ca.DidNotReceiveWithAnyArgs().GetTemplatesAsync(default);
+    }
+
     [Fact]
     public async Task DucksManaged_AcmeIssuedRow_IsInScope()
     {
-        // The provenance leg: an AcmeCertificates row bridges by request id,
-        // with no template lookup involved.
+        // The provenance leg: an AcmeCertificates row bridges by request id and
+        // serial, with no template lookup involved. The serial is the row's own
+        // in the X509 spelling, uppercase, as the ACME side stores it (issue
+        // #442).
         WriteStatus("ducks-managed", enabled: []);
         _db.AcmeCertificates.Add(new AcmeCertificate
         {
             CertificateId = "elig-test-cert",
             CertificatePem = "PEM",
             AdcsRequestId = 4711,
+            SerialNumber = "0DC0FFEE000000AA",
             Order = new AcmeOrder
             {
                 OrderId = "elig-test-order",
@@ -203,6 +227,26 @@ public class RevocationEligibilityServiceTests : IDisposable
         WriteStatus("custom", revocable: []);
 
         var result = await BuildService().EvaluateAsync(TlsRow("Web Server"));
+
+        result.Allowed.Should().BeFalse();
+        result.BlockedKind.Should().Be("out-of-scope");
+    }
+
+    [Theory]
+    [InlineData("custom")]
+    [InlineData("ducks-managed")]
+    public async Task UnknownTemplate_NeverMatchesABlankEntry(string scope)
+    {
+        // Issue #545. A stored template that sanitized away to nothing is the
+        // empty string, which means the template is unknown. The dashboard drops
+        // blank entries before it saves the list, but the status file is read
+        // back as written, so a hand edit can still carry one. Read as a set
+        // member, that entry would make every certificate of unknown template
+        // revocable from the dashboard, and the startup sweep is what writes
+        // the empty string for rows the sync never revisits.
+        WriteStatus(scope, revocable: [""], enabled: [""]);
+
+        var result = await BuildService().EvaluateAsync(TlsRow(""));
 
         result.Allowed.Should().BeFalse();
         result.BlockedKind.Should().Be("out-of-scope");

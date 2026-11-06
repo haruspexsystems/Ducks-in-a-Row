@@ -21,6 +21,9 @@ public interface IHttpsCertificateStore
 
     /// <summary>
     /// Load a certificate by thumbprint, or null when it is not present.
+    /// Archived certificates count as present: startup serves one when a renewal
+    /// archived it and nothing replaced it (issue #471), and the settings page,
+    /// the automatic renewal and the alert identity must see what is served.
     /// The caller owns the returned instance.
     /// </summary>
     X509Certificate2? Find(string thumbprint);
@@ -41,6 +44,13 @@ public interface IHttpsCertificateStore
     /// certificate an administrator put in the store by hand is never touched.
     /// </summary>
     int RemoveSuperseded(string keepThumbprint);
+
+    /// <summary>
+    /// Every certificate in the store, archived ones left out, for the setup
+    /// wizard to choose from in monitor mode (issue #471). The caller owns and
+    /// disposes every instance.
+    /// </summary>
+    IReadOnlyList<X509Certificate2> ListCertificates();
 }
 
 /// <summary>
@@ -60,6 +70,8 @@ public sealed class NoOpHttpsCertificateStore : IHttpsCertificateStore
     public bool Remove(string thumbprint) => false;
 
     public int RemoveSuperseded(string keepThumbprint) => 0;
+
+    public IReadOnlyList<X509Certificate2> ListCertificates() => [];
 }
 
 /// <summary>
@@ -71,8 +83,12 @@ public sealed class NoOpHttpsCertificateStore : IHttpsCertificateStore
 [SupportedOSPlatform("windows")]
 public sealed class MachineHttpsCertificateStore : IHttpsCertificateStore
 {
-    /// <summary>Shown in certlm.msc so an admin can tell the certificate apart.</summary>
-    public const string FriendlyName = "Ducks in a Row HTTPS";
+    /// <summary>
+    /// Shown in certlm.msc so an admin can tell the certificate apart, and the
+    /// marker that says this service installed it (issue #535). The value lives on
+    /// <see cref="HttpsCertificateOwnership.FriendlyName"/>.
+    /// </summary>
+    public const string FriendlyName = HttpsCertificateOwnership.FriendlyName;
 
     private readonly ILogger<MachineHttpsCertificateStore> _logger;
 
@@ -108,9 +124,16 @@ public sealed class MachineHttpsCertificateStore : IHttpsCertificateStore
     public X509Certificate2? Find(string thumbprint)
     {
         using var store = new X509Store(StoreName.My, StoreLocation.LocalMachine);
-        store.Open(OpenFlags.ReadOnly);
+        store.Open(OpenFlags.ReadOnly | OpenFlags.IncludeArchived);
         var matches = store.Certificates.Find(X509FindType.FindByThumbprint, thumbprint, validOnly: false);
         return matches.Count > 0 ? matches[0] : null;
+    }
+
+    public IReadOnlyList<X509Certificate2> ListCertificates()
+    {
+        using var store = new X509Store(StoreName.My, StoreLocation.LocalMachine);
+        store.Open(OpenFlags.ReadOnly);
+        return store.Certificates.ToList();
     }
 
     public bool Remove(string thumbprint)
@@ -142,7 +165,7 @@ public sealed class MachineHttpsCertificateStore : IHttpsCertificateStore
         // installed by hand carries their own (or none), so it is never a
         // candidate however much it looks like ours.
         var superseded = store.Certificates
-            .Where(c => string.Equals(c.FriendlyName, FriendlyName, StringComparison.Ordinal)
+            .Where(c => HttpsCertificateOwnership.InstalledByService(c)
                         && !string.Equals(c.Thumbprint, keepThumbprint, StringComparison.OrdinalIgnoreCase))
             .ToList();
 

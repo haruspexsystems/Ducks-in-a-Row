@@ -29,18 +29,20 @@ namespace Certus.Core.Data;
 /// not visible through PRAGMA table_info and EF generated names are brittle to
 /// compare. Tables and columns are what the queries need.
 ///
-/// Two data steps follow the schema, in order: the stored subject sweep
-/// (<see cref="SanitizeStoredSubjects"/>, issue #224) and the journal mode
-/// (<see cref="ApplyJournalMode"/>, issue #283). The journal mode step is the
-/// only one here that reports a failure and carries on rather than throwing;
-/// its doc comment says why.
+/// Four data steps follow the schema, in order: the stored subject sweep
+/// (<see cref="SanitizeStoredSubjects"/>, issue #224), the stored requester
+/// sweep (<see cref="SanitizeStoredRequestors"/>, issue #429), the stored
+/// template name sweep (<see cref="SanitizeStoredTemplateNames"/>, issue #545)
+/// and the journal mode (<see cref="ApplyJournalMode"/>, issue #283). The
+/// journal mode step is the only one here that reports a failure and carries on
+/// rather than throwing; its doc comment says why.
 /// </summary>
 public static class DatabaseInitializer
 {
     // EF turns a Contains over a list into one parameter per element, and
     // SQLite's older default ceiling is 999. Same reasoning, and the same value,
-    // as SupersessionLinker.UpdateChunkSize.
-    private const int SubjectUpdateChunkSize = 500;
+    // as SupersessionLinker.UpdateChunkSize. Shared by every stored value sweep.
+    private const int SweepUpdateChunkSize = 500;
 
     // SQLite reports a journal mode in lower case whatever case the pragma was
     // written in, so these double as the values the results are compared
@@ -102,6 +104,8 @@ public static class DatabaseInitializer
         }
 
         SanitizeStoredSubjects(db, logger);
+        SanitizeStoredRequestors(db, logger);
+        SanitizeStoredTemplateNames(db, logger);
 
         // Last on purpose. The schema is the thing that can fail startup and it
         // should fail before the file is reconfigured, and leaving WAL
@@ -296,7 +300,7 @@ public static class DatabaseInitializer
         // Chunked for the same reason SupersessionLinker chunks: EF turns a
         // Contains over a list into one parameter per element, against SQLite's
         // older default ceiling of 999.
-        foreach (var chunk in replacements.Keys.Chunk(SubjectUpdateChunkSize))
+        foreach (var chunk in replacements.Keys.Chunk(SweepUpdateChunkSize))
         {
             var ids = chunk.ToList();
             foreach (var entity in db.SyncedCertificates.Where(c => ids.Contains(c.Id)))
@@ -306,6 +310,103 @@ public static class DatabaseInitializer
         db.SaveChanges();
         logger.LogInformation(
             "Sanitized {Count} stored certificate subject(s) that carried control or format "
+            + "characters, or exceeded the column width", replacements.Count);
+    }
+
+    /// <summary>
+    /// Rewrites any stored requester name that still carries the control or
+    /// format characters the sanitizer strips, or that overflows the column
+    /// (issue #429).
+    ///
+    /// The sync rewrites the requester on every row it reads, so a row it revisits
+    /// heals on the next pass. Two kinds of row it never revisits are why this
+    /// exists, and they are two of the three the subject sweep above names: a
+    /// request row resolved longer ago than RequestHistoryDays, and a row the CA
+    /// no longer returns, since nothing deletes a SyncedCertificate. The third
+    /// kind does not apply here, because the requester write is unconditional.
+    ///
+    /// The same shape as the subject sweep with one difference. Null is kept as
+    /// null rather than coalesced: the column is nullable and null already means
+    /// the CA recorded no requester. A value that sanitizes away entirely becomes
+    /// null for the same reason.
+    /// </summary>
+    private static void SanitizeStoredRequestors(CertusDbContext db, ILogger logger)
+    {
+        // Rows with no requester are filtered in the query, so the common case
+        // reads only the rows that carry one, and only two short columns of those.
+        var replacements = db.SyncedCertificates
+            .AsNoTracking()
+            .Where(c => c.Requestor != null)
+            .Select(c => new { c.Id, c.Requestor })
+            .ToList()
+            .Select(row => (row.Id, Cleaned: CertificateTextSanitizer.SanitizeRequestor(row.Requestor), row.Requestor))
+            .Where(row => !string.Equals(row.Cleaned, row.Requestor, StringComparison.Ordinal))
+            .ToDictionary(row => row.Id, row => row.Cleaned);
+
+        if (replacements.Count == 0)
+            return;
+
+        foreach (var chunk in replacements.Keys.Chunk(SweepUpdateChunkSize))
+        {
+            var ids = chunk.ToList();
+            foreach (var entity in db.SyncedCertificates.Where(c => ids.Contains(c.Id)))
+                entity.Requestor = replacements[entity.Id];
+        }
+
+        db.SaveChanges();
+        logger.LogInformation(
+            "Sanitized {Count} stored certificate requester name(s) that carried control or format "
+            + "characters, or exceeded the column width", replacements.Count);
+    }
+
+    /// <summary>
+    /// Rewrites any stored template name that still carries the control or
+    /// format characters the sanitizer strips, or that overflows the column
+    /// (issue #545).
+    ///
+    /// The same two kinds of row as the requester sweep above, for the same
+    /// reason: the sync writes the template on every row it reads, so only a
+    /// request row resolved longer ago than RequestHistoryDays and a row the CA
+    /// no longer returns keep a value stored before issue #378.
+    ///
+    /// The same shape as the subject sweep, coalesce included: the column is
+    /// required, so a name that sanitizes away entirely becomes the empty
+    /// string, which reads as an unknown template.
+    ///
+    /// This column feeds a security decision, and the rewrite changes no
+    /// decision the sync would not make. RevocationEligibilityService compares
+    /// it against an allow list, so a strip that breaks a match can only refuse
+    /// a revocation, and one that creates a match is the repair issue #378
+    /// already applies to every row the sync reads (CertificateTextSanitizer
+    /// says why). The empty string matches no scope entry, blank or not; that
+    /// is pinned in TemplateInSetAsync rather than assumed. And most rows this
+    /// pass reaches are request rows, which neither the revoke path nor the
+    /// detail page evaluates at all, because both require an issued row with a
+    /// serial before asking.
+    /// </summary>
+    private static void SanitizeStoredTemplateNames(CertusDbContext db, ILogger logger)
+    {
+        var replacements = db.SyncedCertificates
+            .AsNoTracking()
+            .Select(c => new { c.Id, c.TemplateName })
+            .ToList()
+            .Select(row => (row.Id, Cleaned: CertificateTextSanitizer.SanitizeTemplateName(row.TemplateName) ?? "", row.TemplateName))
+            .Where(row => !string.Equals(row.Cleaned, row.TemplateName, StringComparison.Ordinal))
+            .ToDictionary(row => row.Id, row => row.Cleaned);
+
+        if (replacements.Count == 0)
+            return;
+
+        foreach (var chunk in replacements.Keys.Chunk(SweepUpdateChunkSize))
+        {
+            var ids = chunk.ToList();
+            foreach (var entity in db.SyncedCertificates.Where(c => ids.Contains(c.Id)))
+                entity.TemplateName = replacements[entity.Id];
+        }
+
+        db.SaveChanges();
+        logger.LogInformation(
+            "Sanitized {Count} stored certificate template name(s) that carried control or format "
             + "characters, or exceeded the column width", replacements.Count);
     }
 

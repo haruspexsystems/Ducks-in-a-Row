@@ -1,6 +1,8 @@
 using Certus.Core.Acme.Models;
 using Certus.Core.Acme.Services;
+using Certus.Core.Adcs;
 using Certus.Core.Data.Entities;
+using Certus.Web.Audit;
 using Certus.Web.Authentication;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -24,13 +26,16 @@ public sealed class DeviceAttestationController : ControllerBase
 {
     private readonly DeviceAttestationAdminService _adminService;
     private readonly TemplateService _templateService;
+    private readonly ILogger<DeviceAttestationController> _logger;
 
     public DeviceAttestationController(
         DeviceAttestationAdminService adminService,
-        TemplateService templateService)
+        TemplateService templateService,
+        ILogger<DeviceAttestationController> logger)
     {
         _adminService = adminService;
         _templateService = templateService;
+        _logger = logger;
     }
 
     // ---- Profiles ----
@@ -49,6 +54,7 @@ public sealed class DeviceAttestationController : ControllerBase
     /// cannot reach would be dead). One profile per template; a second is 409.
     /// </summary>
     [HttpPost("profiles")]
+    [AdminAudit("acme.device-profile.created", Transactional = true)]
     public async Task<IActionResult> CreateProfile(
         [FromBody] CreateDeviceProfileRequest request, CancellationToken ct)
     {
@@ -63,6 +69,8 @@ public sealed class DeviceAttestationController : ControllerBase
 
         var result = await _adminService.CreateProfileAsync(
             templateName!, gateMode, binding, request.Enabled ?? true, ct);
+        if (result.Profile is { } created)
+            this.AdminAudit().Describe($"template {created.TemplateId}", after: DescribeProfile(created));
 
         return result.Outcome switch
         {
@@ -80,6 +88,7 @@ public sealed class DeviceAttestationController : ControllerBase
     /// here. The change applies to the next device order immediately.
     /// </summary>
     [HttpPut("profiles/{id:int}")]
+    [AdminAudit("acme.device-profile.changed", Transactional = true)]
     public async Task<IActionResult> UpdateProfile(
         int id, [FromBody] UpdateDeviceProfileRequest request, CancellationToken ct)
     {
@@ -90,6 +99,8 @@ public sealed class DeviceAttestationController : ControllerBase
 
         var result = await _adminService.UpdateProfileAsync(
             id, gateMode, binding, request.Enabled ?? true, ct);
+        if (result.Profile is { } updated)
+            this.AdminAudit().Describe($"template {updated.TemplateId}", after: DescribeProfile(updated));
 
         return result.Outcome switch
         {
@@ -105,8 +116,10 @@ public sealed class DeviceAttestationController : ControllerBase
     /// refusal again. Idempotent from the client's view: an unknown id is 404.
     /// </summary>
     [HttpDelete("profiles/{id:int}")]
+    [AdminAudit("acme.device-profile.deleted", Transactional = true)]
     public async Task<IActionResult> DeleteProfile(int id, CancellationToken ct)
     {
+        this.AdminAudit().Describe($"profile {id}", after: "deleted with its allowlist");
         return await _adminService.DeleteProfileAsync(id, ct)
             ? NoContent()
             : NotFound(new { error = "No device attestation profile has this id." });
@@ -131,6 +144,7 @@ public sealed class DeviceAttestationController : ControllerBase
     /// so it is stored exactly as given. A device already listed is 409.
     /// </summary>
     [HttpPost("profiles/{id:int}/allowlist")]
+    [AdminAudit("acme.device-allowlist.added", Transactional = true)]
     public async Task<IActionResult> AddAllowlistEntry(
         int id, [FromBody] AllowlistEntryRequest request, CancellationToken ct)
     {
@@ -138,6 +152,9 @@ public sealed class DeviceAttestationController : ControllerBase
             return BadRequest(new { error = fieldError });
 
         var result = await _adminService.AddAllowlistEntryAsync(id, value!, note, ct);
+        if (result.Entry is { } added)
+            this.AdminAudit().Describe($"profile {added.ProfileId}", after: $"device {added.IdentifierValue} admitted");
+
         return result.Outcome switch
         {
             AllowlistOutcome.ProfileNotFound =>
@@ -154,6 +171,7 @@ public sealed class DeviceAttestationController : ControllerBase
     /// 409.
     /// </summary>
     [HttpPut("allowlist/{entryId:int}")]
+    [AdminAudit("acme.device-allowlist.changed", Transactional = true)]
     public async Task<IActionResult> UpdateAllowlistEntry(
         int entryId, [FromBody] AllowlistEntryRequest request, CancellationToken ct)
     {
@@ -161,6 +179,9 @@ public sealed class DeviceAttestationController : ControllerBase
             return BadRequest(new { error = fieldError });
 
         var result = await _adminService.UpdateAllowlistEntryAsync(entryId, value!, note, ct);
+        if (result.Entry is { } changed)
+            this.AdminAudit().Describe($"profile {changed.ProfileId}", after: $"entry {entryId} now device {changed.IdentifierValue}");
+
         return result.Outcome switch
         {
             AllowlistOutcome.EntryNotFound =>
@@ -173,8 +194,10 @@ public sealed class DeviceAttestationController : ControllerBase
 
     /// <summary>DELETE /allowlist/{entryId}: remove a listed device. Unknown id is 404.</summary>
     [HttpDelete("allowlist/{entryId:int}")]
+    [AdminAudit("acme.device-allowlist.removed", Transactional = true)]
     public async Task<IActionResult> DeleteAllowlistEntry(int entryId, CancellationToken ct)
     {
+        this.AdminAudit().Describe($"allowlist entry {entryId}", after: "removed");
         return await _adminService.DeleteAllowlistEntryAsync(entryId, ct)
             ? NoContent()
             : NotFound(new { error = "No allowlist entry has this id." });
@@ -201,6 +224,7 @@ public sealed class DeviceAttestationController : ControllerBase
     /// the SHA-256 of its DER bytes.
     /// </summary>
     [HttpPost("trust-anchors")]
+    [AdminAudit("acme.device-trust-anchor.added", Transactional = true)]
     public async Task<IActionResult> AddTrustAnchor(
         [FromBody] CreateTrustAnchorRequest request, CancellationToken ct)
     {
@@ -218,6 +242,13 @@ public sealed class DeviceAttestationController : ControllerBase
             return BadRequest(new { error = "Paste the anchor certificate in PEM form." });
 
         var result = await _adminService.AddAnchorAsync(format, name, pem, ct);
+        if (result.Anchor is { } anchor)
+        {
+            this.AdminAudit().Describe(
+                $"trust anchor {anchor.Name}",
+                after: $"added for {anchor.Format}, SHA-256 {anchor.Sha256Fingerprint}");
+        }
+
         return result.Outcome switch
         {
             AnchorOutcome.UnsupportedFormat =>
@@ -241,8 +272,10 @@ public sealed class DeviceAttestationController : ControllerBase
     /// roots carry no id and cannot be targeted; an unknown id is 404.
     /// </summary>
     [HttpDelete("trust-anchors/{id:int}")]
+    [AdminAudit("acme.device-trust-anchor.removed", Transactional = true)]
     public async Task<IActionResult> DeleteTrustAnchor(int id, CancellationToken ct)
     {
+        this.AdminAudit().Describe($"trust anchor {id}", after: "removed");
         return await _adminService.DeleteAnchorAsync(id, ct)
             ? NoContent()
             : NotFound(new { error = "No custom trust anchor has this id." });
@@ -250,9 +283,14 @@ public sealed class DeviceAttestationController : ControllerBase
 
     // ---- Helpers ----
 
+    /// <summary>A profile's settable fields in the words the audit trail records (issue #634).</summary>
+    internal static string DescribeProfile(DeviceAttestationProfileSummary profile) =>
+        $"{(profile.Enabled ? "enabled" : "disabled")}, gate {profile.GateMode}, CSR binding {profile.CsrIdentifierBinding}";
+
     /// <summary>
     /// Resolves the request's template to its canonical name, or returns the
-    /// 400 to send. Unknown templates and templates not enabled for ACME are
+    /// error to send: a 400 for the template, a 503 when the CA could not be
+    /// asked. Unknown templates and templates not enabled for ACME are
     /// both refused: a device profile only makes sense on a template a client
     /// can actually reach.
     /// </summary>
@@ -263,7 +301,30 @@ public sealed class DeviceAttestationController : ControllerBase
         if (string.IsNullOrEmpty(trimmed))
             return (BadRequest(new { error = "A template is required." }), null);
 
-        var resolution = await _templateService.ResolveAsync(trimmed, ct);
+        // The resolution reads the CA's template list, which can fail two ways
+        // that are not the administrator's input (issue #476). Without these arms
+        // both faulted to a bare 500 with no body. Strings in "error", which is
+        // what this tab's client shows; the refusal carries its remedy in full,
+        // as every administrator surface does.
+        TemplateResolution resolution;
+        try
+        {
+            resolution = await _templateService.ResolveAsync(trimmed, ct);
+        }
+        catch (CaUnavailableException ex)
+        {
+            _logger.LogWarning(ex, "Device attestation profile: the CA is unavailable");
+            return (StatusCode(503, new
+            {
+                error = "The certificate authority is unavailable. Try again shortly.",
+            }), null);
+        }
+        catch (CaAccessDeniedException ex)
+        {
+            _logger.LogError(ex, "Device attestation profile: the CA denied access");
+            return (StatusCode(503, new { error = ex.Message }), null);
+        }
+
         return resolution.Access switch
         {
             TemplateAccess.Enabled => (null, resolution.Template!.Name),

@@ -138,7 +138,45 @@
                   Vital="yes"
                   bal:DisplayInternalUICondition="WixBundleInstalled = 0">
         <MsiProperty Name="ARPSYSTEMCOMPONENT" Value="1" />
+        <!-- The MSI's public properties, from the variables declared below. -->
+        <MsiProperty Name="INSTALLFOLDER" Value="[INSTALLFOLDER]" />
+        <MsiProperty Name="DATAFOLDER" Value="[DATAFOLDER]" />
+        <MsiProperty Name="START_SERVICE" Value="[START_SERVICE]" />
+        <MsiProperty Name="MONITOR_ONLY" Value="[MONITOR_ONLY]" />
+        <MsiProperty Name="ALLOW_INCOMPATIBLE_MODULE" Value="[ALLOW_INCOMPATIBLE_MODULE]" />
       </MsiPackage>
     </Chain>
+
+    <!--
+      The MSI's public properties, settable on the setup exe's command line
+      (issue #471), for example:
+        Ducks-in-a-Row-Setup.exe /quiet MONITOR_ONLY=1
+      Before this the bundle declared no variables and passed nothing, although
+      the docs said it accepted the MSI's switches. WixStdBA takes NAME=value
+      from its command line only for an overridable variable, and names are
+      upper cased, so these match however they are typed.
+
+      Every property is passed on every run. One that was not given formats to
+      an empty value, and an empty property on the msiexec command line is the
+      same as one never set, so the MSI's own defaults, its remembered folders
+      and its remembered mode all still apply. The one exception is
+      START_SERVICE, whose MSI default is 1: an empty value would unset it and
+      the service would not start, so its variable carries that default here
+      too. Passing everything unconditionally keeps the result independent of
+      how Burn would judge a bare "0" in a condition.
+
+      ALLOW_INCOMPATIBLE_MODULE (issue #495) is the fifth, with no default:
+      the go ahead for an upgrade that leaves an installed paid module unable
+      to load. The MSI's wizard asks instead when it is shown (a first run of
+      the setup exe, an upgrade included). /quiet and /passive run the MSI
+      without that page, so either one refuses such an upgrade unless this is
+      given:
+        Ducks-in-a-Row-Setup.exe /quiet ALLOW_INCOMPATIBLE_MODULE=1
+    -->
+    <Variable Name="INSTALLFOLDER" bal:Overridable="yes" />
+    <Variable Name="DATAFOLDER" bal:Overridable="yes" />
+    <Variable Name="START_SERVICE" Value="1" bal:Overridable="yes" />
+    <Variable Name="MONITOR_ONLY" bal:Overridable="yes" />
+    <Variable Name="ALLOW_INCOMPATIBLE_MODULE" bal:Overridable="yes" />
   </Bundle>
 </Wix>

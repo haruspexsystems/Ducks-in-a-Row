@@ -11,7 +11,8 @@ namespace Certus.Core.Adcs;
 /// is why sync fails while ACME issuance succeeds.
 ///
 /// Inherits from UnauthorizedAccessException so existing catch sites match, but
-/// carries an actionable message naming the exact fix (grant "Read" on the CA).
+/// carries an actionable message naming the exact fix, which differs per path:
+/// one message constant per path, below.
 /// </summary>
 public sealed class CaAccessDeniedException : UnauthorizedAccessException
 {
@@ -52,24 +53,34 @@ public sealed class CaAccessDeniedException : UnauthorizedAccessException
         "CA request access denied: the Ducks in a Row service account lacks 'Request Certificates' " +
         "permission on the CA. Grant it to the service account via the Certificate Authority console " +
         "(CA Properties -> Security) to enable certificate enrollment (ICertRequest::Submit). " +
-        "If enrollment is refused with this permission already granted, check Enroll on the " +
+        "If enrollment is refused with this permission already granted, the CA may refuse remote " +
+        "requests altogether (the IF_NOREMOTEICERTREQUEST interface flag); also check Enroll on the " +
         "Security tab of the certificate template itself, which is a separate access control list.";
 
     /// <summary>
     /// Operator facing remediation message for collecting an issued certificate
-    /// (ICertRequest::GetIssuedCertificate), issue #336.
+    /// (ICertRequest::GetIssuedCertificate), issues #336 and #477.
     ///
-    /// Deliberately not <see cref="SyncReadPermissionMessage"/>, even though the two
-    /// name the same CA level right. That one is written for ICertView and tells the
-    /// operator dashboard sync is what is broken, which would misdescribe this: here
-    /// the certificate exists and ACME issuance is what cannot finish.
+    /// It named 'Read' until issue #477, which was the wrong right, for the reason
+    /// <see cref="CrlReadPermissionMessage"/> was. Measured on lab 2025 on
+    /// 2026-10-03: the account's own request was collected with Request
+    /// Certificates alone, and refused with CERTSRV_E_ENROLL_DENIED under Read
+    /// with Request Certificates denied. Granting Read would not have fixed it.
+    ///
+    /// Two callers read it, so it is worded for both. The ACME finalize and the
+    /// pending issuance sweep leave the order processing and collect it once the
+    /// right is back. The server's own HTTPS enrolment has no order to come back
+    /// to, so its certificate stays at the CA and the enrolment has to be run
+    /// again.
     /// </summary>
     public const string CollectPermissionMessage =
-        "CA collection access denied: the Ducks in a Row service account lacks 'Read' permission " +
-        "on the CA, so a certificate the CA has already issued cannot be retrieved. Grant 'Read' " +
-        "to the service account via the Certificate Authority console (CA Properties -> Security) " +
-        "to let ACME orders complete (ICertRequest::GetIssuedCertificate). The certificate itself " +
-        "is safe at the CA and the order is collected automatically once this is fixed.";
+        "CA collection access denied: the CA refused the Ducks in a Row service account when it asked " +
+        "for a certificate the CA has already issued (ICertRequest::GetIssuedCertificate). Grant the " +
+        "service account 'Request Certificates' on the CA via the Certificate Authority console " +
+        "(CA Properties -> Security); Authenticated Users hold it on a default CA. The certificate itself " +
+        "is safe at the CA: an ACME order waiting for it is collected automatically once this is fixed, " +
+        "and an HTTPS certificate enrolment has to be run again. If the right is already granted, the CA " +
+        "may refuse remote requests altogether (the IF_NOREMOTEICERTREQUEST interface flag).";
 
     /// <summary>
     /// Operator facing remediation message for reading the CA's own CRLs
@@ -109,6 +120,46 @@ public sealed class CaAccessDeniedException : UnauthorizedAccessException
         "via the Certificate Authority console (CA Properties -> Security). The connection test, the template " +
         "list, the CA certificate downloads and CRL watching all read through this interface. If the right is " +
         "already granted, the CA may refuse remote requests altogether (the IF_NOREMOTEICERTREQUEST interface flag).";
+
+    /// <summary>
+    /// Operator facing remediation message for reading the templates the CA
+    /// publishes (ICertRequest::GetCAProperty, CR_PROP_TEMPLATES), issues #467
+    /// and #476.
+    ///
+    /// Its own constant rather than <see cref="ConnectPermissionMessage"/>, which
+    /// opens by describing the connection test, because this is read long after
+    /// setup: by the ACME template gate on every request, by the dashboard and by
+    /// the wizard. Named for what stops, like the others. The right is the one
+    /// lab 2019 (#440) and lab 2025 (#469) measured for property 29 on the request
+    /// interface. Issue #531 may move this read to the admin interface, which
+    /// answers it to Read instead, and this message moves with it.
+    /// </summary>
+    public const string TemplateReadPermissionMessage =
+        "CA template list access denied: the CA refused the Ducks in a Row service account when it asked " +
+        "for the certificate templates the CA publishes (ICertRequest::GetCAProperty). Grant the service " +
+        "account 'Request Certificates' on the CA via the Certificate Authority console " +
+        "(CA Properties -> Security); Authenticated Users hold it on a default CA. Until then the template " +
+        "lists cannot load, and a server that issues turns ACME clients away. If the right is already " +
+        "granted, the CA may refuse remote requests altogether (the IF_NOREMOTEICERTREQUEST interface flag).";
+
+    /// <summary>
+    /// Operator facing remediation message for reading the CA's own signing
+    /// certificate chain (ICertRequest::GetCAProperty, CR_PROP_CASIGCERTCOUNT and
+    /// CR_PROP_CASIGCERTCHAIN), issues #467 and #476.
+    ///
+    /// The same right as <see cref="TemplateReadPermissionMessage"/>, measured for
+    /// properties 11 and 13 on lab 2025 (#469), and the same note about issue
+    /// #531 applies. Kept apart because what stops is different: the chain feeds
+    /// the CA certificate downloads, the ACME issuer certificate link and the
+    /// CRL watch's view of which CA it is watching.
+    /// </summary>
+    public const string ChainReadPermissionMessage =
+        "CA certificate chain access denied: the CA refused the Ducks in a Row service account when it asked " +
+        "for the CA's own certificate chain (ICertRequest::GetCAProperty). Grant the service account " +
+        "'Request Certificates' on the CA via the Certificate Authority console (CA Properties -> Security); " +
+        "Authenticated Users hold it on a default CA. Until then the CA certificate downloads and the ACME " +
+        "issuer certificate link fail. If the right is already granted, the CA may refuse remote requests " +
+        "altogether (the IF_NOREMOTEICERTREQUEST interface flag).";
 
     public CaAccessDeniedException(string message, Exception inner)
         : base(message, inner) { }

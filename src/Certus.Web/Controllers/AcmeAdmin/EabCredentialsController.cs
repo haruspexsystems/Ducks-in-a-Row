@@ -2,6 +2,7 @@ using Certus.Core.Acme.Services;
 using Certus.Core.ActiveDirectory;
 using Certus.Core.Data;
 using Certus.Core.Data.Entities;
+using Certus.Web.Audit;
 using Certus.Web.Authentication;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -55,6 +56,7 @@ public sealed class EabCredentialsController : ControllerBase
     /// template. An empty list adds no restriction.
     /// </summary>
     [HttpPost]
+    [AdminAudit("acme.eab-credential.created", Transactional = true)]
     public async Task<IActionResult> Create(
         [FromBody] CreateEabCredentialRequest request, CancellationToken ct)
     {
@@ -66,6 +68,11 @@ public sealed class EabCredentialsController : ControllerBase
 
         var (credential, secret) = await _credentialService.CreateAsync(
             name, expiresAt, namespaces, ct);
+
+        // The row names the credential, never the secret (issue #634).
+        this.AdminAudit().Describe(
+            $"credential {credential.KeyId}",
+            after: DescribeCredential(name, expiresAt, namespaces));
 
         // 201 with no Location header: there is no GET for a single
         // credential (the list is the read surface), so advertising a URL
@@ -81,6 +88,7 @@ public sealed class EabCredentialsController : ControllerBase
     /// credential can no longer be changed.
     /// </summary>
     [HttpPut("{id:int}")]
+    [AdminAudit("acme.eab-credential.changed", Transactional = true)]
     public async Task<IActionResult> Update(
         int id, [FromBody] UpdateEabCredentialRequest request, CancellationToken ct)
     {
@@ -102,6 +110,13 @@ public sealed class EabCredentialsController : ControllerBase
             return error;
 
         var result = await _credentialService.UpdateAsync(id, name, expiresAt, namespaces, ct);
+        if (result.Outcome == EabUpdateOutcome.Updated)
+        {
+            this.AdminAudit().Describe(
+                $"credential {result.Credential!.KeyId}",
+                after: DescribeCredential(name, expiresAt, namespaces));
+        }
+
         return result.Outcome switch
         {
             EabUpdateOutcome.NotFound =>
@@ -130,9 +145,13 @@ public sealed class EabCredentialsController : ControllerBase
     /// secret on an expired credential could never verify.
     /// </summary>
     [HttpPost("{id:int}/regenerate")]
+    [AdminAudit("acme.eab-credential.secret-regenerated", Transactional = true)]
     public async Task<IActionResult> Regenerate(int id, CancellationToken ct)
     {
         var result = await _credentialService.RegenerateSecretAsync(id, ct);
+        if (result.Outcome == EabRegenerateOutcome.Regenerated)
+            this.AdminAudit().Describe($"credential {result.Credential!.KeyId}", after: "secret regenerated");
+
         return result.Outcome switch
         {
             EabRegenerateOutcome.NotFound =>
@@ -151,12 +170,14 @@ public sealed class EabCredentialsController : ControllerBase
     /// accounts are suspended from the next request on. Idempotent.
     /// </summary>
     [HttpPost("{id:int}/revoke")]
+    [AdminAudit("acme.eab-credential.revoked", Transactional = true)]
     public async Task<IActionResult> Revoke(int id, CancellationToken ct)
     {
         var credential = await _credentialService.RevokeAsync(id, ct);
         if (credential == null)
             return NotFound(new { error = "No credential has this id." });
 
+        this.AdminAudit().Describe($"credential {credential.KeyId}", after: "revoked");
         return Ok(new
         {
             id = credential.Id,
@@ -218,6 +239,7 @@ public sealed class EabCredentialsController : ControllerBase
     /// a SID the directory cannot resolve is refused.
     /// </summary>
     [HttpPut("{id:int}/principal")]
+    [AdminAudit("acme.eab-credential.principal-set", Transactional = true)]
     public async Task<IActionResult> SetPrincipal(
         int id, [FromBody] SetEabPrincipalRequest request, CancellationToken ct)
     {
@@ -243,11 +265,17 @@ public sealed class EabCredentialsController : ControllerBase
     /// Idempotent on a credential that has none.
     /// </summary>
     [HttpDelete("{id:int}/principal")]
+    [AdminAudit("acme.eab-credential.principal-cleared", Transactional = true)]
     public async Task<IActionResult> ClearPrincipal(int id, CancellationToken ct)
     {
         var result = await _credentialService.ClearPrincipalAsync(id, ct);
         return PrincipalChangeResult(result, null);
     }
+
+    /// <summary>The credential's settable fields in the words the audit trail records (issue #634).</summary>
+    internal static string DescribeCredential(string name, DateTime? expiresAt, IReadOnlyList<string> namespaces) =>
+        $"name {name}, expires {(expiresAt is { } at ? at.ToString("u") : "never")}, " +
+        $"domains {(namespaces.Count == 0 ? "(unrestricted)" : string.Join(", ", namespaces))}";
 
     /// <summary>
     /// The shared response mapping of the two owner endpoints, so the not
@@ -256,6 +284,15 @@ public sealed class EabCredentialsController : ControllerBase
     /// </summary>
     private IActionResult PrincipalChangeResult(EabUpdateResult result, AdPrincipal? principal)
     {
+        if (result.Outcome == EabUpdateOutcome.Updated)
+        {
+            this.AdminAudit().Describe(
+                $"credential {result.Credential!.KeyId}",
+                after: principal == null
+                    ? "owner link cleared"
+                    : $"owner {principal.Name} ({principal.Type}, {principal.Sid})");
+        }
+
         return result.Outcome switch
         {
             EabUpdateOutcome.NotFound =>

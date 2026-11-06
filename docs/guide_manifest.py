@@ -1,20 +1,16 @@
 """Which markdown files the installation guide is built from, and in what order.
 
 Separate from generate_guide.py, and free of any ReportLab import, so the
-staleness check can read the manifest without needing the rendering toolchain
-installed. That is what lets continuous integration answer "is the committed PDF
-current" without building it.
+chapter list and the version reader can be read without the rendering
+toolchain installed.
 """
 
-import hashlib
-import io
 import os
 import xml.etree.ElementTree as ET
 
 DOCS_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGES_DIR = os.path.join(DOCS_DIR, "images")
 BUILD_PROPS_PATH = os.path.join(DOCS_DIR, "..", "Directory.Build.props")
-DIGEST_PATH = os.path.join(DOCS_DIR, "guide-inputs.sha256")
 
 
 class Chapter:
@@ -37,8 +33,16 @@ CHAPTERS = [
     # this list. Getting started, then setting up, then the things you
     # administer once it runs, then what to do when it misbehaves.
     Chapter("quickstart.md", "Quick Start"),
+    Chapter("intended-use.md", "Intended Use"),
     Chapter("system-requirements.md", "System Requirements"),
+    Chapter("ad-and-ca-team-request.md", "What to Ask Your AD and CA Team"),
     Chapter("installation.md", "Installation"),
+    # Right after Installation, because the choice is made in the installer and
+    # a reader needs what it means before the Configuration reference.
+    Chapter("monitor-mode.md", "Monitor Mode"),
+    # Beside Monitor Mode, because the OT pattern it describes is a monitor
+    # mode installation against a second issuing CA.
+    Chapter("several-cas.md", "Several Certificate Authorities"),
     Chapter("configuration.md", "Configuration"),
     Chapter("adcs-setup.md", "ADCS Configuration"),
     Chapter("verifying.md", "Verifying Your Installation"),
@@ -48,16 +52,13 @@ CHAPTERS = [
     Chapter("device-attestation.md", "Device Attestation"),
     Chapter("revocation.md", "Revocation"),
     Chapter("alerts.md", "Expiry Alerts"),
+    Chapter("licence.md", "Licence and Paid Module"),
     Chapter("hardening.md", "Hardening"),
     Chapter("backup-and-restore.md", "Backup and Restore"),
     Chapter("troubleshooting.md", "Troubleshooting"),
     Chapter("uninstall.md", "Uninstalling"),
     Chapter("glossary.md", "Glossary"),
 ]
-
-# The renderer and the parser are inputs too: a change to either can change the
-# rendered guide without any markdown moving.
-SOURCE_FILES = ["generate_guide.py", "guide_markdown.py", "guide_manifest.py"]
 
 
 def read_version(props_path=BUILD_PROPS_PATH):
@@ -94,69 +95,3 @@ def read_version(props_path=BUILD_PROPS_PATH):
 
     suffix = first("VersionSuffix")
     return "%s-%s" % (prefix, suffix) if suffix else prefix
-
-
-def input_digest():
-    """Digest every input the guide is rendered from.
-
-    This is what the staleness gate compares, rather than the bytes of the PDF
-    itself. Byte equality would be a stronger claim than the gate needs and one
-    the toolchain does not support: ReportLab's output varies between its own
-    versions and between Python versions, so a PDF regenerated on a different
-    machine differs even though its content is identical. Digesting the inputs
-    answers the question that actually matters, which is whether the committed
-    PDF was built from the markdown currently in the tree.
-    """
-    digest = hashlib.sha256()
-
-    # The version is stamped on the cover and every footer, so a bump without a
-    # regenerate leaves the guide stale even though no markdown moved.
-    digest.update(read_version().encode("utf-8"))
-
-    for name in SOURCE_FILES:
-        digest.update(name.encode("utf-8"))
-        digest.update(_text_bytes(os.path.join(DOCS_DIR, name)))
-
-    for chapter in CHAPTERS:
-        digest.update(chapter.filename.encode("utf-8"))
-        digest.update(chapter.title.encode("utf-8"))
-        digest.update(_text_bytes(os.path.join(DOCS_DIR, chapter.filename)))
-
-    # Images are inputs as well, and a recaptured screenshot is exactly the kind
-    # of change that would otherwise slip through.
-    for name in sorted(os.listdir(IMAGES_DIR)):
-        if not name.lower().endswith(".png"):
-            continue
-        digest.update(name.encode("utf-8"))
-        digest.update(_raw_bytes(os.path.join(IMAGES_DIR, name)))
-
-    return digest.hexdigest()
-
-
-def _text_bytes(path):
-    """Read a text file with newlines normalised, so a checkout setting cannot
-    alter the digest. Everything hashed here is committed with LF, but git is
-    configured with `* text=auto` and a future attribute change should not
-    start failing the gate on every machine at once."""
-    with io.open(path, "rb") as handle:
-        return handle.read().replace(b"\r\n", b"\n")
-
-
-def write_digest():
-    with io.open(DIGEST_PATH, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(input_digest() + "\n")
-
-
-def _raw_bytes(path):
-    """Read a binary file exactly as it is. An image is an input to the
-    guide, so it belongs in the digest, but it is not text and must not be
-    newline normalised on the way in."""
-    with io.open(path, "rb") as handle:
-        return handle.read()
-
-
-def read_digest():
-    if not os.path.exists(DIGEST_PATH):
-        return None
-    with io.open(DIGEST_PATH, encoding="utf-8") as handle:
-        return handle.read().strip()

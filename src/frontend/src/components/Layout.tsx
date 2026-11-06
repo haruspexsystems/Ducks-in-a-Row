@@ -1,18 +1,25 @@
-import { Link, Outlet, useLocation } from 'react-router-dom';
+import { Link, Outlet, useLocation } from 'react-router';
 import { useQuery } from '@tanstack/react-query';
-import { FlaskConical, KeyRound, LayoutDashboard, List, Settings } from 'lucide-react';
+import { ExternalLink, Eye, FlaskConical, KeyRound, LayoutDashboard, List, ScrollText, Settings } from 'lucide-react';
 import { DuckMark } from '@/features/dashboard/components/DuckMark';
 import { ACCENT } from '@/features/dashboard/lib/colors';
 import { fetchSetupConfig } from '@/api/setup';
 import { HttpsCertificateNoticeBanner } from '@/components/HttpsCertificateNoticeBanner';
+import { LicenceBanner } from '@/components/LicenceBanner';
+import { MonitorModeAlertsBanner } from '@/components/MonitorModeAlertsBanner';
 import { SupportFooter } from '@/components/SupportFooter';
 import { ThemeToggle } from '@/components/ThemeToggle';
+import { useMonitorMode } from '@/hooks/useSystemInfo';
+import { MONITOR_MODE_URL } from '@/lib/support';
 
 const navItems = [
   { path: '/', label: 'Dashboard', icon: LayoutDashboard },
   { path: '/certificates', label: 'Certificates', icon: List },
-  { path: '/acme', label: 'ACME', icon: KeyRound },
+  // Not in monitor mode (issue #470), where there is no ACME to administer.
+  { path: '/acme', label: 'ACME', icon: KeyRound, fullModeOnly: true },
   { path: '/settings', label: 'Settings', icon: Settings },
+  // The administrator audit trail (issue #634), read only.
+  { path: '/audit', label: 'Audit', icon: ScrollText },
 ];
 
 /**
@@ -44,13 +51,48 @@ function MockCaBanner() {
   );
 }
 
+/**
+ * Persistent badge while the server runs in monitor mode (issue #470): it
+ * watches the CA and never issues or revokes, so an operator must never mistake
+ * the missing controls for a fault. A calm tone rather than the mock CA's
+ * amber, because nothing here is wrong. The link leads to the same page the
+ * server's monitor mode refusals name.
+ */
+function MonitorModeBadge() {
+  if (!useMonitorMode()) {
+    return null;
+  }
+
+  return (
+    <div className="bg-sky-100 text-sky-900 dark:bg-sky-500/15 dark:text-sky-200">
+      <div className="max-w-screen-2xl mx-auto px-4 sm:px-6 lg:px-8 py-1.5 flex items-center gap-2 text-xs font-semibold">
+        <Eye className="h-3.5 w-3.5" />
+        Monitor mode: never issues or revokes
+        <a
+          href={MONITOR_MODE_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex items-center gap-1 font-medium underline underline-offset-2 hover:no-underline"
+        >
+          What this means
+          <ExternalLink className="h-3 w-3" />
+        </a>
+      </div>
+    </div>
+  );
+}
+
 export function Layout() {
   const location = useLocation();
+  const monitorMode = useMonitorMode();
 
   return (
     <div className="min-h-screen bg-bg">
       <MockCaBanner />
+      <MonitorModeBadge />
+      <MonitorModeAlertsBanner />
       <HttpsCertificateNoticeBanner />
+      <LicenceBanner />
       {/* Top navigation bar — deep-slate brand chrome, identical in both themes.
           Driven by tokens rather than inline styles: an inline style attribute
           cannot respond to the `.dark` class at all. */}
@@ -75,7 +117,7 @@ export function Layout() {
 
             {/* Navigation */}
             <nav className="flex items-center gap-1">
-              {navItems.map(({ path, label, icon: Icon }) => {
+              {navItems.filter((item) => !(monitorMode && item.fullModeOnly)).map(({ path, label, icon: Icon }) => {
                 const isActive = path === '/'
                   ? location.pathname === '/'
                   : location.pathname.startsWith(path);

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using Certus.Core.Crl;
 using Certus.Core.Security;
@@ -15,7 +16,7 @@ namespace Certus.Core.Alerts;
 public sealed class EmailAlertNotifier : IAlertNotifier
 {
     private readonly AlertOptions _options;
-    private readonly ISecretProtector _protector;
+    private readonly ISmtpSecretProtector _protector;
     private readonly ILogger<EmailAlertNotifier> _logger;
 
     public string Channel => "email";
@@ -42,7 +43,7 @@ public sealed class EmailAlertNotifier : IAlertNotifier
 
     public EmailAlertNotifier(
         IOptions<AlertOptions> options,
-        ISecretProtector protector,
+        ISmtpSecretProtector protector,
         ILogger<EmailAlertNotifier> logger)
     {
         _options = options.Value;
@@ -120,6 +121,26 @@ public sealed class EmailAlertNotifier : IAlertNotifier
             $"the {alert.Stage} CRL warning for {alert.IssuerName}", recipients.Count, cancellationToken);
     }
 
+    public async Task<AlertNotificationResult> SendLicenceAlertAsync(
+        LicenceAlert alert,
+        CancellationToken cancellationToken = default)
+    {
+        var smtp = _options.Smtp;
+        if (smtp == null || !IsEnabled)
+            return new AlertNotificationResult(false, "SMTP not configured");
+
+        var recipients = ParseRecipients(smtp.Recipients, out _);
+        if (recipients.Count == 0)
+        {
+            _logger.LogError("No valid recipient addresses are configured for email alerts");
+            return new AlertNotificationResult(false, "No valid recipient addresses");
+        }
+
+        return await SendAsync(
+            () => BuildLicenceMessage(alert, smtp, recipients), smtp,
+            $"the licence {alert.Stage} alert", recipients.Count, cancellationToken);
+    }
+
     public async Task<AlertNotificationResult> SendTestAlertAsync(
         TestAlert alert,
         CancellationToken cancellationToken = default)
@@ -160,7 +181,7 @@ public sealed class EmailAlertNotifier : IAlertNotifier
 
     /// <summary>
     /// Build the message, connect, authenticate if credentials are configured,
-    /// send, disconnect. Shared by all three alert kinds so the transport
+    /// send, disconnect. Shared by every alert kind so the transport
     /// security decision, the credential handling, and the failure reporting stay
     /// identical whatever is being delivered. This mirrors
     /// WebhookAlertNotifier.PostAsync.
@@ -223,8 +244,17 @@ public sealed class EmailAlertNotifier : IAlertNotifier
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to send the alert email for {Description}", description);
-            return new AlertNotificationResult(false, ScrubResolvedPassword(ex.Message, password));
+            // Redacted at the source (issue #635), so the history row and the
+            // test send response never hold the relay host, the account name
+            // or the password: the password only this class can know is
+            // scrubbed first, then the values in the options in use, which
+            // for a candidate send are the candidate's own.
+            var error = AlertErrorRedactor.Redact(
+                ScrubResolvedPassword(ex.Message, password), _options, smtp);
+            _logger.LogError(
+                "Failed to send the alert email for {Description}: {ExceptionType}: {Error}",
+                description, ex.GetType().Name, error);
+            return new AlertNotificationResult(false, error);
         }
     }
 
@@ -311,9 +341,11 @@ public sealed class EmailAlertNotifier : IAlertNotifier
     /// The renewal failure mail. Urgency tracks how long the certificate the
     /// server is still serving has left, not the failure itself: a denial 30
     /// days out is a task, the same denial with a day left is an outage about
-    /// to happen.
+    /// to happen. It carries the full detail, which for a denial names the
+    /// computer account to grant Enroll to, because this goes to the operator's
+    /// own recipients; the webhook carries the account free form (issue #485).
     /// </summary>
-    private static MimeMessage BuildServerCertificateMessage(
+    internal static MimeMessage BuildServerCertificateMessage(
         ServerCertificateAlert alert, SmtpOptions smtp, List<MailboxAddress> recipients)
     {
         var message = new MimeMessage();
@@ -444,6 +476,135 @@ public sealed class EmailAlertNotifier : IAlertNotifier
         message.Body = new TextPart("plain") { Text = body.ToString() };
         return message;
     }
+
+    /// <summary>
+    /// The licence mail (issue #494, licence design section 13.6).
+    ///
+    /// Every word here is the core's own. The alert carries a validated licence
+    /// id, a validated tier and the module's dates and day count, and nothing
+    /// else, so there is no field a module could use to put text in front of an
+    /// administrator, and the licensee's name is never in it.
+    ///
+    /// It is never CRITICAL (Sean's decision of 2026-10-14): a lapse switches
+    /// paid features off and leaves every certificate alone, so CRITICAL stays
+    /// for the alerts that mean something is about to break. The sentences match
+    /// what the Settings card and the banner say for the same state
+    /// (src/frontend/src/lib/licence.ts), and the last line is the one every
+    /// negative licence state ends with.
+    /// </summary>
+    internal static MimeMessage BuildLicenceMessage(
+        LicenceAlert alert, SmtpOptions smtp, List<MailboxAddress> recipients)
+    {
+        var message = new MimeMessage();
+        message.From.Add(new MailboxAddress(smtp.FromName, smtp.FromAddress));
+        message.To.AddRange(recipients);
+        message.Headers.Add("X-Certus-Alert-Kind", "licence");
+
+        var urgency = alert.Kind == LicenceAlertKind.Expiring
+            && alert.Stage is LicenceAlertStages.Days30 or LicenceAlertStages.Days14
+                ? "NOTICE"
+                : "WARNING";
+
+        var ends = LicenceDate(alert.ValidUntil);
+        var graceEnds = LicenceDate(alert.GraceUntil);
+        var days = LicenceDaysPhrase(alert.DaysRemaining);
+
+        message.Subject = alert.Kind switch
+        {
+            LicenceAlertKind.Expiring =>
+                $"[Ducks in a Row {urgency}] Your licence expires {days ?? StageDaysPhrase(alert.Stage)}",
+            LicenceAlertKind.Grace =>
+                $"[Ducks in a Row {urgency}] Your licence has expired; paid features switch off on {graceEnds}",
+            _ =>
+                $"[Ducks in a Row {urgency}] Your licence has lapsed; paid features are off",
+        };
+
+        var body = new StringBuilder();
+        body.AppendLine("Ducks in a Row Licence Alert");
+        body.AppendLine(new string('=', 50));
+        body.AppendLine();
+        body.AppendLine(alert.Kind switch
+        {
+            LicenceAlertKind.Expiring =>
+                $"Your licence expires on {ends}{(days is null ? "" : $", {days}")}.",
+            LicenceAlertKind.Grace =>
+                $"Your licence expired on {ends}. Paid features switch off on {graceEnds}{(days is null ? "" : $", {days}")}.",
+            _ =>
+                $"Your licence lapsed on {graceEnds}. Paid features are off.",
+        });
+        body.AppendLine();
+        body.AppendLine($"Licence:      {alert.LicenceId}");
+        body.AppendLine($"Tier:         {TierName(alert.Tier)}");
+        body.AppendLine($"Ends:         {ends}");
+        if (alert.GraceUntil is not null)
+            body.AppendLine($"Grace until:  {graceEnds}");
+        body.AppendLine();
+
+        body.AppendLine("What to do:");
+        body.AppendLine(new string('-', 50));
+        switch (alert.Kind)
+        {
+            case LicenceAlertKind.Expiring:
+                body.AppendLine("Install the renewed licence file when it arrives, from the Licence card");
+                body.AppendLine("on the Settings page of the Ducks in a Row Dashboard.");
+                break;
+            case LicenceAlertKind.Grace:
+                body.AppendLine($"Install a renewed licence file before {graceEnds}, from the Licence card");
+                body.AppendLine("on the Settings page of the Ducks in a Row Dashboard, and paid features");
+                body.AppendLine("stay on.");
+                break;
+            default:
+                body.AppendLine("Install a renewed licence file from the Licence card on the Settings page");
+                body.AppendLine("of the Ducks in a Row Dashboard. A lapse deletes nothing and reconfigures");
+                body.AppendLine("nothing, so a renewed licence switches everything back on as it was.");
+                break;
+        }
+        body.AppendLine("Quote the licence id above when you ask Haruspex Systems about a renewal.");
+
+        body.AppendLine();
+        body.AppendLine(new string('-', 50));
+        body.AppendLine("This alert was sent by Ducks in a Row.");
+        body.AppendLine("Certificate issuance and renewal are not affected.");
+
+        message.Body = new TextPart("plain") { Text = body.ToString() };
+        return message;
+    }
+
+    /// <summary>
+    /// A licence date as the card shows it: year first, in UTC, always in the
+    /// Gregorian calendar whatever the server's culture is.
+    /// </summary>
+    private static string LicenceDate(DateTimeOffset? value) =>
+        value?.UtcDateTime.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) ?? "an unknown date";
+
+    /// <summary>
+    /// The module's day count as words, mirroring daysPhrase in the dashboard.
+    /// The module rounds down to whole days, so 0 means less than a day is left,
+    /// which is what the 1 day stage normally carries.
+    /// </summary>
+    private static string? LicenceDaysPhrase(int? days) => days switch
+    {
+        null => null,
+        <= 0 => "in less than a day",
+        1 => "in 1 day",
+        _ => $"in {days.Value.ToString(CultureInfo.InvariantCulture)} days",
+    };
+
+    /// <summary>What a stage promises, for a warning that somehow arrived without a day count.</summary>
+    private static string StageDaysPhrase(string stage) => stage switch
+    {
+        LicenceAlertStages.Days30 => "within 30 days",
+        LicenceAlertStages.Days14 => "within 14 days",
+        LicenceAlertStages.Days7 => "within 7 days",
+        LicenceAlertStages.Days1 => "within 1 day",
+        _ => "soon",
+    };
+
+    /// <summary>A tier as the licence names it ("standard"), as a reader expects it ("Standard").</summary>
+    private static string TierName(string? tier) =>
+        string.IsNullOrEmpty(tier)
+            ? "unknown"
+            : char.ToUpperInvariant(tier[0]) + tier[1..];
 
     /// <summary>Hours, or days once there are enough of them to be worth rounding.</summary>
     private static string DescribeRemaining(double hours) =>

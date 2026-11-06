@@ -19,7 +19,9 @@ namespace Certus.Core.Setup;
 /// <list type="bullet">
 ///   <item>removing the superseded certificate from the store. The background
 ///   caller must not: the running process is still serving that certificate,
-///   and removing it deletes its key container.</item>
+///   and removing it deletes its key container. The settings page does, through
+///   <see cref="TryRemoveSuperseded"/>, and only for a certificate this service
+///   installed (issue #535).</item>
 ///   <item>scheduling the restart that applies the new certificate. Only the
 ///   settings page does that, because an administrator asked for it.</item>
 /// </list>
@@ -31,6 +33,12 @@ namespace Certus.Core.Setup;
 /// would risk rewriting it from an empty record. The two CA exceptions travel
 /// together and any caller added later must handle both, or a permissions failure
 /// faults where an outage would have been answered (issue #336).
+///
+/// The one overlay failure that does not propagate is an overlay that would refuse
+/// to record the renewed certificate (<see cref="SettingsOverlayConflictException"/>).
+/// That is asked before enrolling and answered as a
+/// <see cref="HttpsCertificateRenewalOutcome.Failed"/> outcome (issue #553), because
+/// past the enrolment the refusal would strand a certificate the CA has issued.
 /// </summary>
 public sealed class HttpsCertificateRenewalService
 {
@@ -38,6 +46,7 @@ public sealed class HttpsCertificateRenewalService
     private readonly TlsCertificateEnroller _enroller;
     private readonly IHttpsCertificateStore _certificateStore;
     private readonly CertusOptions _certusOptions;
+    private readonly CertusInstanceMode _instanceMode;
     private readonly ILogger<HttpsCertificateRenewalService> _logger;
 
     public HttpsCertificateRenewalService(
@@ -45,12 +54,14 @@ public sealed class HttpsCertificateRenewalService
         TlsCertificateEnroller enroller,
         IHttpsCertificateStore certificateStore,
         IOptions<CertusOptions> certusOptions,
+        CertusInstanceMode instanceMode,
         ILogger<HttpsCertificateRenewalService> logger)
     {
         _setupService = setupService;
         _enroller = enroller;
         _certificateStore = certificateStore;
         _certusOptions = certusOptions.Value;
+        _instanceMode = instanceMode;
         _logger = logger;
     }
 
@@ -62,6 +73,17 @@ public sealed class HttpsCertificateRenewalService
     /// </summary>
     public HttpsCertificateRenewalContext ReadContext()
     {
+        // First, so it answers whatever else is true: a renewal is an enrolment,
+        // and an enrolment is a CA write, which monitor mode never makes (issue
+        // #470). The settings endpoint refuses earlier still, and the auto renewal
+        // worker is not even registered; this is the core refusing on its own.
+        if (_instanceMode.IsMonitor)
+        {
+            return HttpsCertificateRenewalContext.Blocked(
+                HttpsCertificateRenewalBlocker.MonitorMode,
+                "This server runs in monitor mode, so it never enrolls or renews a certificate.");
+        }
+
         var status = _setupService.GetStatus();
         if (!status.SetupCompleted || !_setupService.IsCaEffectivelyConfigured)
         {
@@ -142,7 +164,8 @@ public sealed class HttpsCertificateRenewalService
             return new HttpsCertificateRenewalResult(
                 HttpsCertificateRenewalOutcome.NotApplicable,
                 Blocker: context.Blocker,
-                Message: context.Message);
+                Message: context.Message,
+                WireMessage: context.Message);
         }
 
         return await RenewAsync(context, currentHost, cancellationToken);
@@ -162,10 +185,42 @@ public sealed class HttpsCertificateRenewalService
             return new HttpsCertificateRenewalResult(
                 HttpsCertificateRenewalOutcome.NotApplicable,
                 Blocker: context.Blocker,
-                Message: context.Message);
+                Message: context.Message,
+                WireMessage: context.Message);
         }
 
         var template = context.Template!;
+
+        // Refuse before enrolling, never after (issue #553). The record below can be
+        // refused by the overlay: a key it writes, such as Certus:HttpsCertificateTemplate,
+        // also written by hand in the colon form at the top level would set one key
+        // twice, which issue #550 refuses rather than resolves. Found there, the CA had
+        // already issued and the store installed a certificate nothing names, and the
+        // background renewal did that again on every check. Asked here it costs nothing,
+        // and it comes back as an ordinary failed outcome, so the settings page shows
+        // the reason and the background renewal records it and sends its alert. Any
+        // template name stands for the one recorded below: both are set, and a save
+        // decides its keys by whether a value is set, never by what it says.
+        try
+        {
+            _setupService.EnsureHttpsCertificateCanBeRecorded(template);
+        }
+        catch (SettingsOverlayConflictException ex)
+        {
+            _logger.LogWarning(ex,
+                "The HTTPS certificate was not renewed, because the settings overlay at {Overlay} " +
+                "could not record it; nothing was enrolled",
+                _setupService.SettingsOverlayPath);
+
+            var refused = ex.Message + " Nothing was enrolled, so no certificate was issued or installed.";
+            return new HttpsCertificateRenewalResult(
+                HttpsCertificateRenewalOutcome.Failed,
+                PreviousThumbprint: context.OverlayThumbprint,
+                Template: template,
+                Message: refused,
+                WireMessage: refused);
+        }
+
         var result = await _enroller.EnrollAsync(
             context.CaConnectionString!, template, context.ExternalUrl!, currentHost, cancellationToken);
 
@@ -190,7 +245,8 @@ public sealed class HttpsCertificateRenewalService
                 PreviousThumbprint: context.OverlayThumbprint,
                 Template: enrolledTemplate,
                 RequestId: result.RequestId,
-                Message: result.Message);
+                Message: result.Message,
+                WireMessage: result.WireMessage);
         }
 
         if (!result.ExternalHostCovered)
@@ -205,20 +261,24 @@ public sealed class HttpsCertificateRenewalService
                 "cover the external URL host; the certificate was removed again",
                 enrolledTemplate, string.Join(", ", result.IssuedNames ?? []));
 
+            var mismatch = "The CA issued a certificate that does not cover the external URL host, " +
+                           "so it was not applied. Check the Subject Name tab of the " +
+                           $"{enrolledTemplate} template (\"Supply in the request\").";
             return new HttpsCertificateRenewalResult(
                 HttpsCertificateRenewalOutcome.SanMismatch,
                 PreviousThumbprint: context.OverlayThumbprint,
                 Template: enrolledTemplate,
                 RequestId: result.RequestId,
                 IssuedNames: result.IssuedNames,
-                Message: "The CA issued a certificate that does not cover the external URL host, " +
-                         "so it was not applied. Check the Subject Name tab of the " +
-                         $"{enrolledTemplate} template (\"Supply in the request\").");
+                Message: mismatch,
+                WireMessage: mismatch);
         }
 
-        // SetHttpsCertificateThumbprint writes through SettingsOverlay.Save,
+        // SetHttpsCertificateThumbprint writes through SettingsOverlay.Mutate,
         // which is a temp file then move, so a crash mid write cannot leave a
-        // torn overlay that stops the next start.
+        // torn overlay that stops the next start. The overlay agreed to this
+        // record before the enrolment, so a refusal here means it was edited by
+        // hand since, and propagates like any other overlay failure.
         _setupService.SetHttpsCertificateThumbprint(result.Thumbprint!, enrolledTemplate);
 
         return new HttpsCertificateRenewalResult(
@@ -229,6 +289,46 @@ public sealed class HttpsCertificateRenewalService
             RequestId: result.RequestId,
             IssuedNames: result.IssuedNames,
             CurrentHostCovered: result.CurrentHostCovered);
+    }
+
+    /// <summary>
+    /// Remove the certificate a renewal from the settings page superseded, but
+    /// only when this service installed it (issue #535). One somebody else
+    /// installed, typically picked in monitor mode and renewed by Windows
+    /// autoenrolment, stays in the store with its private key: the renewal only
+    /// stopped this service serving it, and the certificate is still theirs.
+    /// Before this the settings page removed the superseded certificate
+    /// whoever had installed it, and deleted its key with it.
+    ///
+    /// Never throws, like <see cref="TryRemoveFromStore"/>: the overlay already
+    /// names the new certificate, and a store failure here must not stop the
+    /// restart that applies it.
+    /// </summary>
+    public void TryRemoveSuperseded(string thumbprint)
+    {
+        try
+        {
+            using var certificate = _certificateStore.Find(thumbprint);
+            if (certificate is null)
+                return;
+
+            if (!HttpsCertificateOwnership.InstalledByService(certificate))
+            {
+                _logger.LogInformation(
+                    "Left the superseded HTTPS certificate {Thumbprint} in LocalMachine\\My, because " +
+                    "this service did not install it", thumbprint);
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Could not read the superseded HTTPS certificate {Thumbprint} from the certificate " +
+                "store, so it was left there", thumbprint);
+            return;
+        }
+
+        TryRemoveFromStore(thumbprint, "the superseded certificate");
     }
 
     /// <summary>
@@ -274,6 +374,9 @@ public enum HttpsCertificateRenewalBlocker
 
     /// <summary>No template is recorded and none is enabled.</summary>
     NoTemplate,
+
+    /// <summary>The server runs in monitor mode, which never writes to the CA (issue #470).</summary>
+    MonitorMode,
 }
 
 /// <summary>How a renewal attempt ended.</summary>
@@ -315,7 +418,12 @@ public sealed record HttpsCertificateRenewalContext(
         HttpsCertificateRenewalBlocker blocker, string message) => new(blocker, message);
 }
 
-/// <summary>Outcome of <see cref="HttpsCertificateRenewalService.RenewAsync(string?, CancellationToken)"/>.</summary>
+/// <summary>
+/// Outcome of <see cref="HttpsCertificateRenewalService.RenewAsync(string?, CancellationToken)"/>.
+/// <see cref="WireMessage"/> is <see cref="Message"/> without the computer account a
+/// denial names, which is the only form the alert webhook sends (issue #485); see
+/// <see cref="TlsEnrollmentResult"/>.
+/// </summary>
 public sealed record HttpsCertificateRenewalResult(
     HttpsCertificateRenewalOutcome Outcome,
     string? Thumbprint = null,
@@ -325,4 +433,5 @@ public sealed record HttpsCertificateRenewalResult(
     IReadOnlyList<string>? IssuedNames = null,
     bool? CurrentHostCovered = null,
     string? Message = null,
-    HttpsCertificateRenewalBlocker Blocker = HttpsCertificateRenewalBlocker.None);
+    HttpsCertificateRenewalBlocker Blocker = HttpsCertificateRenewalBlocker.None,
+    string? WireMessage = null);

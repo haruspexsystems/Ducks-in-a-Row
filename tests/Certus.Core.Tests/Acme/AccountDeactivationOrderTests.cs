@@ -86,6 +86,27 @@ public class AccountDeactivationOrderTests : IDisposable
     }
 
     [Fact]
+    public async Task Deactivate_InsideACallersTransaction_JoinsIt_SoARollbackUndoesIt()
+    {
+        // The dashboard's audit filter opens the transaction before the action
+        // runs (issue #634); the deactivation must land in it, so the audit row
+        // and the status change commit or roll back together.
+        var pending = await SeedOrderAsync("pending");
+
+        await using (var tx = await _db.Database.BeginTransactionAsync())
+        {
+            var result = await _sut.DeactivateAsync(_account.Id, AccountDeactivationOrigin.Dashboard);
+            result.Outcome.Should().Be(AccountDeactivationOutcome.Deactivated);
+            _db.Database.CurrentTransaction.Should().BeSameAs(tx, "the service joined rather than replaced it");
+            await tx.RollbackAsync();
+        }
+
+        await using var verify = new CertusDbContext(_dbOptions);
+        (await verify.AcmeAccounts.SingleAsync(a => a.Id == _account.Id)).Status.Should().Be("valid");
+        (await verify.AcmeOrders.SingleAsync(o => o.Id == pending.Id)).Status.Should().Be("pending");
+    }
+
+    [Fact]
     public async Task Deactivate_WritesTheReasonOntoEveryOrderItInvalidates()
     {
         // Issue #320. RFC 8555 section 7.1.3 gives an order an error field for the

@@ -20,12 +20,28 @@ public class StartupValidatorTests
         _logger = Substitute.For<ILogger<StartupValidator>>();
     }
 
+    /// <summary>
+    /// Whether the validator logged a line at <paramref name="level"/> whose
+    /// rendered text satisfies <paramref name="match"/>. Read off the received
+    /// calls, because the logger's generic Log is called with the framework's own
+    /// state type, which a typed matcher cannot name.
+    /// </summary>
+    private bool Logged(LogLevel level, Func<string, bool> match) =>
+        _logger.ReceivedCalls().Any(call =>
+        {
+            var args = call.GetArguments();
+            return call.GetMethodInfo().Name == nameof(ILogger.Log)
+                   && args[0] is LogLevel logged && logged == level
+                   && args[2]?.ToString() is { } text && match(text);
+        });
+
     private StartupValidator CreateValidator(
         CertusOptions options,
         AuthOptions? authOptions = null,
         AcmeRateLimitOptions? rateLimitOptions = null,
         IConfiguration? configuration = null,
-        AcmeOptions? acmeOptions = null)
+        AcmeOptions? acmeOptions = null,
+        CertusInstanceMode? instanceMode = null)
     {
         return new StartupValidator(
             Options.Create(options),
@@ -34,6 +50,7 @@ public class StartupValidatorTests
             Options.Create(acmeOptions ?? new AcmeOptions()),
             new RevocationScopePolicy(
                 Options.Create(options), NullLogger<RevocationScopePolicy>.Instance),
+            instanceMode ?? CertusInstanceMode.Full,
             configuration ?? new ConfigurationManager(),
             _logger);
     }
@@ -122,6 +139,60 @@ public class StartupValidatorTests
     }
 
     [Fact]
+    public void Validate_MonitorMode_ExposeAllTemplates_IsNotAWarning()
+    {
+        // Monitor mode exposes nothing whatever the override says (issue #532),
+        // so the line is named at Information and not counted.
+        var warnings = CreateValidator(
+            FullyConfigured(),
+            acmeOptions: new AcmeOptions { ExposeAllTemplates = true },
+            instanceMode: CertusInstanceMode.Monitor).Validate();
+
+        warnings.Should().Be(0);
+        Logged(LogLevel.Information, text => text.Contains("no effect in monitor mode")).Should().BeTrue();
+    }
+
+    [Fact]
+    public void Validate_MonitorMode_RevocationScopeAll_IsNotAWarning()
+    {
+        var (options, tempDir) = FullyConfiguredInTempDir();
+        try
+        {
+            new SetupStatus { SetupCompleted = true, RevocationScope = "all" }
+                .Save(SetupStatus.GetStatusPath(options));
+
+            var warnings = CreateValidator(options, instanceMode: CertusInstanceMode.Monitor).Validate();
+
+            warnings.Should().Be(0);
+        }
+        finally
+        {
+            Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void Validate_MonitorMode_HttpExternalUrl_NamesTheDashboardNotAcme()
+    {
+        var options = FullyConfigured();
+        options.ExternalUrl = "http://certus.example.com:5000";
+
+        var warnings = CreateValidator(options, instanceMode: CertusInstanceMode.Monitor).Validate();
+
+        warnings.Should().Be(1);
+        Logged(LogLevel.Warning, text => text.Contains("dashboard") && !text.Contains("ACME")).Should().BeTrue();
+    }
+
+    [Fact]
+    public void Validate_MonitorMode_NoExternalUrl_IsNotAWarning()
+    {
+        var options = FullyConfigured();
+        options.ExternalUrl = null;
+
+        CreateValidator(options, instanceMode: CertusInstanceMode.Monitor).Validate().Should().Be(0);
+    }
+
+    [Fact]
     public void Validate_NoCaConnection_ReturnsWarning()
     {
         var options = new CertusOptions
@@ -189,6 +260,32 @@ public class StartupValidatorTests
 
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*UseMockCa*CaConnectionString*mutually exclusive*");
+    }
+
+    [Fact]
+    public void Validate_InstanceModeThatCannotBeHonoured_Throws()
+    {
+        // Issue #470: a mistyped value is refused rather than read as full, which
+        // would silently turn issuance and revocation back on.
+        var mode = CertusInstanceMode.Parse("monitr", CertusInstanceMode.RegistrySource);
+
+        var act = () => CreateValidator(FullyConfigured(), instanceMode: mode).Validate();
+
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*Mode*monitr*'monitor'*'full'*");
+    }
+
+    [Theory]
+    [InlineData("monitor")]
+    [InlineData("full")]
+    [InlineData(null)]
+    public void Validate_InstanceModeThatCanBeHonoured_DoesNotThrow(string? value)
+    {
+        var mode = CertusInstanceMode.Parse(value, CertusInstanceMode.RegistrySource);
+
+        var act = () => CreateValidator(FullyConfigured(), instanceMode: mode).Validate();
+
+        act.Should().NotThrow();
     }
 
     [Fact]
@@ -320,6 +417,28 @@ public class StartupValidatorTests
     public void Validate_RateLimitZeroWindow_ReturnsWarning()
     {
         var rateLimit = new AcmeRateLimitOptions { WindowSeconds = 0 };
+
+        var warnings = CreateValidator(FullyConfigured(), rateLimitOptions: rateLimit).Validate();
+
+        warnings.Should().Be(1);
+    }
+
+    [Theory]
+    [InlineData(0, 100, 1000)]
+    [InlineData(10000, 0, 1000)]
+    [InlineData(10000, 100, 0)]
+    public void Validate_ResourceCapBelowOne_ReturnsWarning_EvenWithTheLimiterDisabled(
+        int nonces, int identifiers, int pendingOrders)
+    {
+        // The caps from issue #632 bound what the server stores, not how often it
+        // is asked, so they are checked whether or not the limiter is on.
+        var rateLimit = new AcmeRateLimitOptions
+        {
+            Enabled = false,
+            MaxStoredNonces = nonces,
+            MaxIdentifiersPerOrder = identifiers,
+            MaxPendingOrdersPerAccount = pendingOrders,
+        };
 
         var warnings = CreateValidator(FullyConfigured(), rateLimitOptions: rateLimit).Validate();
 

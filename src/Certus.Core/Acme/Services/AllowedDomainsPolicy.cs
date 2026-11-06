@@ -24,17 +24,27 @@ namespace Certus.Core.Acme.Services;
 /// Names and entries are compared after normalization to lowercase punycode
 /// A labels, so a Unicode name and its A label form are the same name here.
 ///
-/// A missing status file, the enabled flag off, or an enabled flag with no
-/// usable entries all mean no restriction. The settings API refuses to save
-/// the enabled flag without at least one usable entry, so that last state
-/// only arises from hand edits; it fails open with a loud warning. That is a
-/// deliberate contrast with <see cref="EnabledTemplatesPolicy"/>, which fails
-/// closed since issue #101: the domain restriction is opt in, while template
-/// exposure is the issuance gate itself.
+/// A missing status file or the enabled flag off means no restriction. The
+/// enabled flag with no usable entries fails closed: every identifier is
+/// refused, with the problem type a disallowed name gets, until an entry is
+/// added or the restriction is switched off (issue #630). The settings API
+/// and the wizard refuse to save that state, so it only arises from hand
+/// edits, but an operator who switched the restriction on asked for a closed
+/// posture, and a warning in a log file is not consent to an open one. A
+/// file that cannot be read before the first good load fails closed the same
+/// way, as <see cref="EnabledTemplatesPolicy"/> has since issue #101; a
+/// failed reload after a good load keeps the last good list.
 /// </summary>
 public sealed class AllowedDomainsPolicy
 {
     private static readonly IdnMapping Idn = new();
+
+    /// <summary>
+    /// The closed answer: an empty entry list, which
+    /// <see cref="FindDisallowedAgainst"/> turns into "refuse every
+    /// identifier". Never mutated, so one instance serves every call.
+    /// </summary>
+    private static readonly List<string> RefuseAll = new();
 
     private readonly string _statusPath;
     private readonly ILogger<AllowedDomainsPolicy> _logger;
@@ -216,14 +226,26 @@ public sealed class AllowedDomainsPolicy
             {
                 // The file exists but could not be read right now (a
                 // transient lock from a scanner or backup, or a torn write).
-                // Do not cache a decision against the new write time: keep
-                // the last known policy for this order and retry on the next
-                // one. Caching here would silently turn a momentary read
-                // failure into a lasting fail open.
-                _logger.LogWarning(
-                    "Could not read {Path}; keeping the last known domain restriction for this order",
+                // Do not cache a decision against the new write time: answer
+                // from the last known state for this order and retry on the
+                // next one. Caching here would silently turn a momentary read
+                // failure into a lasting one.
+                if (_loaded)
+                {
+                    _logger.LogWarning(
+                        "Could not read {Path}; keeping the last known domain restriction for this order",
+                        _statusPath);
+                    return _entries;
+                }
+
+                // No good load yet, so whether the operator switched the
+                // restriction on is unknown. Refuse every identifier rather
+                // than guess open (issue #630).
+                _logger.LogError(
+                    "Could not read {Path}; every ACME order is refused until the file " +
+                    "is fixed or the setup wizard is re-run",
                     _statusPath);
-                return _entries;
+                return RefuseAll;
             }
 
             _entries = BuildEntries(status);
@@ -255,13 +277,16 @@ public sealed class AllowedDomainsPolicy
         {
             // Only reachable by hand editing the file: the settings API and
             // the wizard refuse to save the enabled flag without at least one
-            // usable entry. Refusing every order would be the worse failure
-            // mode, so fail open and say it loudly.
-            _logger.LogWarning(
+            // usable entry. The operator asked for a restriction, so refuse
+            // every order until the list is fixed rather than silently
+            // issuing for any name (issue #630). The empty list is the closed
+            // answer: FindDisallowedAgainst refuses everything against it.
+            _logger.LogError(
                 "Domain restriction is enabled in {Path} but no usable entries were found; " +
-                "the restriction is off until the list is fixed",
+                "every ACME order is refused until an allowed domain is added or the " +
+                "restriction is switched off",
                 _statusPath);
-            return null;
+            return entries;
         }
 
         _logger.LogInformation(

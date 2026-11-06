@@ -139,14 +139,17 @@ public class CertificateRevocationService
         var eligibility = await _eligibility.EvaluateAsync(entity, cancellationToken);
         if (!eligibility.Allowed)
         {
-            var outOfScope = eligibility.BlockedKind == "out-of-scope";
-            Audit(actor, id, entity.SerialNumber, reason,
-                outOfScope ? "outOfScope" : "blockedByGuardrail");
-            return new CertificateRevocationResult(
-                outOfScope
-                    ? CertificateRevocationStatus.OutOfScope
-                    : CertificateRevocationStatus.BlockedByGuardrail,
-                RefusalDetail: eligibility.Detail);
+            // The guardrail is the arm a kind nobody mapped lands in, so a kind
+            // added later still refuses rather than revokes.
+            var (status, outcome) = eligibility.BlockedKind switch
+            {
+                RevocationEligibilityService.MonitorModeKind =>
+                    (CertificateRevocationStatus.MonitorMode, "monitorMode"),
+                "out-of-scope" => (CertificateRevocationStatus.OutOfScope, "outOfScope"),
+                _ => (CertificateRevocationStatus.BlockedByGuardrail, "blockedByGuardrail"),
+            };
+            Audit(actor, id, entity.SerialNumber, reason, outcome);
+            return new CertificateRevocationResult(status, RefusalDetail: eligibility.Detail);
         }
 
         try
@@ -244,8 +247,15 @@ public class CertificateRevocationService
             // server error instead of alreadyRevoked. The sync clears this
             // stamp again only if the CA later reports the certificate
             // released from hold (issue #375); nothing else touches it.
+            //
+            // Matched on the serial as well as the request id (issue #442).
+            // Once the install is pointed at another CA, the old CA's ACME row
+            // of the same request number is a different certificate, and
+            // stamping it would tell revoke-cert and renewalInfo that a
+            // certificate nobody revoked is revoked.
             await _db.AcmeCertificates
-                .Where(a => a.AdcsRequestId == entity.RequestId && a.RevokedAt == null)
+                .Where(AcmeInventoryBridge.AcmeRowsFor(entity))
+                .Where(a => a.RevokedAt == null)
                 .ExecuteUpdateAsync(setters => setters
                     .SetProperty(a => a.RevokedAt, revokedAt)
                     .SetProperty(a => a.RevokedReason, reason),
@@ -335,5 +345,11 @@ public enum CertificateRevocationStatus
     OutOfScope,
 
     /// <summary>The CA refused the revocation for an unanticipated reason.</summary>
-    CaError
+    CaError,
+
+    /// <summary>
+    /// The server runs in monitor mode and never revokes (issue #470). No setting
+    /// on the dashboard changes this; the mode is a local administrator's choice.
+    /// </summary>
+    MonitorMode,
 }

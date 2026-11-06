@@ -11,6 +11,27 @@ import type { SetupUnreachableUrlResponse } from './setup';
 export interface SystemInfo {
   version: string;
   commit?: string | null;
+  /**
+   * The instance mode (issue #470). "monitor" means the server watches its CA
+   * and never issues or revokes; a local administrator sets it on the server,
+   * and nothing here can change it.
+   */
+  mode: 'full' | 'monitor';
+  /**
+   * The release's age (issue #623). commitDate is the date of the commit the
+   * build was stamped from, null on a build with no stamp, like commit; the
+   * server works out releaseAgeDays by its own clock and sets
+   * releaseOutdated once that passes releaseAgeWarningDays (0 means the
+   * warning is off). The page shows what it is given and compares nothing.
+   */
+  commitDate?: string | null;
+  releaseAgeDays?: number | null;
+  releaseAgeWarningDays: number;
+  releaseOutdated: boolean;
+  /** The .NET runtime, as it describes itself (".NET 10.0.1"). Patched by Windows Update. */
+  runtimeVersion: string;
+  /** The ASP.NET Core shared framework version, the build metadata split off. */
+  aspNetCoreVersion: string;
 }
 
 /** Fetch the running application version (admin only). */
@@ -271,6 +292,13 @@ export interface HttpsCertificateInfo {
   configured: boolean;
   thumbprint?: string | null;
   inStore?: boolean;
+  /**
+   * Who installed the certificate (issue #535): true when it carries the
+   * service's friendly name "Ducks in a Row HTTPS", false when somebody else put
+   * it in the machine store (typically one picked in monitor mode that Windows
+   * autoenrolment renews), null when it is not in the store.
+   */
+  installedByService?: boolean | null;
   subject?: string | null;
   subjectNames?: string[] | null;
   notBefore?: string | null;
@@ -300,6 +328,13 @@ export interface HttpsCertificateInfo {
  */
 export interface HttpsCertificateAutoRenewal {
   enabled: boolean;
+  /**
+   * Whether the automatic renewal renews this certificate: switched on, and not
+   * one somebody else installed, which it leaves to whoever issued it (issue
+   * #535). A certificate missing from the store counts, because the renewal
+   * replaces it.
+   */
+  renewsThisCertificate: boolean;
   windowDays: number;
   lastAttemptAt?: string | null;
   lastOutcome?:
@@ -351,10 +386,13 @@ export async function renewHttpsCertificate(): Promise<RenewHttpsCertificateResu
     body: '{}',
   });
   if (!response.ok) {
+    // { error, message } from the renewal arms, or a problem detail from a
+    // refusal such as monitor mode (issue #470).
     const body = (await response.json().catch(() => null)) as
-      | { error?: string | boolean; message?: string }
+      | { error?: string | boolean; message?: string; detail?: string }
       | null;
-    const reason = body?.message ?? (typeof body?.error === 'string' ? body.error : null);
+    const reason =
+      body?.message ?? (typeof body?.error === 'string' ? body.error : null) ?? body?.detail ?? null;
     throw new ApiError(response.status, reason ?? response.statusText, endpoint);
   }
   return (await response.json()) as RenewHttpsCertificateResult;

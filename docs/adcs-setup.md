@@ -1,7 +1,9 @@
 # ADCS configuration
 
 What to set up on the certificate authority side. Most of this is done once,
-and the setup wizard handles the parts it can.
+and the setup wizard handles the parts it can. If someone else administers your
+CA or your directory, send them
+[what to ask your AD and CA team](ad-and-ca-team-request.md) first.
 
 ## Finding your CA connection string
 
@@ -50,7 +52,10 @@ Certification Authority console:
 3. Open the **Security** tab.
 4. Add the Ducks in a Row server's machine account, for example
    `DUCKS-SERVER$`. Machine accounts do not appear in the object picker until
-   you add **Computers** to the object types.
+   you add **Computers** to the object types. You can add a group that holds
+   the account instead; see
+   [granting to a group](ad-and-ca-team-request.md#granting-to-a-group) for the
+   restart that needs.
 5. Grant **Enroll**. Do not grant **Autoenroll**: nothing here autoenrols, and
    granting it widens what the account can do for no benefit.
 6. Click OK, and repeat for each template you intend to expose.
@@ -62,18 +67,29 @@ reports Enroll as **Inferred**, which is a reading and not a proof. Only an
 enrolment proves it. In the wizard that is the HTTPS certificate on the External
 URL step, for the template it uses; otherwise it is the first ACME order.
 
-## CA read permission
+## CA permissions
 
-The machine account also needs **Read** on the CA itself: Certification
-Authority console, right click the CA, **Properties**, **Security** tab.
+The CA's own rights are on its Security tab: Certification Authority console,
+right click the CA, **Properties**, **Security** tab.
 
-Read is what lets the dashboard sync the certificate inventory. Without it
+**Request Certificates** is what submitting a request needs, and it is also what
+the CA asks for before it answers the wizard's Test Connection, lists its
+templates, hands over its own certificates, or lets the service read its CRLs or
+collect a certificate it held for approval. Authenticated Users hold it on a
+default CA, so it is usually in place already. If someone removed it, the CA
+refuses with `0x80094011`.
+
+**Read** is what lets the dashboard sync the certificate inventory. Without it
 enrolment still works and clients get certificates, but the dashboard stays
-empty, which reads like a broken install and is not one.
+empty, which reads like a broken install and is not one. Neither right implies
+the other: Request Certificates does not open the inventory, and Read alone does
+not let the service submit.
 
-**Issue and Manage Certificates** is a separate right, needed only for
-revocation from the dashboard. See [revocation](revocation.md) before granting
-it.
+**Issue and Manage Certificates** is a separate right, and optional. Every
+revocation the product makes needs it: from the dashboard, by an ACME client
+through `revoke-cert`, and the automatic revocation of a certificate that breaks
+the capability ceiling. See [what the CA has to allow](revocation.md#what-the-ca-has-to-allow)
+before granting it.
 
 ## Template URL mapping
 
@@ -101,6 +117,11 @@ differ. A template built on an RSA provider needs an RSA key; an `ECDSA_P256`
 template needs a key on that curve. Requesting the wrong type is refused by the
 CA policy module at finalize. See [reading a denial](#reading-a-denial) below for
 what that refusal tells you.
+
+The provider a template names describes the key the client generates, not the
+CA's own signing key. Where the CA keeps that key, in software or in an HSM, is
+invisible to Ducks in a Row; see
+[CA keys in an HSM](system-requirements.md#ca-keys-in-an-hsm).
 
 You do not have to work this out yourself. The wizard's template step reports
 the key algorithm it read from the template, and the **Client setup** snippets

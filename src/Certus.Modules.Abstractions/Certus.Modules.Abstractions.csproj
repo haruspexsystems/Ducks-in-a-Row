@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The module contract (licence design section 5; lethe377/Certus#413). It is the
+       ONLY assembly the core and a paid module share, so it references nothing beyond
+       the base class library: no Microsoft.Extensions, no Serilog, no System.Text.Json
+       and no Certus type. ContractExposesNoContainerOrFrameworkTypes pins that, and
+       ContractSurfaceMatchesBaseline makes every change to it a deliberate diff of
+       PublicApi.txt. -->
+
+  <PropertyGroup>
+    <RootNamespace>Certus.Modules</RootNamespace>
+    <!-- The CONTRACT version, never the product version. The loader compares a
+         module's reference to this assembly by major and minor (design section 6.2),
+         so it may move only when the contract does. Left to VersionPrefix it would
+         read as contract 0.10, then 1.0, then 1.1 with each product release.
+         ContractVersionIsPinned holds it. -->
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="PublicApi.txt" />
+  </ItemGroup>
+
+</Project>

@@ -68,13 +68,15 @@ public class SetupServiceTests : IDisposable
         return CreateSut(options, NullLogger<SetupService>.Instance);
     }
 
-    private SetupService CreateSut(CertusOptions options, ILogger<SetupService> logger)
+    private SetupService CreateSut(
+        CertusOptions options, ILogger<SetupService> logger, CertusInstanceMode? mode = null)
     {
         return new SetupService(
             _clientFactory,
             _caDiscovery,
             _probe,
             Options.Create(options),
+            mode ?? CertusInstanceMode.Full,
             logger);
     }
 
@@ -740,6 +742,112 @@ public class SetupServiceTests : IDisposable
     }
 
     [Fact]
+    public void CompleteSetup_FreshInstallWithoutAChoice_RequiresBinding()
+    {
+        // Issue #631, Sean's decision: a fresh install completes with external
+        // account binding required unless the administrator switched it off.
+        var status = _sut.CompleteSetup(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"));
+
+        status.EabEnforcement.Should().Be("required");
+        _sut.GetStatus().EabEnforcement.Should().Be("required");
+    }
+
+    [Fact]
+    public void CompleteSetup_FreshInstall_HonoursAnExplicitOff()
+    {
+        var status = _sut.CompleteSetup(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com",
+            EabEnforcement: EabEnforcementMode.Off));
+
+        status.EabEnforcement.Should().Be("off");
+    }
+
+    [Fact]
+    public void CompleteSetup_TheWizardsChoice_BeatsTheRecordedMode()
+    {
+        _sut.CompleteSetup(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"));
+
+        var status = _sut.CompleteSetup(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com",
+            EabEnforcement: EabEnforcementMode.Optional));
+
+        status.EabEnforcement.Should().Be("optional");
+    }
+
+    [Fact]
+    public void CompleteSetup_UpgradedInstallWithoutTheField_StaysOff()
+    {
+        // A file completed before the field existed is an upgraded install, which
+        // EabEnforcementPolicy reads as off. Re-running the wizard there (the
+        // stranded install recovery path) must keep it off, not treat it as fresh.
+        new SetupStatus { SetupCompleted = true, CaConnectionString = TestCa, EnabledTemplates = ["WebServer"] }
+            .Save(_sut.GetSetupStatusPath());
+
+        var status = _sut.CompleteSetup(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"));
+
+        status.EabEnforcement.Should().Be("off");
+    }
+
+    [Fact]
+    public void SaveWizardDraft_UpgradedInstallWithoutTheField_RecordsOff_SoCompletionKeepsIt()
+    {
+        // The draft rewrites the file with SetupCompleted false. Were the absent
+        // field carried as absent, the completion after it would see a fresh
+        // install and switch binding on behind the administrator's back.
+        new SetupStatus { SetupCompleted = true, CaConnectionString = TestCa, EnabledTemplates = ["WebServer"] }
+            .Save(_sut.GetSetupStatusPath());
+
+        _sut.SaveWizardDraft(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"), "url");
+        _sut.GetStatus().EabEnforcement.Should().Be("off");
+
+        var status = _sut.CompleteSetup(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"));
+        status.EabEnforcement.Should().Be("off");
+    }
+
+    [Fact]
+    public void SaveWizardDraft_FreshInstall_KeepsTheChoiceOrLeavesItUndecided()
+    {
+        _sut.SaveWizardDraft(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"), "url");
+        _sut.GetStatus().EabEnforcement.Should().BeNull();
+
+        _sut.SaveWizardDraft(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com",
+            EabEnforcement: EabEnforcementMode.Off), "url");
+        _sut.GetStatus().EabEnforcement.Should().Be("off");
+
+        // A later draft without a choice (the TLS step's own draft) keeps it.
+        _sut.SaveWizardDraft(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"), "url");
+        _sut.CompleteSetup(new SetupConfiguration(
+            TestCa, new[] { "WebServer" }, "https://certus.contoso.com"))
+            .EabEnforcement.Should().Be("off");
+    }
+
+    [Theory]
+    [InlineData(false, null, null)]
+    [InlineData(true, null, "off")]
+    [InlineData(false, "optional", "optional")]
+    [InlineData(true, "required", "required")]
+    [InlineData(true, "bogus", "bogus")]
+    public void RecordedEabEnforcement_ReadsAnAbsentFieldByWhetherSetupEverCompleted(
+        bool setupCompleted, string? recorded, string? expected)
+    {
+        // A present value passes through as written, so a hand edited one still
+        // reaches EabEnforcementPolicy and its warning.
+        SetupService.RecordedEabEnforcement(new SetupStatus
+        {
+            SetupCompleted = setupCompleted,
+            EabEnforcement = recorded,
+        }).Should().Be(expected);
+    }
+
+    [Fact]
     public void CompleteSetup_UntrustedPriorStatusFile_WarnsRatherThanResettingSilently()
     {
         // Issue #489: an untrusted ducks-setup.json reads as absent, so the EAB mode
@@ -759,8 +867,9 @@ public class SetupServiceTests : IDisposable
         var status = sut.CompleteSetup(new SetupConfiguration(
             TestCa, new[] { "WebServer" }, "https://certus.contoso.com"));
 
-        // The reset happened (the untrusted "required" could not be carried forward)...
-        status.EabEnforcement.Should().BeNull();
+        // The reset happened (the untrusted file reads as absent, so the mode could not
+        // be carried forward and completion wrote the fresh install default)...
+        status.EabEnforcement.Should().Be("required");
         // ...but it was not silent.
         logger.Warnings.Should().ContainMatch("*not trusted*carried forward*");
     }
@@ -903,6 +1012,86 @@ public class SetupServiceTests : IDisposable
 
         sut.IsSetupEffectivelyComplete().Should().BeTrue();
         sut.CaMode.Should().Be("real");
+    }
+
+    private SetupService CreateConfiguredSut(CertusInstanceMode mode) =>
+        CreateSut(
+            new CertusOptions
+            {
+                DatabasePath = Path.Combine(_tempDir, "certus.db"),
+                SettingsOverlayPath = _overlayPath,
+                CaConnectionString = TestCa,
+            },
+            NullLogger<SetupService>.Instance,
+            mode);
+
+    [Fact]
+    public void EffectiveCompleteness_FullModeCompletedWithoutTemplates_ReopensTheWizard()
+    {
+        // The state a monitor mode server leaves behind when a local
+        // administrator switches it to full (issue #471): setup finished, no
+        // template recorded. The wizard has to reopen at the Templates step.
+        var sut = CreateConfiguredSut(CertusInstanceMode.Full);
+        sut.CompleteSetup(new SetupConfiguration(TestCa, [], "https://certus.contoso.com"));
+
+        sut.IsSetupEffectivelyComplete().Should().BeFalse();
+        sut.AwaitsTemplateChoice(sut.GetStatus()).Should().BeTrue();
+    }
+
+    [Fact]
+    public void EffectiveCompleteness_MonitorModeCompletedWithoutTemplates_IsComplete()
+    {
+        var sut = CreateConfiguredSut(CertusInstanceMode.Monitor);
+        sut.CompleteSetup(new SetupConfiguration(TestCa, [], "https://certus.contoso.com"));
+
+        sut.IsSetupEffectivelyComplete().Should().BeTrue();
+        sut.AwaitsTemplateChoice(sut.GetStatus()).Should().BeFalse();
+    }
+
+    [Fact]
+    public void EffectiveCompleteness_FullModeWithTemplates_IsComplete()
+    {
+        var sut = CreateConfiguredSut(CertusInstanceMode.Full);
+        sut.CompleteSetup(new SetupConfiguration(TestCa, ["WebServer"], "https://certus.contoso.com"));
+
+        sut.AwaitsTemplateChoice(sut.GetStatus()).Should().BeFalse();
+        sut.IsSetupEffectivelyComplete().Should().BeTrue();
+    }
+
+    [Fact]
+    public void AwaitsTemplateChoice_IsFalseForADraft()
+    {
+        // A draft without templates is an ordinary wizard in progress, not a
+        // reopened one: only a completed status can await a template choice.
+        var sut = CreateConfiguredSut(CertusInstanceMode.Full);
+        sut.SaveWizardDraft(new SetupConfiguration(TestCa, [], "https://certus.contoso.com"), "templates");
+
+        sut.AwaitsTemplateChoice(sut.GetStatus()).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task ValidateExternalUrl_InMonitorMode_ProbesWithoutATemplate()
+    {
+        // Every ACME directory answers 404 in monitor mode, so the probe must not
+        // aim at one even when a caller names a template.
+        var sut = CreateConfiguredSut(CertusInstanceMode.Monitor);
+
+        await sut.ValidateExternalUrlAsync("https://certus.contoso.com:5001", "WebServer");
+
+        await _probe.Received(1).ProbeAsync(
+            Arg.Any<Uri>(), null, Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task ResolvePublishedTemplateNames_ReadsThePublishedListOnce()
+    {
+        // Completion resolves the whole recorded set (issue #271); one CA round
+        // trip for the set, not one per template.
+        var resolved = await _sut.ResolvePublishedTemplateNamesAsync(
+            TestCa, ["Web Server", "codesigning", "NotPublished", " "]);
+
+        resolved.Should().Equal("WebServer", "CodeSigning", null, null);
+        await _mockClient.Received(1).GetTemplatesAsync(Arg.Any<CancellationToken>());
     }
 
     [Fact]

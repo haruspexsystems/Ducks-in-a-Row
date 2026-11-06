@@ -7,11 +7,13 @@ using Certus.Core.Acme.Services;
 using Certus.Core.Adcs;
 using Certus.Core.Data;
 using Certus.Core.Data.Entities;
+using Certus.Core.Security;
 using Certus.Core.Services;
 using Certus.Core.Tests.Acme.Attestation;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 
 namespace Certus.Core.Tests.Acme;
 
@@ -62,6 +64,100 @@ public class OrderServiceTests : IDisposable
         };
         _db.AcmeAccounts.Add(_account);
         _db.SaveChanges();
+    }
+
+    /// <summary>
+    /// An OrderService with explicit caps, on the shared context and account.
+    /// </summary>
+    private OrderService WithCaps(int identifiers = 100, int pendingOrders = 1000) => new(
+        _db, _adcsClient, _syncTrigger, _revocationGate,
+        new DeviceAttestationPolicyService(_db),
+        new DomainPolicyAuditService(_db, NullLogger<DomainPolicyAuditService>.Instance),
+        NullLogger<OrderService>.Instance,
+        Options.Create(new AcmeRateLimitOptions
+        {
+            MaxIdentifiersPerOrder = identifiers,
+            MaxPendingOrdersPerAccount = pendingOrders
+        }));
+
+    [Fact]
+    public void OrderCaps_Defaults_AreTheDecidedOnes()
+    {
+        // Issue #632's decision: 100 identifiers per order, 1,000 open orders
+        // per account. The service built with no options carries the same.
+        new AcmeRateLimitOptions().MaxIdentifiersPerOrder.Should().Be(100);
+        new AcmeRateLimitOptions().MaxPendingOrdersPerAccount.Should().Be(1000);
+        _sut.MaxIdentifiersPerOrder.Should().Be(100);
+        _sut.MaxPendingOrdersPerAccount.Should().Be(1000);
+    }
+
+    [Fact]
+    public async Task CheckOrderCaps_AtTheIdentifierCap_Accepts_OneOver_Refuses()
+    {
+        var sut = WithCaps(identifiers: 3);
+
+        (await sut.CheckOrderCapsAsync(_account, 3)).Should().Be(OrderCapOutcome.Accepted);
+        (await sut.CheckOrderCapsAsync(_account, 4)).Should().Be(OrderCapOutcome.TooManyIdentifiers);
+    }
+
+    [Fact]
+    public async Task CheckOrderCaps_CountsOpenOrdersOnly()
+    {
+        // Two open orders (pending, ready), and four that must not count: valid,
+        // invalid, processing (the finalize claim, possibly held at the CA) and
+        // an expired pending one. With the cap at 3 the account still has room;
+        // if any of the four counted it would not.
+        var sut = WithCaps(pendingOrders: 3);
+        var identifiers = new[] { new AcmeIdentifier { Type = "dns", Value = "cap.example.com" } };
+        foreach (var status in new[] { "pending", "ready", "valid", "invalid", "processing" })
+        {
+            var order = await _sut.CreateOrderAsync(_account, "WebServer", identifiers, null, null);
+            order.Status = status;
+        }
+        var expired = await _sut.CreateOrderAsync(_account, "WebServer", identifiers, null, null);
+        expired.ExpiresAt = DateTime.UtcNow.AddMinutes(-1);
+        await _db.SaveChangesAsync();
+
+        (await sut.CheckOrderCapsAsync(_account, 1)).Should().Be(OrderCapOutcome.Accepted);
+
+        // One more open order reaches the cap of 3, and the next request is refused.
+        await _sut.CreateOrderAsync(_account, "WebServer", identifiers, null, null);
+        (await sut.CheckOrderCapsAsync(_account, 1)).Should().Be(OrderCapOutcome.TooManyPendingOrders);
+    }
+
+    [Fact]
+    public async Task CheckOrderCaps_CountsPerAccount()
+    {
+        var other = new AcmeAccount
+        {
+            AccountId = "other-account",
+            JwkJson = """{"kty":"RSA","n":"other","e":"AQAB"}""",
+            JwkThumbprint = "other-thumbprint",
+            Status = "valid",
+            CreatedAt = DateTime.UtcNow
+        };
+        _db.AcmeAccounts.Add(other);
+        await _db.SaveChangesAsync();
+
+        var sut = WithCaps(pendingOrders: 1);
+        var identifiers = new[] { new AcmeIdentifier { Type = "dns", Value = "cap.example.com" } };
+        await _sut.CreateOrderAsync(other, "WebServer", identifiers, null, null);
+
+        (await sut.CheckOrderCapsAsync(other, 1)).Should().Be(OrderCapOutcome.TooManyPendingOrders);
+        (await sut.CheckOrderCapsAsync(_account, 1)).Should().Be(OrderCapOutcome.Accepted,
+            "another account's open orders are not this account's");
+    }
+
+    [Fact]
+    public async Task CheckOrderCaps_IdentifierCapIsCheckedBeforeTheOrderCount()
+    {
+        // Both over: the identifier refusal wins, because it needs no query and
+        // is the one the client can fix by itself.
+        var sut = WithCaps(identifiers: 1, pendingOrders: 1);
+        var identifiers = new[] { new AcmeIdentifier { Type = "dns", Value = "cap.example.com" } };
+        await _sut.CreateOrderAsync(_account, "WebServer", identifiers, null, null);
+
+        (await sut.CheckOrderCapsAsync(_account, 2)).Should().Be(OrderCapOutcome.TooManyIdentifiers);
     }
 
     [Fact]
@@ -865,6 +961,71 @@ public class OrderServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task RecalculateOrderStatus_WithAStaleTrackedOrder_DoesNotDemoteAClaimedOrder()
+    {
+        // Found in the review of issue #481. The validation worker holds one
+        // DbContext for its whole sweep, so the order it tracks can still read
+        // "ready" after a finalize on another request has claimed it. The sequence:
+        // a redundant second challenge on an already valid authorization is still
+        // validating when the client finalizes, and the client then deactivates
+        // that authorization, which DeactivateAuthorizationAsync allows from valid
+        // and which leaves the processing order alone. The worker reloads the
+        // authorization after recording its result, reads "deactivated", and must
+        // not write "invalid" over the claimed order: that is the #312 harm, a live
+        // certificate under an invalid order that MayServe then refuses to serve.
+        var order = await CreateReadyOrderAsync("stale-sweep.example.com");
+        var authz = order.Authorizations.Single();
+        authz.Status = "valid";
+        await _db.SaveChangesAsync();
+        // _db now tracks the order as "ready" and the authorization as "valid".
+
+        await using (var other = new CertusDbContext(_dbOptions))
+        {
+            await other.AcmeOrders.Where(o => o.Id == order.Id)
+                .ExecuteUpdateAsync(s => s.SetProperty(o => o.Status, "processing"));
+            await other.AcmeAuthorizations.Where(a => a.Id == authz.Id)
+                .ExecuteUpdateAsync(s => s.SetProperty(a => a.Status, "deactivated"));
+        }
+
+        // What the worker does after it records a challenge result.
+        await _db.Entry(authz).ReloadAsync();
+
+        await _sut.RecalculateOrderStatusAsync(order.Id);
+
+        await using var verify = new CertusDbContext(_dbOptions);
+        (await verify.AcmeOrders.SingleAsync(o => o.Id == order.Id))
+            .Status.Should().Be("processing");
+        order.Status.Should().Be("processing",
+            "the copy the worker's context tracks is brought up to the row as it stands");
+    }
+
+    [Fact]
+    public async Task RecalculateOrderStatus_WithAStaleTrackedPendingOrder_DoesNotReArmAClaimedOrder()
+    {
+        // The ready arm's half of the same staleness (issue #301). The worker's
+        // tracked copy reads "pending" while the row has moved on to "processing",
+        // and every authorization is valid, so a decision taken on the tracked copy
+        // would hand the claimed order back to "ready" and invite a second finalize.
+        var identifiers = new[] { new AcmeIdentifier { Type = "dns", Value = "stale-ready.example.com" } };
+        var order = await _sut.CreateOrderAsync(_account, "WebServer", identifiers, null, null);
+        order.Authorizations.Single().Status = "valid";
+        await _db.SaveChangesAsync();
+        // _db now tracks the order as "pending".
+
+        await using (var other = new CertusDbContext(_dbOptions))
+        {
+            await other.AcmeOrders.Where(o => o.Id == order.Id)
+                .ExecuteUpdateAsync(s => s.SetProperty(o => o.Status, "processing"));
+        }
+
+        await _sut.RecalculateOrderStatusAsync(order.Id);
+
+        await using var verify = new CertusDbContext(_dbOptions);
+        (await verify.AcmeOrders.SingleAsync(o => o.Id == order.Id))
+            .Status.Should().Be("processing");
+    }
+
+    [Fact]
     public async Task IssueCertificate_ThatLosesTheStatusCas_WritesNoCertificateRow()
     {
         // Pins the defensive arm rather than reproducing a reachable bug. After #312
@@ -1604,6 +1765,190 @@ public class OrderServiceTests : IDisposable
         (await _db.DomainPolicyRejections.AnyAsync()).Should().BeFalse();
     }
 
+    [Fact]
+    public async Task FinalizeOrder_LeafApplicationPolicy_IsRefusedByTheGuard()
+    {
+        // The lab Run 4 shape at the leaf: a serverAuth EKU (the default) that
+        // passes, with a smart card logon Application Policy that Windows
+        // honours over it. The EKU only ceiling missed this; now it does not
+        // (issue #548).
+        _adcsClient.LeafApplicationPolicyOids = new[] { "1.3.6.1.4.1.311.20.2.2" };
+        var order = await CreateReadyOrderAsync("appol-guard.example.com");
+        var csr = BuildCsr("appol-guard.example.com");
+
+        var result = await _sut.FinalizeOrderAsync(order.OrderId, csr);
+
+        result.Success.Should().BeTrue(result.ErrorMessage);
+        var updated = await _sut.GetOrderAsync(order.OrderId);
+        updated!.Status.Should().Be("invalid");
+        updated.CertificateId.Should().BeNull();
+        _adcsClient.RevokedSerials.Should().ContainSingle();
+        (await _db.DomainPolicyRejections.SingleAsync()).Stage.Should().Be("finalize-guard");
+    }
+
+    [Fact]
+    public async Task FinalizeOrder_IssuedDnsNameNotInOrder_IsRefusedByTheGuard()
+    {
+        // A CA that put a DNS name in the leaf the order never authorized. The
+        // CSR is clean, so only the issued name guard catches it (issue #548).
+        _adcsClient.LeafSanOverrideDer = GeneralNames(w => WriteDnsName(w, "evil.example.com"));
+        var order = await CreateReadyOrderAsync("name-guard.example.com");
+        var csr = BuildCsr("name-guard.example.com");
+
+        var result = await _sut.FinalizeOrderAsync(order.OrderId, csr);
+
+        result.Success.Should().BeTrue(result.ErrorMessage);
+        var updated = await _sut.GetOrderAsync(order.OrderId);
+        updated!.Status.Should().Be("invalid");
+        updated.CertificateId.Should().BeNull();
+        (await _db.AcmeCertificates.AnyAsync(c => c.OrderId == order.Id)).Should().BeFalse();
+        _adcsClient.RevokedSerials.Should().ContainSingle();
+        (await _db.DomainPolicyRejections.SingleAsync()).Stage.Should().Be("finalize-guard");
+    }
+
+    [Fact]
+    public async Task FinalizeOrder_IssuedUpnOtherName_IsRefusedByTheGuard()
+    {
+        // The lab Run 1 shape reaching the leaf: a UPN otherName in the issued
+        // SAN, which is neither a DNS name nor a CN and which a dns order never
+        // authorizes.
+        _adcsClient.LeafSanOverrideDer = GeneralNames(w =>
+        {
+            WriteDnsName(w, "upn-guard.example.com");
+            WriteUpnOtherName(w, "victim@example.com");
+        });
+        var order = await CreateReadyOrderAsync("upn-guard.example.com");
+        var csr = BuildCsr("upn-guard.example.com");
+
+        var result = await _sut.FinalizeOrderAsync(order.OrderId, csr);
+
+        result.Success.Should().BeTrue(result.ErrorMessage);
+        (await _sut.GetOrderAsync(order.OrderId))!.Status.Should().Be("invalid");
+        _adcsClient.RevokedSerials.Should().ContainSingle();
+    }
+
+    #endregion
+
+    #region Finalize CSR attribute carriers (issue #548)
+
+    [Fact]
+    public async Task FinalizeOrder_SanUnderCertExtensions_IsRefusedAsBadCsr()
+    {
+        // The lab Run 1 carrier: a SAN under szOID_CERT_EXTENSIONS. Refused
+        // before anything reaches the CA, so the order stays ready.
+        var order = await CreateReadyOrderAsync("carrier.example.com");
+        var csr = CarrierCsrBuilder.SanUnderCertExtensions("carrier.example.com", "smuggled.example.com");
+
+        var result = await _sut.FinalizeOrderAsync(order.OrderId, csr);
+
+        result.Outcome.Should().Be(FinalizeOutcome.BadCsr);
+        (await _sut.GetOrderAsync(order.OrderId))!.Status.Should().Be("ready");
+        _adcsClient.RevokedSerials.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task FinalizeOrder_SanViaNameValuePair_IsRefusedAsBadCsr()
+    {
+        var order = await CreateReadyOrderAsync("nvp.example.com");
+        var csr = CarrierCsrBuilder.SanViaNameValuePair("nvp.example.com", "SAN", "dns=smuggled.example.com");
+
+        var result = await _sut.FinalizeOrderAsync(order.OrderId, csr);
+
+        result.Outcome.Should().Be(FinalizeOutcome.BadCsr);
+    }
+
+    [Fact]
+    public async Task FinalizeOrder_SecondExtensionRequestValue_IsRefusedAsBadCsr()
+    {
+        var order = await CreateReadyOrderAsync("second.example.com");
+        var csr = CarrierCsrBuilder.SecondExtensionRequestValue(
+            "second.example.com", "second.example.com", "smuggled.example.com");
+
+        var result = await _sut.FinalizeOrderAsync(order.OrderId, csr);
+
+        result.Outcome.Should().Be(FinalizeOutcome.BadCsr);
+    }
+
+    [Fact]
+    public async Task FinalizeOrder_RequestedApplicationPolicies_IsRefusedAsBadCsr()
+    {
+        // The lab Run 4 carrier: a requested Application Policies extension
+        // alongside a legitimate SAN. The extension is outside the allow list,
+        // so it is refused with the offending OID named.
+        var order = await CreateReadyOrderAsync("reqpol.example.com");
+        var csr = CarrierCsrBuilder.SanPlusRequestedExtension(
+            "reqpol.example.com", "reqpol.example.com",
+            CarrierCsrBuilder.ApplicationPoliciesExtension("1.3.6.1.4.1.311.20.2.2"));
+
+        var result = await _sut.FinalizeOrderAsync(order.OrderId, csr);
+
+        result.Outcome.Should().Be(FinalizeOutcome.BadCsr);
+        result.ErrorMessage.Should().Contain("1.3.6.1.4.1.311.21.10");
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FinalizeOrder_PoshAcmeCsr_Issues(bool ecKey)
+    {
+        // Issue #687: Posh-ACME requests basic constraints with cA=false and a
+        // subject key identifier of its own key on every order. Both are
+        // admitted by value, so its orders issue again.
+        var order = await CreateReadyOrderAsync("poshacme.example.com");
+        var csr = PoshAcmeCsrBuilder.Build(ecKey, ocspMustStaple: false, "poshacme.example.com");
+
+        var result = await _sut.FinalizeOrderAsync(order.OrderId, csr);
+
+        result.Success.Should().BeTrue(result.ErrorMessage);
+        (await _sut.GetOrderAsync(order.OrderId))!.Status.Should().Be("valid");
+    }
+
+    [Fact]
+    public async Task FinalizeOrder_RequestedCaCertificate_IsRefusedAsBadCsr()
+    {
+        // A requester must never obtain a CA certificate: cA=true is refused
+        // before the CA, with the reason stated.
+        var order = await CreateReadyOrderAsync("wantsca.example.com");
+        var csr = CarrierCsrBuilder.SanPlusRequestedExtension(
+            "wantsca.example.com", "wantsca.example.com",
+            CarrierCsrBuilder.BasicConstraintsExtension(isCa: true));
+
+        var result = await _sut.FinalizeOrderAsync(order.OrderId, csr);
+
+        result.Outcome.Should().Be(FinalizeOutcome.BadCsr);
+        result.ErrorMessage.Should().Contain("cA=true");
+    }
+
+    [Fact]
+    public async Task FinalizeOrder_RepeatedBasicConstraints_IsRefusedAsBadCsr()
+    {
+        // A cA=false beside a cA=true must not pass on the strength of the first.
+        var order = await CreateReadyOrderAsync("twice.example.com");
+        var csr = CarrierCsrBuilder.SanPlusRequestedExtension(
+            "twice.example.com", "twice.example.com",
+            CarrierCsrBuilder.BasicConstraintsExtension(isCa: false),
+            CarrierCsrBuilder.BasicConstraintsExtension(isCa: true));
+
+        var result = await _sut.FinalizeOrderAsync(order.OrderId, csr);
+
+        result.Outcome.Should().Be(FinalizeOutcome.BadCsr);
+    }
+
+    [Fact]
+    public async Task FinalizeOrder_RequestedKeyUsageAndEku_AreTolerated()
+    {
+        // cert-manager encodes key usage and extended key usage into the CSR by
+        // default, so a request carrying them must still finalize.
+        var order = await CreateReadyOrderAsync("certmgr.example.com");
+        var withKu = CarrierCsrBuilder.SanPlusRequestedExtension(
+            "certmgr.example.com", "certmgr.example.com", CarrierCsrBuilder.KeyUsageExtension());
+
+        var result = await _sut.FinalizeOrderAsync(order.OrderId, withKu);
+
+        result.Success.Should().BeTrue(result.ErrorMessage);
+        (await _sut.GetOrderAsync(order.OrderId))!.Status.Should().Be("valid");
+    }
+
     #endregion
 
     [Fact]
@@ -1685,6 +2030,23 @@ public class OrderServiceTests : IDisposable
 
         result.Success.Should().BeFalse();
         result.ErrorMessage.Should().Contain("attested device key");
+    }
+
+    [Fact]
+    public async Task FinalizeDeviceOrder_RequestedCaCertificate_Rejected()
+    {
+        // An attested key is no licence to request a CA certificate (#687): the
+        // device path returns the same stated refusal as the dns path, and a
+        // null there would admit the CSR.
+        var (order, key) = await CreateReadyDeviceOrderAsync(CsrIdentifierBindingModes.CnOrSan);
+        var request = new CertificateRequest($"CN={DeviceSerial}", key, HashAlgorithmName.SHA256);
+        request.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true));
+        var csr = request.CreateSigningRequest();
+
+        var result = await _sut.FinalizeOrderAsync(order.OrderId, csr);
+
+        result.Success.Should().BeFalse();
+        result.ErrorMessage.Should().Contain("cA=true");
     }
 
     [Fact]
@@ -2657,6 +3019,19 @@ public class OrderServiceTests : IDisposable
         request.CertificateExtensions.Add(
             new X509Extension("2.5.29.17", writer.Encode(), critical: false));
         return request.CreateSigningRequest();
+    }
+
+    /// <summary>
+    /// The raw GeneralNames DER a caller writes, for stamping onto a mock issued
+    /// leaf through <c>MockAdcsClient.LeafSanOverrideDer</c> to stand in for a CA
+    /// that put names in the certificate the CSR did not carry.
+    /// </summary>
+    private static byte[] GeneralNames(Action<AsnWriter> writeGeneralNames)
+    {
+        var writer = new AsnWriter(AsnEncodingRules.DER);
+        using (writer.PushSequence())
+            writeGeneralNames(writer);
+        return writer.Encode();
     }
 
     private static void WriteDnsName(AsnWriter writer, string dns) =>

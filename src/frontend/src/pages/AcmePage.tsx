@@ -1,4 +1,4 @@
-import { Link, useSearchParams } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router';
 import { AcmeAccountsPage } from './acme/AcmeAccountsPage';
 import { EabCredentialsCard } from './acme/EabCredentialsCard';
 import { EabEnforcementCard } from './acme/EabEnforcementCard';

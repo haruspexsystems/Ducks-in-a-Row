@@ -164,6 +164,62 @@ public class RevokeCertIntegrationTests : IDisposable
         error!.Type.Should().Be(AcmeErrorType.Malformed);
     }
 
+    /// <summary>
+    /// The template segment of the revoke-cert URL is advisory (the product decision on
+    /// issue #245). The certificate is found by its own bytes and the signer authorized by
+    /// the account key or the certificate key, so the segment is neither resolved nor
+    /// compared with the template the order recorded. Each case is a shape a stricter rule
+    /// would refuse:
+    ///
+    ///  - another template's URL. User is published by the mock CA and not enabled for
+    ///    ACME in this host, and a compare against the order's WebServer would refuse it.
+    ///  - a segment the CA does not publish at all, which template resolution answers 404.
+    ///  - the certificate's own template after an administrator stopped offering it over
+    ///    ACME. WebServerEC is published and not enabled here, so template resolution
+    ///    answers 403. This is the case the rule exists for: a key compromise revocation
+    ///    must never wait on a dashboard setting.
+    ///
+    /// Every case runs for both signer identities RFC 8555 §7.6 allows. The directory read
+    /// first proves the segment really is one template resolution refuses, so a change to
+    /// the host's enabled templates cannot quietly turn a case into one that pins nothing.
+    /// </summary>
+    [Theory]
+    [InlineData("WebServer", "User", false)]
+    [InlineData("WebServer", "User", true)]
+    [InlineData("WebServer", "NoSuchTemplate", false)]
+    [InlineData("WebServer", "NoSuchTemplate", true)]
+    [InlineData("WebServerEC", "WebServerEC", false)]
+    [InlineData("WebServerEC", "WebServerEC", true)]
+    public async Task Revoke_ThroughAnyTemplateSegment_Returns200(
+        string orderTemplate, string urlTemplate, bool signWithCertificateKey)
+    {
+        var directory = await _client.GetAsync($"/acme/{urlTemplate}/directory");
+        directory.StatusCode.Should().BeOneOf(
+            new[] { HttpStatusCode.Forbidden, HttpStatusCode.NotFound },
+            "the case pins something only if template resolution refuses '{0}'", urlTemplate);
+
+        var (account, rsa) = await CreateAccountAsync();
+        using var certKey = RSA.Create(2048);
+        using var cert = CreateSelfSignedCert(certKey, "CN=revoke-any-segment.example.com");
+        var certId = await SeedCertificateAsync(account.AccountId, cert, templateId: orderTemplate);
+
+        var path = $"/acme/{urlTemplate}/revoke-cert";
+        var jws = signWithCertificateKey
+            ? await BuildJwkRevokeJws(certKey, cert, reason: 1, path: path)
+            : await BuildKidRevokeJws(rsa, account.Kid, cert, reason: 1, path: path);
+        var response = await PostJws(path, jws);
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK,
+            "revoke-cert does not check its template segment; the body was: {0}",
+            await response.Content.ReadAsStringAsync());
+
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<CertusDbContext>();
+        var stored = await db.AcmeCertificates.FirstAsync(c => c.CertificateId == certId);
+        stored.RevokedAt.Should().NotBeNull("the revocation reached the CA and was recorded");
+        stored.RevokedReason.Should().Be(1);
+    }
+
     #region Helpers
 
     private record AccountInfo(string Kid, string AccountId);
@@ -193,11 +249,13 @@ public class RevokeCertIntegrationTests : IDisposable
     /// <summary>
     /// Seeds a valid order and certificate owned by the given account, recording the leaf
     /// serial the revoke path matches on. Pass serialOverride to store a serial that differs
-    /// from the certificate's own (used to simulate a serial collision). Returns the public
+    /// from the certificate's own (used to simulate a serial collision). Pass templateId to
+    /// record the order under a template other than WebServer. Returns the public
     /// certificate ID.
     /// </summary>
     private async Task<string> SeedCertificateAsync(
-        string accountId, X509Certificate2 cert, string? serialOverride = null)
+        string accountId, X509Certificate2 cert, string? serialOverride = null,
+        string templateId = "WebServer")
     {
         var certId = "revoke-cert-" + Guid.NewGuid().ToString("N")[..8];
 
@@ -210,7 +268,7 @@ public class RevokeCertIntegrationTests : IDisposable
             OrderId = "revoke-order-" + Guid.NewGuid().ToString("N")[..8],
             AccountId = dbAccount.Id,
             Status = "valid",
-            TemplateId = "WebServer",
+            TemplateId = templateId,
             IdentifiersJson = "[]",
             ExpiresAt = DateTime.UtcNow.AddDays(7),
             CertificateId = certId
@@ -246,20 +304,20 @@ public class RevokeCertIntegrationTests : IDisposable
     }
 
     private async Task<JwsFlattenedRequest> BuildKidRevokeJws(
-        RSA rsa, string kid, X509Certificate2 cert, int? reason)
+        RSA rsa, string kid, X509Certificate2 cert, int? reason, string path = RevokePath)
     {
         var nonce = await GetFreshNonce();
-        var url = ToAbsoluteUrl(RevokePath);
+        var url = ToAbsoluteUrl(path);
         var payloadJson = JsonSerializer.Serialize(BuildRevokePayload(cert, reason));
         var headerJson = $$"""{"alg":"RS256","nonce":"{{nonce}}","url":"{{url}}","kid":"{{kid}}"}""";
         return SignJws(rsa, headerJson, payloadJson);
     }
 
     private async Task<JwsFlattenedRequest> BuildJwkRevokeJws(
-        RSA rsa, X509Certificate2 cert, int? reason)
+        RSA rsa, X509Certificate2 cert, int? reason, string path = RevokePath)
     {
         var nonce = await GetFreshNonce();
-        var url = ToAbsoluteUrl(RevokePath);
+        var url = ToAbsoluteUrl(path);
         var jwkJson = ExportRsaJwk(rsa);
         var payloadJson = JsonSerializer.Serialize(BuildRevokePayload(cert, reason));
         var headerJson = $$"""{"alg":"RS256","nonce":"{{nonce}}","url":"{{url}}","jwk":{{jwkJson}}}""";

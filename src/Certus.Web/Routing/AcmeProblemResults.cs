@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Threading.RateLimiting;
 using Certus.Core.Acme.Models;
 using Certus.Core.Security;
+using Certus.Web.Logging;
 using Certus.Web.Security;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.Extensions.Options;
@@ -124,6 +125,9 @@ public static class AcmeProblemResults
                 $"<{options.HelpUrl}#{policyName}>; rel=\"help\"";
         }
 
+        // The line below records the refusal, so the request logger drops its own
+        // line for it (issue #741).
+        CertusLogging.MarkRateLimitRefusal(http);
         http.RequestServices?.GetService<AcmeRateLimitRejectionLog>()?.Record(
             policyName,
             http.Request.Method,

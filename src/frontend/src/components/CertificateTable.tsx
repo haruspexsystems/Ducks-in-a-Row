@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { Link } from 'react-router-dom';
+import { Link } from 'react-router';
 import { ArrowDown, ArrowUp, ArrowUpDown } from 'lucide-react';
 import type { CertificateSummary } from '@/types';
 import { certificateDisplayName, formatDate, daysUntilExpiry, getExpiryState, isRevoked, revocationReasonLabel, hasCertificate } from '@/types';

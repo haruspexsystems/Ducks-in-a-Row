@@ -47,6 +47,21 @@ public interface IAlertNotifier
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Warn that the paid licence is running out, has ended, or has lapsed
+    /// (issue #494, licence design section 13.6). A lapse never touches a
+    /// certificate; it switches paid features off, and this is the warning an
+    /// administrator gets before that happens.
+    ///
+    /// Its own method, record and webhook events, like the CRL alert above. The
+    /// record is built by the core from typed and validated fields, so no text
+    /// the paid module supplies ever reaches a channel, and the licensee's name
+    /// never does either.
+    /// </summary>
+    Task<AlertNotificationResult> SendLicenceAlertAsync(
+        LicenceAlert alert,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Deliver a test message on demand, so an operator can prove the channel
     /// works before trusting it with a real warning (issue #161). SMTP fails
     /// quietly and often, and an alerting system nobody has ever seen work is
@@ -101,12 +116,22 @@ public sealed record CertificateExpiryInfo(
 /// exact template setting to change, so it is passed through verbatim.
 /// <see cref="DaysRemaining"/> is how long the certificate the server is still
 /// serving remains valid, or null when it is no longer in the store.
+/// <para>
+/// <see cref="Detail"/> belongs in the email body, which goes to the operator's
+/// own recipients: for a denial it names the service's computer account and
+/// its domain, because that is the account to grant Enroll to.
+/// <see cref="WireDetail"/> is the same reason without them, and the only one
+/// the webhook payload <b>ever</b> carries (issue #485), for the reason
+/// <see cref="TestAlert"/> gives. Null sends no detail at all, so a failure arm
+/// that forgets to say what may go on the wire stays off it.
+/// </para>
 /// </summary>
 public sealed record ServerCertificateAlert(
     string Outcome,
     string? Detail = null,
     string? Template = null,
-    int? DaysRemaining = null);
+    int? DaysRemaining = null,
+    string? WireDetail = null);
 
 /// <summary>
 /// A certificate revocation list that is running out, or has run out.
@@ -154,6 +179,55 @@ public sealed record CrlAlert(
     string? CrlNumber = null,
     string? NewerCrlNumber = null,
     DateTime? LastReadAt = null);
+
+/// <summary>
+/// Which licence alert this is, picked by the licence's status rather than by
+/// the module's notice (issue #494). A trial has no grace period, so the notice
+/// at its end says "expired" while paid features are already off, and the
+/// status is what tells those two apart.
+/// </summary>
+public enum LicenceAlertKind
+{
+    /// <summary>The licence is inside its warning period and paid features are on.</summary>
+    Expiring,
+
+    /// <summary>The licence has ended and paid features stay on until its grace period ends.</summary>
+    Grace,
+
+    /// <summary>Paid features are off.</summary>
+    Lapsed,
+}
+
+/// <summary>
+/// A paid licence that is running out, has ended, or has lapsed (issue #494).
+/// <para>
+/// Every field is built by the core. <see cref="LicenceId"/> has been checked to
+/// be a canonical lower case GUID and <see cref="Tier"/> to be a short lower case
+/// token, or it is null. The dates and the day count are the module's, passed on
+/// as given: the core never compares dates or counts days. Nothing in here is
+/// free text from the module, so a module cannot flood or inject into an
+/// administrator's channels, and the licensee's name, which is personal data
+/// for a sole trader, is never part of it.
+/// </para>
+/// </summary>
+/// <param name="Kind">Which alert this is.</param>
+/// <param name="Stage">A <see cref="LicenceAlertStages"/> value: which warning this is.</param>
+/// <param name="LicenceId">The licence id, which is also the support reference.</param>
+/// <param name="Tier">The licence tier, or null when it is not a tier name.</param>
+/// <param name="ValidUntil">When the licence ends.</param>
+/// <param name="GraceUntil">When its grace period ends, which is when paid features switch off.</param>
+/// <param name="DaysRemaining">
+/// Whole days to the next boundary, counted by the module: to the end of the
+/// licence before it, to the end of grace during grace, null once lapsed.
+/// </param>
+public sealed record LicenceAlert(
+    LicenceAlertKind Kind,
+    string Stage,
+    string LicenceId,
+    string? Tier,
+    DateTimeOffset? ValidUntil,
+    DateTimeOffset? GraceUntil,
+    int? DaysRemaining);
 
 /// <summary>
 /// Result of sending an alert notification.

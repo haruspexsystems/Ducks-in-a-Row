@@ -933,4 +933,124 @@ public class CertificateTextSanitizerTests
             twice.Should().Be(once, "sanitizing {0} twice must not differ from once", input);
         }
     }
+
+    // ---- SanitizeRequestor (issue #429) -----------------------------------
+
+    [Theory]
+    [InlineData(null, null)]
+    [InlineData("", null)]
+    [InlineData("   ", null)]
+    [InlineData("  CORP\\web01$  ", "CORP\\web01$")]
+    public void SanitizeRequestor_NormalizesDegenerateValues(string? input, string? expected)
+    {
+        CertificateTextSanitizer.SanitizeRequestor(input).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("CORP\\web01$")]
+    [InlineData("CORP\\certus-svc")]
+    [InlineData("CORP\\gmsa-acme$")]
+    [InlineData("svc.acme@corp.example.com")]
+    [InlineData("NT AUTHORITY\\SYSTEM")]
+    public void SanitizeRequestor_LeavesOrdinaryAccountNamesAlone(string input)
+    {
+        // The backslash, the dollar of a computer or managed service account, the
+        // at sign and the space all have to survive, because they are how every
+        // legitimate requester is spelled.
+        CertificateTextSanitizer.SanitizeRequestor(input).Should().Be(input);
+    }
+
+    [Fact]
+    public void SanitizeRequestor_StripsEveryClassItsSiblingsDo()
+    {
+        // The same scanner, so this is really asserting that the requester was
+        // wired to it at all: before issue #429 the CA's value reached the
+        // database with no scan of any kind. Line breaks go too, because nothing
+        // legitimate puts one in an account name.
+        var rlo = (char)0x202e;
+        var zwsp = (char)0x200b;
+        var raw = Esc + "[31mCORP\\web" + rlo + "0" + zwsp + "1$" + Tab + Del + LineSep + Cr + Lf;
+
+        CertificateTextSanitizer.SanitizeRequestor(raw).Should().Be("[31mCORP\\web01$");
+    }
+
+    [Theory]
+    [InlineData(0xE0001)] // language tag
+    [InlineData(0xE0020)] // tag space, the start of the invisible ASCII block
+    [InlineData(0xE007F)] // cancel tag
+    public void SanitizeRequestor_StripsTheTagBlock(int codePoint)
+    {
+        // Above the BMP, so it arrives as a surrogate pair and a per char lookup
+        // would miss it (issue #228). Both halves have to go.
+        var cleaned = CertificateTextSanitizer.SanitizeRequestor(
+            "CORP\\web" + char.ConvertFromUtf32(codePoint) + "01$");
+
+        cleaned.Should().Be("CORP\\web01$");
+    }
+
+    [Fact]
+    public void SanitizeRequestor_BoundsToTheColumnWidth()
+    {
+        var raw = "CORP\\" + new string('x', CertificateTextSanitizer.MaxRequestorLength + 500);
+
+        var cleaned = CertificateTextSanitizer.SanitizeRequestor(raw);
+
+        cleaned.Should().NotBeNull();
+        cleaned!.Should().HaveLength(CertificateTextSanitizer.MaxRequestorLength);
+        cleaned.Should().StartWith("CORP\\");
+        cleaned.Should().EndWith(Ellipsis.ToString());
+    }
+
+    [Fact]
+    public void SanitizeRequestor_DoesNotLeadTheCutWithACommonName()
+    {
+        // A requester is an account name, not a distinguished name, so there is
+        // no part to rescue. Pinned for the same reason the template's is: the
+        // flag sits beside SanitizeSubject's and is easy to copy across.
+        var raw = new string('a', CertificateTextSanitizer.MaxRequestorLength) + ", CN=rescue.me";
+
+        var cleaned = CertificateTextSanitizer.SanitizeRequestor(raw);
+
+        cleaned.Should().NotBeNull();
+        cleaned!.Should().StartWith("aaa");
+        cleaned.Should().NotContain("CN=");
+    }
+
+    [Fact]
+    public void SanitizeRequestor_ReturnsNull_WhenNothingUsableSurvives()
+    {
+        // Null, and the writers store it as null. The column is nullable and null
+        // already means the CA recorded no requester, so unlike the template there
+        // is no required column to coalesce for.
+        var rlo = (char)0x202e;
+        var zwsp = (char)0x200b;
+
+        CertificateTextSanitizer.SanitizeRequestor($"{rlo}{zwsp}{LineSep}").Should().BeNull();
+    }
+
+    [Fact]
+    public void SanitizeRequestor_IsIdempotent()
+    {
+        // Load bearing: the value is sanitized in the client that read it, again
+        // at both entity writers and in the startup sweep, and IsUnchanged
+        // compares a stored value against a freshly sanitized one. A second pass
+        // that changed the value would make the sync treat every row as moved on
+        // every cycle.
+        var rlo = (char)0x202e;
+        string[] inputs =
+        [
+            "CORP\\web01$",
+            "CORP\\web" + rlo + "01$",
+            "svc.acme@corp.example.com",
+            "CORP\\" + new string('x', CertificateTextSanitizer.MaxRequestorLength + 100),
+        ];
+
+        foreach (var input in inputs)
+        {
+            var once = CertificateTextSanitizer.SanitizeRequestor(input);
+            var twice = CertificateTextSanitizer.SanitizeRequestor(once);
+
+            twice.Should().Be(once, "sanitizing {0} twice must not differ from once", input);
+        }
+    }
 }

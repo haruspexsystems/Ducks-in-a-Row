@@ -466,6 +466,260 @@ public class SettingsOverlayTests : IDisposable
         loaded.CaConnectionString.Should().Be("ca\\CA");
     }
 
+    // ── Keys the service does not manage (issue #550) ──
+
+    [Fact]
+    public void Save_RewritesAHandEditedFileItDidNotChange_ByteForByte()
+    {
+        // Every key a save does not manage goes back as its raw text: the escaped
+        // backslash, the non ASCII letter, the ampersand the default encoder would
+        // turn into &, the number written as 60.0 and the one line array. And
+        // the managed keys come out exactly as the service always wrote them, so a
+        // save that changes nothing changes no byte.
+        var overlayPath = Path.Combine(_dataDir, "settings.json");
+        var handEdited = """
+            {
+              "Certus": {
+                "CaConnectionString": "ca01.corp.example.com\\Corp Issuing CA",
+                "ExternalUrl": "https://web01.corp.example.com:5001",
+                "RateLimiting": {
+                  "NewOrderLimit": 5,
+                  "WindowSeconds": 60.0
+                },
+                "Alerts": {
+                  "Enabled": true,
+                  "ThresholdDays": [
+                    60,
+                    30
+                  ],
+                  "Webhook": {
+                    "Url": "https://hooks.corp.example.com/ducks?token=abc&channel=pki"
+                  }
+                }
+              },
+              "Certus:Acme:ChallengeValidation": {
+                "BlockPrivateRanges": true,
+                "AdditionalBlockedCidrs": [ "100.64.0.0/10" ]
+              },
+              "Auth": {
+                "AdminGroup": "CORP\\Domänen-Admins"
+              }
+            }
+            """.ReplaceLineEndings();
+        File.WriteAllText(overlayPath, handEdited);
+
+        SettingsOverlay.Mutate(overlayPath, current => current);
+
+        File.ReadAllText(overlayPath).Should().Be(handEdited);
+    }
+
+    [Fact]
+    public void Save_KeepsEveryKeyItDoesNotManage_InsideAndOutsideTheSection()
+    {
+        var overlayPath = Path.Combine(_dataDir, "settings.json");
+        SettingsOverlay.Save(new SettingsOverlay.OverlaySettings("ca\\CA", "https://old.example.com"), overlayPath);
+        HandEditedOverlay.AddTo(overlayPath);
+
+        SettingsOverlay.Mutate(overlayPath, current => current with
+        {
+            ExternalUrl = "https://certus.example.com",
+            Alerts = new SettingsOverlay.AlertOverlaySettings(CheckIntervalMinutes: 90),
+        });
+
+        HandEditedOverlay.ShouldStillBeInForce(overlayPath);
+        var loaded = SettingsOverlay.Load(overlayPath);
+        loaded.ExternalUrl.Should().Be("https://certus.example.com");
+        loaded.Alerts!.CheckIntervalMinutes.Should().Be(90);
+        loaded.CaConnectionString.Should().Be("ca\\CA");
+    }
+
+    [Fact]
+    public void Save_FileWithNoSection_KeepsItsKeysAndAddsTheSection()
+    {
+        // The file docs/quickstart.md has an administrator create before setup ever
+        // runs: nothing in it but the admin group.
+        var overlayPath = Path.Combine(_dataDir, "settings.json");
+        File.WriteAllText(overlayPath, """{ "Auth": { "AdminGroup": "CORP\\Ducks Admins" } }""");
+
+        SettingsOverlay.Mutate(overlayPath, current => current with { ExternalUrl = "https://certus.example.com" });
+
+        using var configuration = new ConfigurationManager();
+        ((IConfigurationBuilder)configuration).AddSettingsOverlay(_dataDir);
+        configuration["Auth:AdminGroup"].Should().Be("CORP\\Ducks Admins");
+        configuration["Certus:ExternalUrl"].Should().Be("https://certus.example.com");
+    }
+
+    [Fact]
+    public void Save_ManagedKeyInAnotherCase_IsReplacedRatherThanWrittenTwice()
+    {
+        // Load reads a member ignoring case, so the save must match it the same way.
+        // Writing ExternalUrl beside the hand typed externalUrl would set one
+        // configuration key twice, and the JSON provider refuses that file outright.
+        var overlayPath = Path.Combine(_dataDir, "settings.json");
+        File.WriteAllText(overlayPath,
+            """{ "certus": { "externalUrl": "https://old.example.com", "SyncIntervalMinutes": 15 } }""");
+
+        SettingsOverlay.Mutate(overlayPath, current => current with { ExternalUrl = "https://certus.example.com" });
+
+        using var configuration = new ConfigurationManager();
+        ((IConfigurationBuilder)configuration).AddSettingsOverlay(_dataDir);
+        configuration["Certus:ExternalUrl"].Should().Be("https://certus.example.com");
+        configuration["Certus:SyncIntervalMinutes"].Should().Be("15");
+        File.ReadAllText(overlayPath).Should().NotContain("old.example.com");
+    }
+
+    [Fact]
+    public void Save_BlockTheRecordLeavesUnset_KeepsTheAdministratorsKeysInsideIt()
+    {
+        // A null alert block means the dashboard manages none of it. The members it
+        // would manage go, by the omit null rule, but the webhook beside them is the
+        // administrator's and stays.
+        var overlayPath = Path.Combine(_dataDir, "settings.json");
+        File.WriteAllText(overlayPath, """
+            { "Certus": { "Alerts": { "Enabled": false, "Webhook": { "Url": "https://hooks.example.com/x" } } } }
+            """);
+
+        SettingsOverlay.Save(new SettingsOverlay.OverlaySettings("ca\\CA", null), overlayPath);
+
+        using var configuration = new ConfigurationManager();
+        ((IConfigurationBuilder)configuration).AddSettingsOverlay(_dataDir);
+        configuration["Certus:Alerts:Webhook:Url"].Should().Be("https://hooks.example.com/x");
+        configuration["Certus:Alerts:Enabled"].Should().BeNull();
+        configuration["Certus:CaConnectionString"].Should().Be("ca\\CA");
+    }
+
+    [Fact]
+    public void Save_ThatWouldSetAKeyTwice_ThrowsWithoutWriting()
+    {
+        // The colon form at the top level, the way docs/hardening.md writes nested
+        // keys, names the same configuration key as ExternalUrl inside the section.
+        // Writing both would stop the next start, so the writer is told instead.
+        var overlayPath = Path.Combine(_dataDir, "settings.json");
+        const string handEdited = """{ "Certus:ExternalUrl": "https://hand.example.com" }""";
+        File.WriteAllText(overlayPath, handEdited);
+
+        var act = () => SettingsOverlay.Mutate(overlayPath, c => c with { ExternalUrl = "https://certus.example.com" });
+
+        // Its own type (issue #553), so a caller can tell the refusal from a file that
+        // is not JSON, and still a JsonException, so every existing arm catches it.
+        act.Should().Throw<SettingsOverlayConflictException>().WithMessage("*Certus:ExternalUrl*");
+        File.ReadAllText(overlayPath).Should().Be(handEdited);
+    }
+
+    // ── EnsureCanMutate: the save without the write (issue #553) ──
+
+    [Fact]
+    public void EnsureCanMutate_ChangeThatWouldSetAKeyTwice_ThrowsAndWritesNothing()
+    {
+        // The case the HTTPS certificate record meets: the thumbprint in the section,
+        // and the template written by hand in the colon form at the top level. The
+        // record sets the template too, so the save would set that key twice.
+        var overlayPath = Path.Combine(_dataDir, "settings.json");
+        const string handEdited = """
+            {
+              "Certus": { "HttpsCertificateThumbprint": "AA11BB22" },
+              "Certus:HttpsCertificateTemplate": "WebServer"
+            }
+            """;
+        File.WriteAllText(overlayPath, handEdited);
+        var writtenAt = File.GetLastWriteTimeUtc(overlayPath);
+
+        var act = () => SettingsOverlay.EnsureCanMutate(overlayPath, c => c with
+        {
+            HttpsCertificateThumbprint = "CC33DD44",
+            HttpsCertificateTemplate = "WebServer",
+        });
+
+        act.Should().Throw<SettingsOverlayConflictException>()
+            .WithMessage("*Certus:HttpsCertificateTemplate*")
+            .WithMessage($"*{overlayPath}*");
+        File.ReadAllText(overlayPath).Should().Be(handEdited);
+        File.GetLastWriteTimeUtc(overlayPath).Should().Be(writtenAt);
+    }
+
+    [Fact]
+    public void EnsureCanMutate_ChangeThatLoads_WritesNothing()
+    {
+        // The dry run must not be a save: a change it allows still leaves every byte
+        // where it was, hand keys included.
+        var overlayPath = Path.Combine(_dataDir, "settings.json");
+        SettingsOverlay.Save(new SettingsOverlay.OverlaySettings("ca\\CA", "https://certus.example.com"), overlayPath);
+        HandEditedOverlay.AddTo(overlayPath);
+        var before = File.ReadAllBytes(overlayPath);
+
+        SettingsOverlay.EnsureCanMutate(overlayPath, c => c with
+        {
+            HttpsCertificateThumbprint = "CC33DD44",
+            HttpsCertificateTemplate = "WebServer",
+        });
+
+        File.ReadAllBytes(overlayPath).Should().Equal(before);
+        SettingsOverlay.Load(overlayPath).HttpsCertificateThumbprint.Should().BeNull();
+    }
+
+    [Fact]
+    public void EnsureCanMutate_ColonKeyTheChangeLeavesUnset_IsAllowed()
+    {
+        // As precise as the save: a colon form key only collides with a change that
+        // sets the same member, so a hand written URL never blocks a certificate.
+        var overlayPath = Path.Combine(_dataDir, "settings.json");
+        File.WriteAllText(overlayPath, """{ "Certus:ExternalUrl": "https://hand.example.com" }""");
+
+        var act = () => SettingsOverlay.EnsureCanMutate(overlayPath, c => c with
+        {
+            HttpsCertificateThumbprint = "CC33DD44",
+            HttpsCertificateTemplate = "WebServer",
+        });
+
+        act.Should().NotThrow();
+        // And the save agrees, which is the property the dry run exists to predict.
+        SettingsOverlay.Mutate(overlayPath, c => c with
+        {
+            HttpsCertificateThumbprint = "CC33DD44",
+            HttpsCertificateTemplate = "WebServer",
+        });
+        SettingsOverlay.Load(overlayPath).HttpsCertificateThumbprint.Should().Be("CC33DD44");
+    }
+
+    [Fact]
+    public void EnsureCanMutate_CorruptFile_ThrowsWhatTheSaveThrows()
+    {
+        var overlayPath = Path.Combine(_dataDir, "settings.json");
+        File.WriteAllText(overlayPath, "{ this is not json");
+
+        var act = () => SettingsOverlay.EnsureCanMutate(overlayPath, c => c with { ExternalUrl = "https://x" });
+
+        act.Should().Throw<System.Text.Json.JsonException>()
+            .Which.Should().NotBeOfType<SettingsOverlayConflictException>(
+                "a file that is not JSON is not a refused change, and callers answer the two differently");
+        File.ReadAllText(overlayPath).Should().Be("{ this is not json");
+    }
+
+    [Fact]
+    public void EnsureCanMutate_NoFile_CreatesNeitherTheFileNorItsFolder()
+    {
+        var folder = Path.Combine(_dataDir, "not-yet");
+        var overlayPath = Path.Combine(folder, "settings.json");
+
+        SettingsOverlay.EnsureCanMutate(overlayPath, c => c with { ExternalUrl = "https://certus.example.com" });
+
+        Directory.Exists(folder).Should().BeFalse("a dry run writes nothing, not even the folder a save would make");
+    }
+
+    [Fact]
+    public void Save_CorruptFile_ThrowsWithoutWriting()
+    {
+        // Save now reads the file it replaces, so it answers a corrupt one the way
+        // Mutate always has: writing over it would discard whatever it holds.
+        var overlayPath = Path.Combine(_dataDir, "settings.json");
+        File.WriteAllText(overlayPath, "{ this is not json");
+
+        var act = () => SettingsOverlay.Save(new SettingsOverlay.OverlaySettings("ca\\CA", null), overlayPath);
+
+        act.Should().Throw<System.Text.Json.JsonException>();
+        File.ReadAllText(overlayPath).Should().Be("{ this is not json");
+    }
+
     // ── An overlay the service cannot trust (issue #489) ──
 
     [Fact]
@@ -520,8 +774,11 @@ public class SettingsOverlayTests : IDisposable
     {
         // How an administrator recovers: saving from the wizard or the settings page
         // replaces the untrusted file, and nothing an attacker put in it survives.
+        // Keeping unmanaged keys (issue #550) must not change that: the admin group
+        // the attacker planted is exactly the key #489 was about.
         var overlayPath = Path.Combine(_dataDir, "settings.json");
         SettingsOverlay.Save(new SettingsOverlay.OverlaySettings("planted\\CA", "https://planted.example"), overlayPath);
+        HandEditedOverlay.AddTo(overlayPath);
         FileAcl.GrantEveryoneWrite(overlayPath);
 
         SettingsOverlay.Mutate(overlayPath, c => c with { ExternalUrl = "https://certus.example.com" });
@@ -530,6 +787,12 @@ public class SettingsOverlayTests : IDisposable
         var loaded = SettingsOverlay.Load(overlayPath);
         loaded.ExternalUrl.Should().Be("https://certus.example.com");
         loaded.CaConnectionString.Should().BeNull();
+
+        using var configuration = new ConfigurationManager();
+        ((IConfigurationBuilder)configuration).AddSettingsOverlay(_dataDir).IsTrusted.Should().BeTrue();
+        configuration["Auth:AdminGroup"].Should().BeNull();
+        configuration["Certus:Alerts:Webhook:Url"].Should().BeNull();
+        File.ReadAllText(overlayPath).Should().NotContain(HandEditedOverlay.AdminGroup);
     }
 
     [Fact]

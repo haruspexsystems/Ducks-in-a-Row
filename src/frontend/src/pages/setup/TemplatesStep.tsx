@@ -68,6 +68,18 @@ export function TemplatesStep({ state, onUpdate }: TemplatesStepProps) {
         </p>
       </div>
 
+      {/* A server that finished setup in monitor mode was switched to full
+          (issue #471): the wizard reopened here, with the CA it already had. */}
+      {state.reopenedForIssuance && (
+        <div className="bg-certus-50 dark:bg-certus-500/10 border border-certus-200 dark:border-certus-500/30 rounded-lg p-4">
+          <p className="text-sm text-certus-800 dark:text-certus-300">
+            This server was switched from monitor mode to issuance. Pick the template ACME clients
+            may use and finish the remaining steps; nothing is issued until setup completes. The
+            computer account now also needs <strong>Enroll</strong> on that template.
+          </p>
+        </div>
+      )}
+
       {loading && (
         <div className="flex items-center justify-center py-12">
           <Loader2 className="h-6 w-6 text-certus-500 animate-spin" />

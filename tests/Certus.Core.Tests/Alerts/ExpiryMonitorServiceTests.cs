@@ -21,6 +21,7 @@ public class ExpiryMonitorServiceTests : IDisposable
     private readonly IAlertNotifier _mockNotifier;
     private readonly AlertOptions _alertOptions;
     private readonly List<IServiceScope> _scopes = new();
+    private readonly List<ServiceProvider> _providers = new();
 
     public ExpiryMonitorServiceTests()
     {
@@ -62,55 +63,22 @@ public class ExpiryMonitorServiceTests : IDisposable
     }
 
     /// <summary>
-    /// An identity that owns nothing, for the tests that are not about
-    /// suppression: no thumbprint is configured, so it resolves to an empty
-    /// list and every certificate alerts as it always did.
+    /// An identity that owns nothing, for the tests that are not about suppression.
     /// </summary>
-    private static ServerCertificateIdentity NoServerCertificate() =>
-        new(Substitute.For<IHttpsCertificateStore>(),
-            Options.Create(new CertusOptions
-            {
-                // Point at a path that does not exist rather than letting the
-                // default resolve to the real data directory: a unit test must
-                // never read the operator's ProgramData overlay.
-                SettingsOverlayPath = Path.Combine(
-                    Path.GetTempPath(), "certus-no-such-overlay-" + Guid.NewGuid().ToString("N") + ".json"),
-            }),
-            NullLogger<ServerCertificateIdentity>.Instance);
+    private static ServerCertificateIdentity NoServerCertificate() => ServerCertificateFixtures.None();
 
     /// <summary>
-    /// A <see cref="ServerCertificateIdentity"/> whose store holds one
-    /// certificate carrying <paramref name="serialHex"/>, which is what the
-    /// server's own HTTPS certificate looks like to the suppression path.
+    /// A <see cref="ServerCertificateIdentity"/> whose store holds one certificate
+    /// carrying <paramref name="serialHex"/>, which is what the server's own HTTPS
+    /// certificate looks like to the suppression path.
     /// </summary>
     private static (ServerCertificateIdentity Identity, X509Certificate2 Certificate)
-        ServerCertificateWithSerial(byte[] serialHex)
-    {
-        using var key = RSA.Create(2048);
-        var request = new CertificateRequest(
-            "CN=certus.home.local", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-        var certificate = request.Create(
-            request.SubjectName,
-            X509SignatureGenerator.CreateForRSA(key, RSASignaturePadding.Pkcs1),
-            DateTimeOffset.UtcNow.AddDays(-30),
-            DateTimeOffset.UtcNow.AddDays(20),
-            serialHex);
-
-        var store = Substitute.For<IHttpsCertificateStore>();
-        store.Find("AA11BB22").Returns(_ => X509CertificateLoader.LoadCertificate(certificate.RawData));
-
-        var options = Options.Create(new CertusOptions
-        {
-            HttpsCertificateThumbprint = "AA11BB22",
-            // A path that does not exist reads as an empty overlay, so the
-            // in process thumbprint above is the whole answer.
-            SettingsOverlayPath = Path.Combine(
-                Path.GetTempPath(), "certus-no-such-overlay-" + Guid.NewGuid().ToString("N") + ".json"),
-        });
-
-        return (new ServerCertificateIdentity(
-            store, options, NullLogger<ServerCertificateIdentity>.Instance), certificate);
-    }
+        ServerCertificateWithSerial(
+            byte[] serialHex,
+            bool autoRenewalEnabled = true,
+            CertusInstanceMode? instanceMode = null,
+            bool installedByService = true) =>
+        ServerCertificateFixtures.WithSerial(serialHex, autoRenewalEnabled, instanceMode, installedByService);
 
     private CertusDbContext GetDb()
     {
@@ -241,7 +209,142 @@ public class ExpiryMonitorServiceTests : IDisposable
         alerts.Should().HaveCount(1);
         alerts[0].ThresholdDays.Should().Be(30);
         alerts[0].Channels.Should().Be("test");
+        alerts[0].DeliveredChannels.Should().Be("test");
         alerts[0].Success.Should().BeTrue();
+    }
+
+    /// <summary>
+    /// A second provider over the same database with its own notifiers, for the
+    /// tests about more than one channel. The constructor's provider registers
+    /// the single mock notifier every other test uses.
+    /// </summary>
+    private ExpiryMonitorService CreateServiceWith(params IAlertNotifier[] notifiers)
+    {
+        var services = new ServiceCollection();
+        services.AddDbContext<CertusDbContext>(options => options.UseSqlite(_connection));
+        foreach (var notifier in notifiers)
+            services.AddScoped(_ => notifier);
+
+        var provider = services.BuildServiceProvider();
+        _providers.Add(provider);
+
+        return new ExpiryMonitorService(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            Options.Create(_alertOptions),
+            NullLogger<ExpiryMonitorService>.Instance,
+            NoServerCertificate());
+    }
+
+    private static IAlertNotifier Notifier(string channel, AlertNotificationResult result)
+    {
+        var notifier = Substitute.For<IAlertNotifier>();
+        notifier.Channel.Returns(channel);
+        notifier.IsEnabled.Returns(true);
+        notifier.SendExpiryAlertAsync(Arg.Any<ExpiryAlertBatch>(), Arg.Any<CancellationToken>())
+            .Returns(result);
+        return notifier;
+    }
+
+    /// <summary>
+    /// Issue #206: the email arrived and the webhook did not. The row must say
+    /// that, rather than read the same as both failing.
+    /// </summary>
+    [Fact]
+    public async Task Check_MixedOutcome_RecordsEachChannelsOwnResult()
+    {
+        var email = Notifier("email", new AlertNotificationResult(true));
+        var webhook = Notifier("webhook", new AlertNotificationResult(false, "Webhook returned 500"));
+        SeedCertificate(1, "CN=expiring.example.com", 25);
+
+        await CreateServiceWith(email, webhook).CheckForExpiringCertificatesAsync(CancellationToken.None);
+
+        var alert = await GetDb().AlertsSent.SingleAsync();
+        alert.Channels.Should().Be("email,webhook");
+        alert.DeliveredChannels.Should().Be("email");
+        alert.Success.Should().BeFalse("one channel failed");
+        alert.ErrorMessage.Should().Be("Webhook returned 500",
+            "the only failure needs no channel name; the channel columns say which it was");
+    }
+
+    /// <summary>
+    /// The channel that delivered must not hear about the threshold again. The
+    /// failed one is not retried either: that is issue #641, and until it lands
+    /// a recorded row suppresses the threshold on every channel, as before.
+    /// </summary>
+    [Fact]
+    public async Task Check_MixedOutcome_DoesNotSendAgainOnTheNextPass()
+    {
+        var email = Notifier("email", new AlertNotificationResult(true));
+        var webhook = Notifier("webhook", new AlertNotificationResult(false, "Webhook returned 500"));
+        SeedCertificate(1, "CN=expiring.example.com", 25);
+        var sut = CreateServiceWith(email, webhook);
+
+        await sut.CheckForExpiringCertificatesAsync(CancellationToken.None);
+        email.ClearReceivedCalls();
+        webhook.ClearReceivedCalls();
+        await sut.CheckForExpiringCertificatesAsync(CancellationToken.None);
+
+        await email.DidNotReceive().SendExpiryAlertAsync(Arg.Any<ExpiryAlertBatch>(), Arg.Any<CancellationToken>());
+        await webhook.DidNotReceive().SendExpiryAlertAsync(Arg.Any<ExpiryAlertBatch>(), Arg.Any<CancellationToken>());
+        (await GetDb().AlertsSent.CountAsync()).Should().Be(1);
+    }
+
+    /// <summary>
+    /// Before issue #206 the row kept only the last failing channel's error, so
+    /// the email failure here was lost.
+    /// </summary>
+    [Fact]
+    public async Task Check_EveryChannelFails_KeepsEachChannelsError()
+    {
+        var email = Notifier("email", new AlertNotificationResult(false, "SMTP connection refused"));
+        var webhook = Notifier("webhook", new AlertNotificationResult(false, "Webhook returned 500"));
+        SeedCertificate(1, "CN=expiring.example.com", 25);
+
+        await CreateServiceWith(email, webhook).CheckForExpiringCertificatesAsync(CancellationToken.None);
+
+        var alert = await GetDb().AlertsSent.SingleAsync();
+        alert.Channels.Should().Be("email,webhook");
+        alert.DeliveredChannels.Should().BeEmpty("no channel delivered");
+        alert.Success.Should().BeFalse();
+        alert.ErrorMessage.Should().Be("email: SMTP connection refused\nwebhook: Webhook returned 500");
+    }
+
+    [Fact]
+    public void DescribeFailures_TwoLongErrors_FitTheColumn()
+    {
+        // Each error at the redactor's own cap, which alone is half the column.
+        var error = new string('x', 501);
+
+        var text = ExpiryMonitorService.DescribeFailures([("email", error), ("webhook", error)]);
+
+        text!.Length.Should().BeLessThanOrEqualTo(AlertErrorRedactor.MaxStoredLength);
+        var lines = text.Split('\n');
+        lines.Should().HaveCount(2, "a long first error must not push the second out of the row");
+        lines[0].Should().StartWith("email: ").And.EndWith("…");
+        lines[1].Should().StartWith("webhook: ").And.EndWith("…");
+    }
+
+    [Fact]
+    public void DescribeFailures_NeverSplitsASurrogatePair()
+    {
+        // An emoji straddling the cut of the email line, as a receiver's response
+        // body can carry: "email: " is 7 characters, so its high half lands on
+        // the last character the 499 character share keeps before the ellipsis.
+        var error = new string('x', 490) + "😀" + new string('y', 20);
+
+        var text = ExpiryMonitorService.DescribeFailures([("email", error), ("webhook", error)])!;
+
+        text.Should().Contain("…", "the cut has to have happened for this to test anything");
+        text.Where((c, i) => char.IsHighSurrogate(c) && (i + 1 >= text.Length || !char.IsLowSurrogate(text[i + 1])))
+            .Should().BeEmpty("a lone high surrogate is not valid text");
+    }
+
+    [Fact]
+    public void DescribeFailures_ChannelWithoutAnError_IsStillNamed()
+    {
+        ExpiryMonitorService.DescribeFailures([("email", null), ("webhook", "Webhook returned 500")])
+            .Should().Be("email: failed\nwebhook: Webhook returned 500");
+        ExpiryMonitorService.DescribeFailures([]).Should().BeNull();
     }
 
     [Fact]
@@ -292,6 +395,38 @@ public class ExpiryMonitorServiceTests : IDisposable
     }
 
     /// <summary>
+    /// The row is the record that outlives everything else, and the database
+    /// travels with every backup (issue #635). The notifiers redact their own
+    /// text; this pins the second pass on the way to the table, with a notifier
+    /// that did not.
+    /// </summary>
+    [Fact]
+    public async Task Check_FailedNotification_StoresTheErrorRedacted()
+    {
+        _alertOptions.Webhook = new WebhookOptions
+        {
+            Url = "https://hooks.example.com/services/T000/xoxb-secret-token",
+            Secret = "shared-secret",
+        };
+        _mockNotifier.SendExpiryAlertAsync(Arg.Any<ExpiryAlertBatch>(), Arg.Any<CancellationToken>())
+            .Returns(new AlertNotificationResult(
+                false, "POST https://hooks.example.com/services/T000/xoxb-secret-token failed: bad shared-secret"));
+
+        SeedCertificate(1, "CN=expiring.example.com", 25);
+
+        var sut = CreateService();
+        await sut.CheckForExpiringCertificatesAsync(CancellationToken.None);
+
+        var db = GetDb();
+        var alert = await db.AlertsSent.FirstAsync();
+        alert.Success.Should().BeFalse();
+        alert.ErrorMessage.Should().NotContain("xoxb-secret-token");
+        alert.ErrorMessage.Should().NotContain("shared-secret");
+        alert.ErrorMessage.Should().NotContain("hooks.example.com");
+        alert.ErrorMessage.Should().Contain("(redacted)");
+    }
+
+    /// <summary>
     /// The server's own HTTPS certificate is issued by the monitored CA, so it
     /// syncs into the inventory like any other. Automatic renewal owns it
     /// (issue #105), so the threshold ladder must stay quiet about it, and no
@@ -335,10 +470,84 @@ public class ExpiryMonitorServiceTests : IDisposable
             Arg.Any<CancellationToken>());
     }
 
+    /// <summary>
+    /// Issue #470. The exclusion above exists because automatic renewal owns the
+    /// certificate. With renewal turned off nothing does, so it must alert like any
+    /// other; before the fix it stayed silent until it expired.
+    /// </summary>
+    [Fact]
+    public async Task Check_ServerOwnCertificate_RenewalOff_Alerts()
+    {
+        var (identity, certificate) = ServerCertificateWithSerial(
+            [0x00, 0xAB, 0xCD], autoRenewalEnabled: false);
+        using var _ = certificate;
+        SeedCertificate(1, "CN=certus.home.local", 20, serialNumber: "abcd");
+
+        var sut = CreateService(identity);
+        await sut.CheckForExpiringCertificatesAsync(CancellationToken.None);
+
+        await _mockNotifier.Received(1).SendExpiryAlertAsync(
+            Arg.Is<ExpiryAlertBatch>(b =>
+                b.ThresholdDays == 30 &&
+                b.Certificates.Count == 1 &&
+                b.Certificates[0].Subject == "CN=certus.home.local"),
+            Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// Issue #470. Monitor mode never renews, whatever the renewal setting says, so the
+    /// server's own certificate alerts there too.
+    /// </summary>
+    [Fact]
+    public async Task Check_ServerOwnCertificate_MonitorMode_Alerts()
+    {
+        var (identity, certificate) = ServerCertificateWithSerial(
+            [0x00, 0xAB, 0xCD], autoRenewalEnabled: true, CertusInstanceMode.Monitor);
+        using var _ = certificate;
+        SeedCertificate(1, "CN=certus.home.local", 20, serialNumber: "abcd");
+
+        var sut = CreateService(identity);
+        await sut.CheckForExpiringCertificatesAsync(CancellationToken.None);
+
+        await _mockNotifier.Received(1).SendExpiryAlertAsync(
+            Arg.Is<ExpiryAlertBatch>(b =>
+                b.ThresholdDays == 30 &&
+                b.Certificates.Count == 1 &&
+                b.Certificates[0].Subject == "CN=certus.home.local"),
+            Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// Issue #535. In full mode with renewal on, the automatic renewal now leaves a
+    /// certificate somebody else installed to whoever issued it, typically Windows
+    /// autoenrolment for one picked in monitor mode. Nothing in this product renews it
+    /// then, so it alerts like any other: if its own renewal stops, this is the warning.
+    /// </summary>
+    [Fact]
+    public async Task Check_ServerOwnCertificate_NotInstalledByTheService_Alerts()
+    {
+        var (identity, certificate) = ServerCertificateWithSerial(
+            [0x00, 0xAB, 0xCD], autoRenewalEnabled: true, CertusInstanceMode.Full, installedByService: false);
+        using var _ = certificate;
+        SeedCertificate(1, "CN=certus.home.local", 20, serialNumber: "abcd");
+
+        var sut = CreateService(identity);
+        await sut.CheckForExpiringCertificatesAsync(CancellationToken.None);
+
+        await _mockNotifier.Received(1).SendExpiryAlertAsync(
+            Arg.Is<ExpiryAlertBatch>(b =>
+                b.ThresholdDays == 30 &&
+                b.Certificates.Count == 1 &&
+                b.Certificates[0].Subject == "CN=certus.home.local"),
+            Arg.Any<CancellationToken>());
+    }
+
     public void Dispose()
     {
         foreach (var scope in _scopes)
             scope.Dispose();
+        foreach (var provider in _providers)
+            provider.Dispose();
         _serviceProvider.Dispose();
         _connection.Dispose();
     }

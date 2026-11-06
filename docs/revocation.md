@@ -74,15 +74,24 @@ glass and does not quietly become a revocation one.
 
 ## What the CA has to allow
 
-Dashboard revocation needs the server's machine account to hold **Issue and
-Manage Certificates** on the CA, which is a higher privilege than the **Read**
-that the inventory needs and the **Enroll** that issuance needs.
+Every revocation the product makes goes to the CA as the server's machine
+account, so all three kinds need that account to hold **Issue and Manage
+Certificates** on the CA: revocation from the dashboard, an ACME client revoking
+its own certificate through `revoke-cert`, and the
+[one automatic revocation](#the-one-automatic-revocation) described below. That
+is a higher privilege than the **Read** the inventory needs, and than the
+**Request Certificates** on the CA and **Enroll** on the template that issuance
+needs.
 
-Granting it is a real decision. Without it, everything else keeps working and
-revocation returns a permission error naming the right that is missing. If you
-do not intend to revoke from the dashboard, do not grant it: the ceiling and the
-scope are defence in depth on top of the CA's own permissions, not a replacement
-for them.
+Granting it is a real decision, because it also lets the account approve and
+deny requests the CA holds. Without it, issuance, the inventory and alerts keep
+working, and all three kinds of revocation fail with a permission error naming
+the right that is missing. That includes a client revoking a certificate whose
+key it believes is compromised. Grant it if you want any of the three. Either
+way, the ceiling and the scope are defence in depth on top of the CA's own
+permissions, not a replacement for them.
+[What to ask your AD and CA team](ad-and-ca-team-request.md) lists it with the
+other rights.
 
 ## ACME clients revoking their own certificates
 
@@ -95,7 +104,19 @@ own private key.
 certificate is responding to something it knows about, usually a key compromise,
 and that must not wait on a dashboard setting an administrator chose months
 earlier. It only ever reaches certificates Ducks in a Row issued, so the blast
-radius is already bounded.
+radius is already bounded. It does need the same CA right as the dashboard; see
+[what the CA has to allow](#what-the-ca-has-to-allow).
+
+**The template name in the `revoke-cert` URL is not checked either.** A client
+can revoke through the URL of any template: the one the certificate was issued
+from, another one, or one that is no longer offered over ACME. What authorizes
+the request is the account key or the certificate's own key, and the
+certificate sent has to be byte for byte the one this server issued. Checking
+the name would add nothing to that, and it would let a template setting stand
+between a compromised key and its revocation. The order, authorization,
+challenge, certificate, account and key-change URLs treat the name the same
+way, while `renewalInfo` does check it; see
+[which URLs check the template](acme-clients.md#which-urls-check-the-template).
 
 ## The one automatic revocation
 
@@ -104,10 +125,24 @@ asked. At finalize, the certificate the CA returns is checked against the
 capability ceiling before it is handed to the client. A leaf that breaches the
 ceiling is revoked immediately, with reason code 5, and the order fails.
 
+The revocation needs **Issue and Manage Certificates** on the CA, like every
+other. Without it the revocation fails and the certificate stays valid at the
+CA: the order still fails and the client still never receives it, and the
+service log names the certificate's serial number and CA request id and says to
+revoke it by hand.
+
 That is the guarantee behind the advisory check at new order time: a template's
 recorded metadata is unverified and might be wrong, but the certificate itself
 is checked every time and cannot be wrong. If a template is misconfigured so
 badly that it mints something outside the ceiling, the client never receives it.
+
+Before either check, the certificate must carry the public key from the order's
+own CSR. One that does not is not the order's certificate at all, so it is
+neither delivered nor revoked: the order fails, and the service log names the
+CA request id. The usual cause is an install pointed at a different CA while an
+order was waiting at the old one for a manager's approval. Every CA numbers its
+requests from 1, so the new CA's request of the same number belongs to someone
+else, and revoking it would break their service.
 
 Nothing else revokes on its own. In particular, an order that is abandoned or
 expires while the CA is holding it does not revoke anything: it logs the CA

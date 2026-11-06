@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using Certus.Core.Acme.Crypto;
 using Certus.Core.Acme.Models;
+using Certus.Core.Setup;
 
 namespace Certus.Web.Tests;
 
@@ -20,13 +21,32 @@ namespace Certus.Web.Tests;
 /// code were at fault. The domain itself and a host under it must both
 /// issue: an entry covers the domain and its subdomains.
 ///
-/// Own factory instance per class because completion locks setup.
+/// The second test is the hand edit case from issue #630: the restriction
+/// switched on with no usable entry, a state the wizard and the settings API
+/// refuse to write, must refuse every order at the ACME surface with the
+/// same rejectedIdentifier problem a disallowed name gets.
+///
+/// Own factory instance per test because completion locks setup.
 /// </summary>
 [Trait("Category", "Integration")]
 public class AllowedDomainsFirstUseIntegrationTests : IDisposable
 {
     private sealed class Factory : CertusWebApplicationFactory
     {
+        /// <summary>
+        /// Write the status file the way a hand edit would leave it: setup
+        /// complete, the restriction on, and no entry at all.
+        /// </summary>
+        public void WriteHandEditedEmptyRestriction()
+        {
+            new SetupStatus
+            {
+                SetupCompleted = true,
+                EnabledTemplates = ["WebServer"],
+                AllowedDomainsEnabled = true,
+                AllowedDomains = [],
+            }.Save(Path.Combine(TempDataDir, SetupStatus.FileName));
+        }
     }
 
     private readonly Factory _factory = new();
@@ -55,9 +75,13 @@ public class AllowedDomainsFirstUseIntegrationTests : IDisposable
             JsonSerializer.Serialize(new
             {
                 enabledTemplates = new[] { "WebServer" },
-                externalUrl = "https://certus.manual2025.local:5001",
+                externalUrl = "https://certus.corp.example.com:5001",
                 allowedDomainsEnabled = true,
-                allowedDomains = new[] { "manual2025.local" },
+                allowedDomains = new[] { "corp.example.com" },
+                // Binding switched off, so the plain new-account below reaches
+                // the domain policy this class pins. A fresh install requires
+                // binding otherwise (issue #631, EabSetupIntegrationTests).
+                eabEnforcement = "off",
             }),
             Encoding.UTF8, "application/json"));
         completion.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -66,11 +90,11 @@ public class AllowedDomainsFirstUseIntegrationTests : IDisposable
 
         // The entry itself: "a cert for that domain" is the reported first
         // request, and MatchesEntry's equality arm is what admits it.
-        var bareDomain = await PostNewOrderAsync(rsa, account.Kid, "manual2025.local");
+        var bareDomain = await PostNewOrderAsync(rsa, account.Kid, "corp.example.com");
         bareDomain.StatusCode.Should().Be(HttpStatusCode.Created);
 
         // A host under it, the everyday case.
-        var subdomain = await PostNewOrderAsync(rsa, account.Kid, "web01.manual2025.local");
+        var subdomain = await PostNewOrderAsync(rsa, account.Kid, "web01.corp.example.com");
         subdomain.StatusCode.Should().Be(HttpStatusCode.Created);
 
         // A name outside the list is the shape the policy exists to refuse,
@@ -82,6 +106,32 @@ public class AllowedDomainsFirstUseIntegrationTests : IDisposable
         error!.Type.Should().Be(AcmeErrorType.RejectedIdentifier);
         error.Subproblems.Should().ContainSingle();
         error.Subproblems![0].Identifier!.Value.Should().Be("other.local");
+    }
+
+    [Fact]
+    public async Task HandEditedEmptyRestriction_ThenOrder_EveryNameRefusedAsRejectedIdentifier()
+    {
+        // The state the wizard and the settings API refuse to write: the
+        // restriction on with nothing in the list. Issue #630: the policy
+        // fails closed, so the very first order after the edit is refused
+        // with the problem type a disallowed name gets, naming the identifier
+        // and pointing at the Settings page where the fix lives.
+        _factory.WriteHandEditedEmptyRestriction();
+
+        var (account, rsa) = await CreateAccountAsync();
+
+        var response = await PostNewOrderAsync(rsa, account.Kid, "corp.example.com");
+
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        response.Content.Headers.ContentType?.MediaType.Should().Be("application/problem+json");
+        var error = JsonSerializer.Deserialize<AcmeError>(
+            await response.Content.ReadAsStringAsync());
+        error!.Type.Should().Be(AcmeErrorType.RejectedIdentifier);
+        error.Detail.Should().Contain("corp.example.com");
+        error.Detail.Should().Contain("Settings");
+        error.Subproblems.Should().ContainSingle();
+        error.Subproblems![0].Type.Should().Be(AcmeErrorType.RejectedIdentifier);
+        error.Subproblems[0].Identifier!.Value.Should().Be("corp.example.com");
     }
 
     #region Test Helpers

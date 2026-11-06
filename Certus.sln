@@ -19,6 +19,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Certus.Core.Tests", "tests\
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Certus.Web.Tests", "tests\Certus.Web.Tests\Certus.Web.Tests.csproj", "{6827E9EF-F484-4810-890A-7BC991953A6C}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Certus.Modules.Abstractions", "src\Certus.Modules.Abstractions\Certus.Modules.Abstractions.csproj", "{DC8B8CE1-895B-423B-9FC0-3D4D8AE91274}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Certus.Service.Tests", "tests\Certus.Service.Tests\Certus.Service.Tests.csproj", "{A2FC49AE-66E1-4B64-908A-0CCA10BB14D0}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -52,6 +56,14 @@ Global
 		{6827E9EF-F484-4810-890A-7BC991953A6C}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{6827E9EF-F484-4810-890A-7BC991953A6C}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{6827E9EF-F484-4810-890A-7BC991953A6C}.Release|Any CPU.Build.0 = Release|Any CPU
+		{DC8B8CE1-895B-423B-9FC0-3D4D8AE91274}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{DC8B8CE1-895B-423B-9FC0-3D4D8AE91274}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{DC8B8CE1-895B-423B-9FC0-3D4D8AE91274}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{DC8B8CE1-895B-423B-9FC0-3D4D8AE91274}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A2FC49AE-66E1-4B64-908A-0CCA10BB14D0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A2FC49AE-66E1-4B64-908A-0CCA10BB14D0}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A2FC49AE-66E1-4B64-908A-0CCA10BB14D0}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A2FC49AE-66E1-4B64-908A-0CCA10BB14D0}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{75480487-FA94-4461-B8C4-94D7F7735E29} = {A888141C-B44F-4CA4-B788-7AC47D0FB7CA}
@@ -60,5 +72,6 @@ Global
 		{274E2F9E-4F69-4333-B35A-7E4979E671DB} = {A888141C-B44F-4CA4-B788-7AC47D0FB7CA}
 		{C6B28034-581B-42F2-A3B1-CC498B97D8BF} = {E1D99526-D8B6-4BED-916B-5EF8D0755101}
 		{6827E9EF-F484-4810-890A-7BC991953A6C} = {E1D99526-D8B6-4BED-916B-5EF8D0755101}
+		{A2FC49AE-66E1-4B64-908A-0CCA10BB14D0} = {E1D99526-D8B6-4BED-916B-5EF8D0755101}
 	EndGlobalSection
 EndGlobal

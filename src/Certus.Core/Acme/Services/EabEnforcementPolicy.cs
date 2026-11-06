@@ -35,7 +35,10 @@ public enum EabEnforcementMode
 /// next directory fetch and the next new-account without a service restart.
 /// A missing file, a file written before the field existed, or an
 /// unrecognized value all read as <see cref="EabEnforcementMode.Off"/>, so an
-/// upgraded install stays unenforced until an administrator opts in.
+/// upgraded install stays unenforced until an administrator opts in. A fresh
+/// install is not covered by that reading: the setup wizard writes the mode at
+/// completion, required unless the administrator switched it off (issue #631,
+/// <see cref="SetupService.FreshInstallEabEnforcement"/>).
 /// </summary>
 public sealed class EabEnforcementPolicy
 {

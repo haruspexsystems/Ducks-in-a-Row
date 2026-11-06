@@ -11,6 +11,7 @@ using Certus.Core.Services;
 using Certus.Core.Setup;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace Certus.Core.Acme.Services;
 
@@ -27,6 +28,7 @@ public sealed class OrderService
     private readonly DeviceAttestationPolicyService _devicePolicy;
     private readonly DomainPolicyAuditService _domainPolicyAudit;
     private readonly ILogger<OrderService> _logger;
+    private readonly AcmeRateLimitOptions _caps;
 
     /// <summary>Order expiration: 7 days from creation.</summary>
     private static readonly TimeSpan OrderLifetime = TimeSpan.FromDays(7);
@@ -45,7 +47,8 @@ public sealed class OrderService
         CertificateRevocationGate revocationGate,
         DeviceAttestationPolicyService devicePolicy,
         DomainPolicyAuditService domainPolicyAudit,
-        ILogger<OrderService> logger)
+        ILogger<OrderService> logger,
+        IOptions<AcmeRateLimitOptions>? rateLimits = null)
     {
         _db = db;
         _adcsClient = adcsClient;
@@ -54,7 +57,62 @@ public sealed class OrderService
         _devicePolicy = devicePolicy;
         _domainPolicyAudit = domainPolicyAudit;
         _logger = logger;
+        // Optional so the many tests that build the service by hand keep the
+        // documented defaults; both hosts bind the options, so the container
+        // always supplies them.
+        _caps = rateLimits?.Value ?? new AcmeRateLimitOptions();
     }
+
+    /// <summary>
+    /// The resource caps a new-order request has to clear before anything is
+    /// examined or stored (issue #632, CRA R04). The identifier count bounds
+    /// what one request can make the server create (an authorization and up to
+    /// three challenges per identifier, and a policy audit row for each refused
+    /// one); the open order count bounds what one account can accumulate across
+    /// many requests, which the 64 KB body cap and the per address limiter do
+    /// not. Run it before the identifier loop, so a refused request has cost no
+    /// work and written no audit row, and before any value is read, so it tells
+    /// a client nothing about which identifier types the template offers.
+    /// </summary>
+    public async Task<OrderCapOutcome> CheckOrderCapsAsync(
+        AcmeAccount account,
+        int identifierCount,
+        CancellationToken cancellationToken = default)
+    {
+        if (identifierCount > _caps.MaxIdentifiersPerOrder)
+            return OrderCapOutcome.TooManyIdentifiers;
+
+        // An open order is one the client has not finalized and nothing has
+        // closed: pending or ready, and not yet expired. Processing orders are
+        // excluded on purpose: the finalize claim was the issuance decision,
+        // the CA may be holding the request for an operator, and an account
+        // waiting on manager approval must not be locked out of ordering. An
+        // allow list, so a status added later does not count.
+        var now = DateTime.UtcNow;
+        var open = await _db.AcmeOrders.CountAsync(
+            o => o.AccountId == account.Id
+                && (o.Status == "pending" || o.Status == "ready")
+                && o.ExpiresAt > now,
+            cancellationToken);
+
+        if (open >= _caps.MaxPendingOrdersPerAccount)
+        {
+            _logger.LogWarning(
+                "ACME account {AccountId} holds {Open} open orders, at the " +
+                "Certus:RateLimiting:MaxPendingOrdersPerAccount cap of {Cap}; its new " +
+                "order request is refused until it finalizes, deactivates or lets some expire",
+                account.AccountId, open, _caps.MaxPendingOrdersPerAccount);
+            return OrderCapOutcome.TooManyPendingOrders;
+        }
+
+        return OrderCapOutcome.Accepted;
+    }
+
+    /// <summary>The identifier cap, for the refusal detail.</summary>
+    public int MaxIdentifiersPerOrder => _caps.MaxIdentifiersPerOrder;
+
+    /// <summary>The open order cap, for the refusal detail.</summary>
+    public int MaxPendingOrdersPerAccount => _caps.MaxPendingOrdersPerAccount;
 
     /// <summary>
     /// Creates a new order with authorizations and challenges.
@@ -539,6 +597,37 @@ public sealed class OrderService
                     "The CSR could not be parsed or its signature did not verify.");
             }
 
+            // A carrier the SAN walk does not read is refused before anything
+            // else. ADCS honours a SAN carried under szOID_CERT_EXTENSIONS, a
+            // carrier the parser never inspects (measured on lab 2019, issue
+            // #548), so a request shaped any way other than a single PKCS#9
+            // extensionRequest with a single value cannot be trusted to carry
+            // only the names this check saw.
+            if (identity.HasUnexpectedCsrAttributes)
+            {
+                _logger.LogWarning(
+                    "CSR for order {OrderId} carries an attribute other than a single extensionRequest",
+                    orderId);
+                return new FinalizeResult(FinalizeOutcome.BadCsr,
+                    "The CSR must carry exactly one PKCS#9 extensionRequest attribute with a single value.");
+            }
+
+            // A requested extension outside the allow list is refused, and
+            // basic constraints and the subject key identifier are admitted only
+            // by value (cA=false, the key's own identifier; issue #687). ADCS can
+            // copy a requested extension into the certificate (Application
+            // Policies on a schema version 1 template, ESC15, measured on lab
+            // 2019, issue #548), where the capability ceiling would not see it.
+            if (identity.DisallowedRequestedExtensionOid is { } disallowedOid)
+            {
+                _logger.LogWarning(
+                    "CSR for order {OrderId} requests a disallowed extension {Oid}",
+                    orderId, disallowedOid);
+                return new FinalizeResult(FinalizeOutcome.BadCsr,
+                    identity.DisallowedRequestedExtensionDetail
+                        ?? $"The CSR requests an extension this server does not allow ({disallowedOid}).");
+            }
+
             // Any non DNS SAN entry is unauthorized. A PermanentIdentifier is a
             // recognized type, so it does not set HasOtherSanEntries, but a dns
             // order authorizes none, so refuse it explicitly too.
@@ -1006,6 +1095,20 @@ public sealed class OrderService
             return "The CSR could not be parsed or its signature did not verify.";
         }
 
+        // The carrier and requested extension refusals apply to a device CSR
+        // too: an attested key is no licence to smuggle a name under a carrier
+        // the parser does not read, or to request an extension the ceiling
+        // cannot see (issue #548). The device specific identity rules below
+        // (attested SPKI, PermanentIdentifier, the binding mode) are what stays
+        // device specific.
+        if (identity.HasUnexpectedCsrAttributes)
+            return "The CSR must carry exactly one PKCS#9 extensionRequest attribute with a single value.";
+        // A null here would admit the CSR, so the detail falls back rather
+        // than passing through.
+        if (identity.DisallowedRequestedExtensionOid is { } disallowedOid)
+            return identity.DisallowedRequestedExtensionDetail
+                ?? $"The CSR requests an extension this server does not allow ({disallowedOid}).";
+
         var expected = deviceIdentifier.Value;
 
         var authz = order.Authorizations.FirstOrDefault(
@@ -1179,9 +1282,12 @@ public sealed class OrderService
     /// ACME row is stamped by revoke-cert, the finalize guard and the
     /// dashboard, but a revocation done at the CA itself (certutil,
     /// certsrv.msc) reaches only the synced inventory, and the renew now
-    /// window exists precisely for that case. The bridge key is the one the
-    /// revocation stamps use in the other direction, unique on the inventory
-    /// side, so this is a point read per poll.
+    /// window exists precisely for that case. The bridge is the one the
+    /// revocation stamps use in the other direction, keyed on the request id,
+    /// which is unique on the inventory side, so this is a point read per poll.
+    /// It also has to agree on the serial (issue #442): after the install is
+    /// pointed at another CA, the new CA's request of the same number is some
+    /// other certificate, and its revocation says nothing about this one.
     /// </summary>
     private async Task<DateTimeOffset?> ResolveRevocationInstantAsync(
         AcmeCertificate certificate, CancellationToken cancellationToken)
@@ -1194,7 +1300,7 @@ public sealed class OrderService
 
         var synced = await _db.SyncedCertificates
             .AsNoTracking()
-            .Where(s => s.RequestId == certificate.AdcsRequestId)
+            .Where(AcmeInventoryBridge.InventoryRowsFor(certificate))
             .Select(s => new { s.Status, s.RevokedAt })
             .FirstOrDefaultAsync(cancellationToken);
         if (synced == null)
@@ -1444,11 +1550,16 @@ public sealed class OrderService
         try
         {
             // Bridged on the CA request id, the same key #202 used in the other
-            // direction. Written as a direct UPDATE rather than through a tracked
-            // entity so it cannot be shadowed by this scope's identity map.
+            // direction, and on the serial, because a request id names a
+            // different certificate once the install is pointed at another CA
+            // (issue #442). A row that fails the bridge is some other
+            // certificate and is left alone, because stamping it would show a
+            // live certificate as revoked. Written as a direct UPDATE rather than
+            // through a tracked entity so it cannot be shadowed by this scope's
+            // identity map.
             await _db.SyncedCertificates
-                .Where(c => c.RequestId == certificate.AdcsRequestId
-                         && c.Status != nameof(CertificateStatus.Revoked))
+                .Where(AcmeInventoryBridge.InventoryRowsFor(certificate))
+                .Where(c => c.Status != nameof(CertificateStatus.Revoked))
                 .ExecuteUpdateAsync(setters => setters
                     .SetProperty(c => c.Status, nameof(CertificateStatus.Revoked))
                     .SetProperty(c => c.RevokedAt, revokedAt)
@@ -1493,7 +1604,19 @@ public sealed class OrderService
         int orderId,
         CancellationToken cancellationToken = default)
     {
+        // Anything the caller left pending is flushed first, as the single save at
+        // the end of this method used to do. The status writes below go round the
+        // change tracker, so they are not part of that save.
+        await _db.SaveChangesAsync(cancellationToken);
+
+        // Read the row as it is now, not as this context last saw it. The worker
+        // that calls this holds one scoped DbContext for the whole sweep, so a
+        // tracking query would hand back the order it loaded at the start of the
+        // sweep, with whatever status it had then: identity resolution never
+        // overwrites a tracked entity's values. A stale "ready" would carry the
+        // order past the early return below after a finalize had claimed it.
         var order = await _db.AcmeOrders
+            .AsNoTracking()
             .Include(o => o.Authorizations)
             .FirstOrDefaultAsync(o => o.Id == orderId, cancellationToken);
 
@@ -1506,29 +1629,33 @@ public sealed class OrderService
         // request at all. Issue #301 already stopped the ready arm re-arming a
         // claimed order; this stops the invalid arm demoting one.
         //
-        // Nothing reachable is lost. The worker's three call sites either cannot
-        // produce an unusable authorization under a processing order, or already
-        // wrote the demote themselves: a challenge failing marks its authorization
-        // invalid only when every challenge in it is invalid, and an order can only
-        // be processing if the claim found it ready, which required every
-        // authorization valid, so the sibling challenge that made it valid is still
-        // valid; and a deactivation never reaches here at all, because
-        // ChallengeValidationService returns early on a deactivated authorization
-        // without calling this method, and DeactivateAuthorizationAsync writes its
-        // own demote. The expiry arm does reach a processing order, and leaving it
-        // alone is right rather than a loss: the order's own expiry was checked
-        // before the claim, and an authorization ageing out afterwards does not
-        // retroactively unauthorize an issuance already in flight. The
-        // authorization and the challenge still go invalid, so the record of what
-        // happened survives; only the order status is left to the finalize that
-        // owns it.
+        // Nothing reachable is lost. The worker's call sites either cannot produce
+        // an unusable authorization under a processing order, or already wrote the
+        // demote themselves: a challenge failing marks its authorization invalid
+        // only while that authorization is still pending (RFC 8555 section 7.1.6,
+        // issue #481), and an order can only be processing if the claim found it
+        // ready, which required every authorization valid, and a failure never
+        // demotes a valid one; and a deactivation writes its own demote in
+        // DeactivateAuthorizationAsync, which leaves a processing order alone. The
+        // worker can still read that deactivated authorization afterwards, when a
+        // redundant second challenge on it finishes after the finalize, and it is
+        // the conditional writes below that keep it off the claimed order. The expiry arm
+        // does reach a processing order, and leaving it alone is right rather than
+        // a loss: the order's own expiry was checked before the claim, and an
+        // authorization ageing out afterwards does not retroactively unauthorize
+        // an issuance already in flight. The authorization and the challenge still
+        // go invalid, so the record of what happened survives; only the order
+        // status is left to the finalize that owns it.
         //
         // Widened here rather than as a predicate on the invalid arm because this
         // early return is the single statement of "this order's status is no longer
         // mine", it is what DeactivateAuthorizationAsync's allow list agrees with by
         // construction, and it covers any arm added later.
         if (order == null || order.Status is "valid" or "invalid" or "processing")
+        {
+            await ReloadTrackedOrderAsync(orderId, cancellationToken);
             return;
+        }
 
         // Any authorization that can never be valid again → order invalid.
         // RFC 8555 §7.5.2: a deactivated authorization is as fatal to the order as
@@ -1536,7 +1663,7 @@ public sealed class OrderService
         // this method was a silent no-op for one and an order could sit pending
         // for ever. DeactivateAuthorizationAsync writes the demote itself, in the
         // same SaveChanges as the status flip; this arm is what keeps the
-        // validation worker's three call sites agreeing with that write.
+        // validation worker's call sites agreeing with that write.
         //
         // The one demote in the product that deliberately writes no ErrorJson, and
         // the silence is a decision rather than an oversight (issue #330). This is
@@ -1549,11 +1676,26 @@ public sealed class OrderService
         // be a second, vaguer copy of a reason the client can already read, written
         // on the path that runs most often. Adding one is a behaviour change to be
         // decided on its own, not a tidy up.
+        //
+        // Both arms are conditional UPDATEs naming the statuses they may write
+        // from, like every other order status write from a scope that does not own
+        // the row (issues #301 and #312). The early return above reads a fresh row,
+        // but a finalize can still claim the order between that read and this
+        // write; the predicate is what makes the refusal hold at the instant of the
+        // write. Before issue #481 the worker's tracked copy of the authorization
+        // was stale in the same way as the order, which hid this: a deactivation
+        // that landed after a finalize still read "valid" here, so nothing was
+        // written. Once the worker reloads the authorization it reads
+        // "deactivated", and a tracked assignment would have written "invalid"
+        // over a processing or valid order.
         if (order.Authorizations.Any(a => a.Status == "invalid" || a.Status == "deactivated"))
         {
-            order.Status = "invalid";
-            _logger.LogInformation(
-                "Order {OrderId} is now invalid (an authorization is no longer usable)", order.OrderId);
+            var demoted = await _db.AcmeOrders
+                .Where(o => o.Id == orderId && (o.Status == "pending" || o.Status == "ready"))
+                .ExecuteUpdateAsync(setters => setters.SetProperty(o => o.Status, "invalid"), cancellationToken);
+            if (demoted == 1)
+                _logger.LogInformation(
+                    "Order {OrderId} is now invalid (an authorization is no longer usable)", order.OrderId);
         }
         // Check if all authorizations are valid → order ready. Only out of
         // "pending", never out of "processing" (issue #301): that order has
@@ -1565,12 +1707,29 @@ public sealed class OrderService
         // client finalizes, and validating it lands here.
         else if (order.Status == "pending" && order.Authorizations.All(a => a.Status == "valid"))
         {
-            order.Status = "ready";
-            _logger.LogInformation("Order {OrderId} is now ready for finalization", order.OrderId);
+            var readied = await _db.AcmeOrders
+                .Where(o => o.Id == orderId && o.Status == "pending")
+                .ExecuteUpdateAsync(setters => setters.SetProperty(o => o.Status, "ready"), cancellationToken);
+            if (readied == 1)
+                _logger.LogInformation("Order {OrderId} is now ready for finalization", order.OrderId);
         }
         // Otherwise: still pending
 
-        await _db.SaveChangesAsync(cancellationToken);
+        await ReloadTrackedOrderAsync(orderId, cancellationToken);
+    }
+
+    /// <summary>
+    /// Brings a copy of the order this context already tracks up to the row as it
+    /// stands. <see cref="RecalculateOrderStatusAsync"/> reads with no tracking and
+    /// writes with ExecuteUpdate, both of which go round the change tracker, so
+    /// without this a caller reading the order next through the same context would
+    /// be served the status it had before.
+    /// </summary>
+    private async Task ReloadTrackedOrderAsync(int orderId, CancellationToken cancellationToken)
+    {
+        var tracked = _db.AcmeOrders.Local.FirstOrDefault(o => o.Id == orderId);
+        if (tracked is not null)
+            await _db.Entry(tracked).ReloadAsync(cancellationToken);
     }
 
     /// <summary>
@@ -1958,6 +2117,27 @@ public sealed class OrderService
             return;
         }
 
+        // The key half of the leaf guard (issue #604), ahead of both ceilings
+        // because their breach arm revokes. The sweep asks whichever CA is
+        // configured now for a request id that is unique only within one CA, so
+        // an order held at a CA the install has since been pointed away from
+        // collects the new CA's request of the same number, which is somebody
+        // else's certificate. The certificate this order asked for carries its
+        // CSR's key; one with any other key is not this order's, and revoking it
+        // would revoke a stranger's. The finalize's issued arm passes here too,
+        // where it costs one parse and guards against a CA side mix up. An absent
+        // DER is left to the capability ceiling below, which refuses it and has
+        // no serial to revoke by.
+        if (certResult.CertificateDer != null)
+        {
+            var keyVerdict = IssuedKeyCheck.Evaluate(certResult.CertificateDer, StoredCsrOf(order));
+            if (!keyVerdict.Allowed)
+            {
+                await RefuseForeignCertificateAsync(order, requestId, keyVerdict);
+                return;
+            }
+        }
+
         // The finalize leaf guard, the hard guarantee behind the advisory
         // template metadata check at new-order: parse what the CA actually
         // returned and never deliver anything outside the TLS capability
@@ -1970,6 +2150,28 @@ public sealed class OrderService
             ? new CeilingVerdict(false, "undetermined",
                 "The issued certificate could not be parsed, so its TLS capability cannot be verified.")
             : TlsCapabilityCeiling.Evaluate(capability);
+
+        // The names half of the same guard, for a dns order (issue #548). The
+        // ceiling judges the certificate's capability; this judges the names
+        // the CA actually put in it against the order's identifiers, so a name
+        // smuggled through a CSR carrier the finalize parser never read, or
+        // added by the CA, is caught at the leaf even though the CSR was clean.
+        // Device orders are judged by their attested key and PermanentIdentifier
+        // instead, so they are not held to the dns name rule here.
+        if (verdict.Allowed && certResult.CertificateDer != null)
+        {
+            var orderIdentifiers = JsonSerializer.Deserialize<AcmeIdentifier[]>(order.IdentifiersJson)
+                ?? Array.Empty<AcmeIdentifier>();
+            if (!orderIdentifiers.Any(i => AcmeIdentifierTypes.IsDeviceType(i.Type)))
+            {
+                var orderDomains = orderIdentifiers
+                    .Where(i => i.Type == AcmeIdentifierTypes.Dns)
+                    .Select(i => i.Value.Trim().ToLowerInvariant())
+                    .ToHashSet();
+                verdict = IssuedNameCeiling.Evaluate(certResult.CertificateDer, orderDomains);
+            }
+        }
+
         if (!verdict.Allowed)
         {
             await RefuseIssuedCertificateAsync(order, requestId, certResult, verdict);
@@ -2214,6 +2416,79 @@ public sealed class OrderService
         // The revoked leaf still belongs in the inventory; nudge the sync so
         // it appears promptly rather than on the next timer tick.
         _syncTrigger.FireDebounced(PostIssuanceSyncDelay);
+    }
+
+    /// <summary>
+    /// The CSR the finalize claim stored with the order, or null when none is
+    /// stored (erasure drops it, #637) or it does not decode.
+    /// </summary>
+    private static byte[]? StoredCsrOf(AcmeOrder order)
+    {
+        if (string.IsNullOrEmpty(order.CsrDer))
+            return null;
+        try
+        {
+            return JwsService.Base64UrlDecode(order.CsrDer);
+        }
+        catch (FormatException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The refusal arm of the key check (issue #604): the CA returned a
+    /// certificate that cannot be shown to carry this order's key. Nothing is
+    /// delivered and nothing is recorded, and unlike
+    /// <see cref="RefuseIssuedCertificateAsync"/> nothing is revoked: the
+    /// certificate is most likely another requester's, issued by a CA this
+    /// install was pointed at after the order was submitted elsewhere, and
+    /// revoking it would take down their service. The order fails, so the sweep
+    /// stops asking, and the log names the request for an operator to follow up
+    /// at the CA the order was really submitted to. Like the other completion
+    /// arms it takes no token, and its status write is conditional from
+    /// "processing" because the sweep never claimed the row.
+    /// </summary>
+    private async Task RefuseForeignCertificateAsync(
+        AcmeOrder order,
+        int requestId,
+        CeilingVerdict verdict)
+    {
+        if (verdict.ReasonCode == "key-mismatch")
+            _logger.LogError(
+                "Order {OrderId}: CA request {RequestId} returned a certificate whose public key is " +
+                "not the one in the order's CSR, so it is not this order's certificate. It was " +
+                "neither delivered nor revoked. This happens when the install was pointed at " +
+                "another CA while the order was waiting at the old one, whose request {RequestId} " +
+                "may still issue a certificate nothing will collect; deny it there, or revoke what " +
+                "it issues, by hand",
+                order.OrderId, requestId, requestId);
+        else
+            _logger.LogError(
+                "Order {OrderId}: the certificate under CA request {RequestId} could not be checked " +
+                "against the order's CSR ({Reason}): {Message} It was neither delivered nor " +
+                "revoked; it stays live at the CA, so revoke it there by hand if nothing needs it",
+                order.OrderId, requestId, verdict.ReasonCode, verdict.Message);
+
+        var errorJson = JsonSerializer.Serialize(new AcmeError
+        {
+            Type = AcmeErrorType.ServerInternal,
+            Detail = "The certificate the CA returned for this order could not be shown to carry " +
+                     "the CSR's public key, so it was not delivered."
+        });
+        var refused = await _db.AcmeOrders
+            .Where(o => o.Id == order.Id && o.Status == "processing")
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(o => o.Status, "invalid")
+                .SetProperty(o => o.ErrorJson, errorJson),
+                CancellationToken.None);
+        await _db.Entry(order).ReloadAsync(CancellationToken.None);
+
+        if (refused == 0)
+            _logger.LogWarning(
+                "Order {OrderId} had already left processing when the certificate under CA request " +
+                "{RequestId} was refused by the key check (it reads {Status}), so it was left as it stands",
+                order.OrderId, requestId, order.Status);
     }
 
     /// <summary>

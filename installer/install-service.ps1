@@ -65,12 +65,14 @@ sc.exe create $ServiceName `
     depend= ""
 
 sc.exe description $ServiceName "Ducks in a Row ACME-to-ADCS certificate proxy. Provides RFC 8555 ACME protocol access to Active Directory Certificate Services."
-# Recovery actions, for development boxes only. The MSI deliberately does not
-# configure these, and never has: see "If the service stops" in
-# docs/installation.md for the reasoning. Do not read this line as a
-# description of what a production install does. The installation guide once
-# did, and was wrong about the product for as long as it said so (issue #338).
-sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/10000/restart/30000
+# Recovery actions, the same as the MSI's since issue #495 (util:ServiceConfig
+# in Certus.wxs): restart 30 seconds after the first and second failures, no
+# action on the third, and the count forgotten after a day. See "If the service
+# stops" in docs/installation.md for why. The third entry must be an explicit
+# none (the empty action between the two slashes): Windows repeats the last
+# action in the list for every later failure, so a list of two restarts would
+# restart for ever. Test-BuildScripts.ps1 holds this line to the MSI's values.
+sc.exe failure $ServiceName reset= 86400 actions= restart/30000/restart/30000//0
 
 Write-Host ""
 Write-Host "Service installed successfully." -ForegroundColor Green

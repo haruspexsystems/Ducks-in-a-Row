@@ -1,5 +1,6 @@
 using System.Net;
 using Certus.Core.Configuration;
+using Certus.Web.Audit;
 using Certus.Web.Middleware;
 using Microsoft.AspNetCore.Authentication.Negotiate;
 using Microsoft.AspNetCore.Authorization;
@@ -39,7 +40,7 @@ public static class CertusAuthExtensions
         // requires Kestrel, so it must not exist on hosts that disable auth
         // (TestServer included). WebApplication also auto-adds the authentication
         // middleware whenever an authentication scheme is registered, so the
-        // handler runs even when UseCertusAuth skips UseAuthentication — the only
+        // handler runs even when UseCertusAuth skips UseAuthentication, and the only
         // safe way to keep it off TestServer is to not register it. Auth tests
         // (AuthWebApplicationFactory) add their own header-driven scheme instead.
         var registration = configuration.GetSection(AuthOptions.SectionName).Get<AuthOptions>()
@@ -110,7 +111,16 @@ public static class CertusAuthExtensions
             return app;
         }
 
+        // In front of authentication, so it sees the 401 and 403 the two
+        // middlewares below answer with and counts the ones that mean a sign in
+        // was refused (issue #634). Only meaningful with authentication on,
+        // which is why the Disabled branch above never adds it.
+        app.UseMiddleware<AdminSignInFailureMiddleware>();
         app.UseAuthentication();
+
+        // After authentication, before any policy: names the package each sign
+        // in used and, with Auth:RequireKerberos, refuses NTLM (issue #633).
+        app.UseMiddleware<KerberosOnlyMiddleware>();
         app.UseAuthorization();
 
         // CSRF rides on ambient credentials; without authentication there is

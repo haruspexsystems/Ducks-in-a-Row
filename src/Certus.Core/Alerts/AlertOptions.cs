@@ -82,7 +82,8 @@ public sealed class AlertOptions
     /// <summary>
     /// Thresholds in days before expiry that trigger alerts.
     /// An alert fires the first time a certificate crosses each threshold.
-    /// Effective default: 30, 14, 7, 1 days, applied by NormalizeThresholdDays.
+    /// Effective default: 30, 14, 7, 1 days, applied by NormalizeThresholdDays
+    /// whenever the configured list holds no positive value, empty or not.
     ///
     /// The initializer is deliberately empty: the configuration binder appends
     /// bound array elements onto whatever the property already holds, so a
@@ -101,7 +102,8 @@ public sealed class AlertOptions
     /// instead of one that reports zero expiring while the emails go out.
     ///
     /// Enabled is deliberately not consulted. NormalizeThresholdDays guarantees
-    /// a non-empty array, so this is 30 on any default or unconfigured install;
+    /// a non-empty array for every input, including one whose values are all
+    /// zero or negative, so this is 30 on any default or unconfigured install;
     /// an operator who explicitly configured a window keeps it even with
     /// delivery switched off, rather than silently getting 30 back.
     ///
@@ -114,15 +116,30 @@ public sealed class AlertOptions
         ThresholdDays.Length > 0 ? ThresholdDays.Max() : DefaultExpiryWarningDays;
 
     /// <summary>
-    /// Applies the default thresholds when none were configured and cleans up
-    /// whatever was: values must be positive, appear once, and run from the
+    /// Cleans up the configured thresholds and applies the defaults when none
+    /// is usable: values must be positive, appear once, and run from the
     /// largest threshold down (the order the expiry monitor evaluates them in).
+    ///
+    /// The defaults apply when nothing survives that filter, not only when the
+    /// input was empty (issue #465). A hand edited list such as <c>[0]</c> or
+    /// <c>[-1]</c> used to pass a length test on the input and then filter down
+    /// to an empty array. The expiry monitor and the CRL ladder then checked
+    /// no threshold at all and sent nothing, while <see cref="ExpiryWarningDays"/>
+    /// fell back to 30 on its own, so the dashboard kept showing a 30 day window
+    /// that nothing warned about. The dashboard cannot store such a list
+    /// (<c>AlertConfigPolicy</c> refuses it), so this is reached only through
+    /// appsettings.json, a hand edited settings.json, an environment variable
+    /// or the command line.
     /// </summary>
     public void NormalizeThresholdDays()
     {
-        ThresholdDays = ThresholdDays is { Length: > 0 }
-            ? ThresholdDays.Where(d => d > 0).Distinct().OrderByDescending(d => d).ToArray()
-            : [DefaultExpiryWarningDays, 14, 7, 1];
+        var usable = (ThresholdDays ?? [])
+            .Where(d => d > 0)
+            .Distinct()
+            .OrderByDescending(d => d)
+            .ToArray();
+
+        ThresholdDays = usable.Length > 0 ? usable : [DefaultExpiryWarningDays, 14, 7, 1];
     }
 
     /// <summary>

@@ -22,7 +22,8 @@
 .PARAMETER SkipFrontend
     Skip the frontend build (useful if node/npm not installed). Implies
     -SkipSbom, because the npm half of the bill of materials is generated
-    from the node_modules that step installs.
+    from the node_modules that step installs. Refused with -Sign, because the
+    dashboard would then be whatever an earlier build left in wwwroot.
 
 .PARAMETER SkipMsi
     Skip the MSI build (useful if WiX not installed)
@@ -54,7 +55,8 @@
     trees included, whenever a SimplySign session was connected.
 
     Needs a clean git checkout, so every signed binary traces to a commit;
-    the Windows SDK signing tools, for signtool.exe; and a connected
+    npm, so the dashboard is built from that commit too (issue #549); the
+    Windows SDK signing tools, for signtool.exe; and a connected
     SimplySign Desktop session, which is what makes the certificate in
     Cert:\CurrentUser\My usable. The session is connected by hand with a
     phone token and lasts about two hours. The card is pinless, so nothing
@@ -91,6 +93,23 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# A signed build packages the dashboard it builds from the commit it signs
+# (issue #549). wwwroot is gitignored and survives between builds, so
+# -SkipFrontend, or a box with no npm (which step 1 only warns about), would
+# sign whatever an earlier build left there. Both are refused here, before the
+# banner and before anything is cleaned, so a refusal has no side effects at
+# all: the same shape as the dry run switches in release/Publish-Release.ps1.
+if ($Sign -and $SkipFrontend) {
+    Write-Host "ERROR: -Sign cannot be combined with -SkipFrontend." -ForegroundColor Red
+    Write-Host "       A signed build packages the dashboard it builds from this commit, never one an earlier build left in wwwroot." -ForegroundColor Red
+    exit 1
+}
+if ($Sign -and -not (Get-Command npm -ErrorAction SilentlyContinue)) {
+    Write-Host "ERROR: -Sign needs npm, to build the dashboard from this commit, and npm was not found." -ForegroundColor Red
+    Write-Host "       Install Node.js, then run this again." -ForegroundColor Red
+    exit 1
+}
+
 # Captured at script entry. Used by the stale artifact assertion below to
 # decide whether the publish output is genuinely fresh or whether the compile
 # silently no-opped and we are about to package last week's DLLs again.
@@ -99,6 +118,7 @@ $BuildStartUtc = (Get-Date).ToUniversalTime()
 $RepoRoot = $PSScriptRoot
 $FrontendDir = Join-Path $RepoRoot "src/frontend"
 $ServiceProject = Join-Path $RepoRoot "src/Certus.Service/Certus.Service.csproj"
+$ContractProject = Join-Path $RepoRoot "src/Certus.Modules.Abstractions/Certus.Modules.Abstractions.csproj"
 $WwwrootDir = Join-Path $RepoRoot "src/Certus.Web/wwwroot"
 $PublishDir = Join-Path $RepoRoot "artifacts/publish"
 $SbomDir = Join-Path $RepoRoot "artifacts/sbom"
@@ -196,6 +216,17 @@ $SigningExpiryWarningDays = 90
 # A dirty tree stamps "<sha>.dirty" so a developer build never claims to be a
 # clean commit. Releases can never carry it: Publish-Release.ps1 refuses to run
 # on a dirty tree.
+#
+# Issue #623: the same lookup resolves the commit's date (the committer date,
+# as ISO 8601 in UTC) into the Date member, which travels in as
+# /p:CertusCommitDate and lands on every assembly as
+# AssemblyMetadata("CommitDate"). The Settings page shows it beside the version
+# and warns when it is older than Certus:ReleaseAgeWarningDays. It is the
+# commit's date and never the build clock, so two builds of one commit stay
+# byte identical (issue #396). Only git knows it: an explicit -CommitSha and the
+# CERTUS_COMMIT_SHA and GITHUB_SHA fall backs carry no date unless
+# CERTUS_COMMIT_DATE names one, and a build without a date simply shows no
+# release age, which the page is built to cope with.
 function Resolve-CommitSha {
     param(
         [string]$Override,
@@ -211,7 +242,7 @@ function Resolve-CommitSha {
         if ([string]::IsNullOrWhiteSpace($Override)) {
             return $null
         }
-        return [pscustomobject]@{ Sha = $Override.Trim(); Source = "-CommitSha parameter" }
+        return [pscustomobject]@{ Sha = $Override.Trim(); Source = "-CommitSha parameter"; Date = (Get-CommitDateFromEnvironment) }
     }
 
     if (Get-Command git -ErrorAction SilentlyContinue) {
@@ -220,23 +251,85 @@ function Resolve-CommitSha {
         $sha = & git -C $RepoRoot rev-parse HEAD 2>$null
         if ($LASTEXITCODE -eq 0 -and $sha) {
             $sha = $sha.Trim()
+            # %cI is the committer date in strict ISO 8601 with its offset; the
+            # helper rewrites it in UTC so the stamp reads the same from any
+            # build box and carries no "+" the MSBuild command line could misread.
+            $rawDate = & git -C $RepoRoot log -1 --format=%cI HEAD 2>$null
+            $date = if ($LASTEXITCODE -eq 0 -and $rawDate) { ConvertTo-CommitDateStamp -Value $rawDate } else { $null }
             $dirty = & git -C $RepoRoot status --porcelain 2>$null
             if ($LASTEXITCODE -eq 0 -and $dirty) {
-                return [pscustomobject]@{ Sha = "$sha.dirty"; Source = "git HEAD (working tree is dirty)" }
+                return [pscustomobject]@{ Sha = "$sha.dirty"; Source = "git HEAD (working tree is dirty)"; Date = $date }
             }
-            return [pscustomobject]@{ Sha = $sha; Source = "git HEAD" }
+            return [pscustomobject]@{ Sha = $sha; Source = "git HEAD"; Date = $date }
         }
     }
 
     if ($env:CERTUS_COMMIT_SHA) {
-        return [pscustomobject]@{ Sha = $env:CERTUS_COMMIT_SHA; Source = "CERTUS_COMMIT_SHA" }
+        return [pscustomobject]@{ Sha = $env:CERTUS_COMMIT_SHA; Source = "CERTUS_COMMIT_SHA"; Date = (Get-CommitDateFromEnvironment) }
     }
 
     if ($env:GITHUB_SHA) {
-        return [pscustomobject]@{ Sha = $env:GITHUB_SHA; Source = "GITHUB_SHA" }
+        return [pscustomobject]@{ Sha = $env:GITHUB_SHA; Source = "GITHUB_SHA"; Date = (Get-CommitDateFromEnvironment) }
     }
 
     return $null
+}
+
+function ConvertTo-CommitDateStamp {
+    <#
+    .SYNOPSIS
+        Normalises a commit date to the one form the assemblies carry (issue #623).
+    .DESCRIPTION
+        Takes any ISO 8601 date with an offset (git's %cI, or whatever
+        CERTUS_COMMIT_DATE holds) and returns it as an instant in UTC,
+        "yyyy-MM-ddTHH:mm:ssZ". Returns $null for anything that does not parse,
+        so a bad value drops the date rather than failing the build or
+        stamping nonsense. Pure: tests/build/Test-BuildScripts.ps1 lifts it out
+        through the AST and drives it directly.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyString()][string] $Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $parsed = [DateTimeOffset]::MinValue
+    $ok = [DateTimeOffset]::TryParse($Value.Trim(), [cultureinfo]::InvariantCulture,
+        [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)
+    if (-not $ok) { return $null }
+    return $parsed.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [cultureinfo]::InvariantCulture)
+}
+
+function Get-CommitDateFromEnvironment {
+    # The date for a stamp git did not resolve. Nothing validates the sha the
+    # same sources supply, but the date is normalised, because the Settings
+    # page parses it.
+    if ($env:CERTUS_COMMIT_DATE) { return ConvertTo-CommitDateStamp -Value $env:CERTUS_COMMIT_DATE }
+    return $null
+}
+
+function Find-ByteSequence {
+    <#
+    .SYNOPSIS
+        Index of the first occurrence of Needle in Haystack, or -1 (issue #623).
+    .DESCRIPTION
+        A plain forward scan. The haystack is a published assembly of a few
+        megabytes and the needle is a twenty byte date, so nothing cleverer is
+        worth its complexity. Pure, for the same reason as its neighbours.
+    #>
+    [CmdletBinding()]
+    param([byte[]] $Haystack, [byte[]] $Needle)
+
+    if ($null -eq $Needle -or $Needle.Length -eq 0) { return -1 }
+    if ($null -eq $Haystack -or $Haystack.Length -lt $Needle.Length) { return -1 }
+    $last = $Haystack.Length - $Needle.Length
+    for ($i = 0; $i -le $last; $i++) {
+        if ($Haystack[$i] -ne $Needle[0]) { continue }
+        $match = $true
+        for ($j = 1; $j -lt $Needle.Length; $j++) {
+            if ($Haystack[$i + $j] -ne $Needle[$j]) { $match = $false; break }
+        }
+        if ($match) { return $i }
+    }
+    return -1
 }
 
 # ---- Pure helpers (issue #396) ----------------------------------------------
@@ -306,6 +399,223 @@ function Get-ProductVersionInfo {
     }
 }
 
+function Get-ModuleContractInfo {
+    <#
+    .SYNOPSIS
+        The module contract the core carries, read from the contract assembly's
+        own project (issue #495).
+    .DESCRIPTION
+        The MSI writes it as ModuleContractVersion, and the paid module's
+        installer requires the same major. The one source of the contract is the
+        AssemblyVersion pinned in src/Certus.Modules.Abstractions (the test
+        ContractVersionIsPinned holds it), and ModuleHost reads its own contract
+        from that assembly at run time, so the MSI is given the same value
+        rather than a copy that could drift. The caller also checks the
+        published DLL agrees.
+
+        Always major.minor: the MSI's upgrade check compares by a "1." prefix,
+        and a bare major would read as another contract. Never falls back to a
+        literal, the doctrine of Get-ProductVersionInfo above.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string] $CsprojPath)
+
+    $fail = { param($Message) [pscustomobject]@{ Ok = $false; Error = $Message; Version = ''; Major = '' } }
+
+    if (-not (Test-Path -LiteralPath $CsprojPath -PathType Leaf)) {
+        return & $fail "the contract project was not found at $CsprojPath"
+    }
+
+    $project = [xml][System.IO.File]::ReadAllText($CsprojPath, [System.Text.Encoding]::UTF8)
+    $nodes = @($project.SelectNodes('/Project/PropertyGroup/AssemblyVersion'))
+    if ($nodes.Count -ne 1) {
+        return & $fail "expected exactly one AssemblyVersion in $CsprojPath, found $($nodes.Count)"
+    }
+
+    $text = $nodes[0].InnerText.Trim()
+    if ($text -notmatch '^(\d+)\.(\d+)(\.\d+){0,2}$') {
+        return & $fail "AssemblyVersion '$text' in $CsprojPath is not a plain numeric version"
+    }
+
+    [pscustomobject]@{
+        Ok      = $true
+        Error   = ''
+        Version = "$([int]$Matches[1]).$([int]$Matches[2])"
+        Major   = "$([int]$Matches[1])"
+    }
+}
+
+function Get-DesignTimeOnlyPackages {
+    <#
+    .SYNOPSIS
+        The packages the NuGet SBOM lists that only a PrivateAssets="all"
+        reference in a referenced project reaches, so the publish never ships
+        them (issue #434).
+    .DESCRIPTION
+        JSON text in, a list of Name@Version out, so the self test can drive
+        every case without a restore.
+
+        The generator runs with -rs, which reads every referenced project's own
+        assets file, and -ed, which drops a package flagged developmentDependency.
+        Together they list Microsoft.EntityFrameworkCore.Design's whole closure
+        (Microsoft.CodeAnalysis.*, Newtonsoft.Json, System.Composition.*) while
+        dropping the package itself. Its -ef filter is no remedy: measured, it
+        also removes Microsoft.Extensions.Logging and the rest of the family the
+        service runs on, because that filter takes every transitive of a name.
+
+        This reads the restore's own record instead. A direct reference with
+        suppressParent "All" (PrivateAssets="all") in a project OTHER than the
+        root never flows to a consumer, so nothing it reaches ships unless
+        something else reaches it too. Hence the set difference: everything a
+        private root reaches in any graph, minus everything a flowing root
+        reaches in any graph. Microsoft.Extensions.Logging stays, because
+        Microsoft.EntityFrameworkCore reaches it as well. The root's own private
+        references are flowing, because PrivateAssets limits only consumers and
+        the root is what is published.
+
+        Comparing against deps.json alone would not do, and was the other option
+        in the issue: a framework dependent publish leaves out every package the
+        shared framework supplies (System.Formats.Cbor, the Microsoft.Extensions
+        family), so a filter on it would drop packages the product runs on. It is
+        used here the other way round, as a backstop: a package this function
+        would remove that deps.json DOES list is shipped, so the whole answer is
+        refused rather than trusted. Under stating a bill of materials is the
+        failure that matters; over stating one is recoverable.
+
+        Every comparison ignores case, because NuGet package ids do.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string] $RootAssetsJson,
+        [AllowEmptyCollection()][string[]] $ReferencedAssetsJson = @(),
+        [Parameter(Mandatory)][AllowEmptyString()][string] $DepsJson
+    )
+
+    $fail = { param($Message) [pscustomobject]@{ Ok = $false; Error = $Message; Packages = @(); Roots = @() } }
+
+    # Every library a set of start keys reaches in one target graph, the start
+    # keys included. Dependencies are listed by name with a version range, and
+    # a graph resolves each name to exactly one version, so the name index is
+    # what turns a range into the key that was actually restored.
+    $closure = {
+        param($Target, $ByName, [string[]] $Start)
+        $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $pending = [System.Collections.Generic.Queue[string]]::new()
+        foreach ($key in $Start) { $pending.Enqueue($key) }
+        while ($pending.Count -gt 0) {
+            $key = $pending.Dequeue()
+            if (-not $seen.Add($key)) { continue }
+            $library = $Target[$key]
+            if ($library -is [System.Collections.IDictionary] -and $library.Contains('dependencies')) {
+                foreach ($name in @($library['dependencies'].Keys)) {
+                    if ($ByName.ContainsKey($name)) { $pending.Enqueue($ByName[$name]) }
+                }
+            }
+        }
+        # Unrolled, so the caller's foreach sees keys rather than one set.
+        $seen
+    }
+
+    $sources = [System.Collections.Generic.List[object]]::new()
+    $sources.Add([pscustomobject]@{ IsRoot = $true; Json = $RootAssetsJson })
+    foreach ($json in @($ReferencedAssetsJson)) { $sources.Add([pscustomobject]@{ IsRoot = $false; Json = $json }) }
+
+    $documents = [System.Collections.Generic.List[object]]::new()
+    foreach ($source in $sources) {
+        $doc = $null
+        try { $doc = $source.Json | ConvertFrom-Json -AsHashtable } catch { $doc = $null }
+        if ($doc -isnot [System.Collections.IDictionary] -or -not $doc.Contains('targets') -or
+            -not $doc.Contains('project') -or $doc['project'] -isnot [System.Collections.IDictionary]) {
+            return & $fail 'a project.assets.json is not valid JSON or has no targets and project sections.'
+        }
+        $documents.Add([pscustomobject]@{ IsRoot = $source.IsRoot; Doc = $doc })
+    }
+
+    $deps = $null
+    try { $deps = $DepsJson | ConvertFrom-Json -AsHashtable } catch { $deps = $null }
+    if ($deps -isnot [System.Collections.IDictionary] -or -not $deps.Contains('libraries')) {
+        return & $fail 'the published deps.json is not valid JSON or has no libraries section.'
+    }
+
+    $flowing = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $private = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $roots = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($entry in $documents) {
+        $project = $entry.Doc['project']
+        $frameworks = if ($project.Contains('frameworks')) { $project['frameworks'] } else { @{} }
+
+        foreach ($targetName in @($entry.Doc['targets'].Keys)) {
+            $target = $entry.Doc['targets'][$targetName]
+            if ($target -isnot [System.Collections.IDictionary]) { continue }
+
+            $byName = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($key in @($target.Keys)) { $byName["$key".Split('/')[0]] = "$key" }
+
+            # A project library's dependency list in a consumer's graph has
+            # already had its PrivateAssets applied by the restore, so all of
+            # it flows.
+            $flowingStart = @(@($target.Keys) | Where-Object {
+                    $target[$_] -is [System.Collections.IDictionary] -and $target[$_].Contains('type') -and
+                    "$($target[$_]['type'])" -eq 'project' })
+            $privateStart = @()
+
+            # "net10.0/win-x64" is the RID graph of framework "net10.0". A
+            # target whose framework is not found contributes no private root,
+            # which over states rather than under states.
+            $tfm = "$targetName".Split('/')[0]
+            $direct = if ($frameworks.Contains($tfm) -and $frameworks[$tfm].Contains('dependencies')) {
+                $frameworks[$tfm]['dependencies'] } else { @{} }
+            foreach ($name in @($direct.Keys)) {
+                # Absent from the graph means pruned as part of the shared
+                # framework, which is not this function's question.
+                if (-not $byName.ContainsKey($name)) { continue }
+                $spec = $direct[$name]
+                # Only "All" stops a reference flowing. Anything less still lets
+                # some asset through, so it counts as flowing.
+                $suppress = if ($spec -is [System.Collections.IDictionary] -and $spec.Contains('suppressParent')) {
+                    @("$($spec['suppressParent'])".Split(',') | ForEach-Object { $_.Trim() }) } else { @() }
+                if (-not $entry.IsRoot -and ($suppress -contains 'All')) {
+                    $privateStart += $byName[$name]
+                    [void]$roots.Add($name)
+                } else {
+                    $flowingStart += $byName[$name]
+                }
+            }
+
+            foreach ($key in (& $closure $target $byName $flowingStart)) { [void]$flowing.Add($key) }
+            foreach ($key in (& $closure $target $byName $privateStart)) { [void]$private.Add($key) }
+        }
+    }
+
+    $designOnly = [System.Collections.Generic.List[string]]::new()
+    foreach ($key in $private) {
+        if (-not $flowing.Contains($key)) { $designOnly.Add($key) }
+    }
+
+    # The backstop described above. deps.json keys are Name/Version too.
+    $shipped = [System.Collections.Generic.HashSet[string]]::new([string[]]@($deps['libraries'].Keys), [System.StringComparer]::OrdinalIgnoreCase)
+    $contradicted = @($designOnly | Where-Object { $shipped.Contains($_) })
+    if ($contradicted.Count -gt 0) {
+        return & $fail ("the publish ships $($contradicted -join ', '), which the restore graphs say only a " +
+            'PrivateAssets="all" reference reaches. Refusing to drop a package the product ships.')
+    }
+
+    # Sorted after the rewrite to Name@Version, not before: '/' sorts before a
+    # digit and '@' after one, so Lib/1 and Lib2/1 would come out the other way.
+    $packages = [System.Collections.Generic.List[string]]::new()
+    foreach ($key in $designOnly) { $packages.Add($key.Replace('/', '@')) }
+    $packages.Sort([System.StringComparer]::Ordinal)
+    $rootList = [System.Collections.Generic.List[string]]::new([string[]]@($roots))
+    $rootList.Sort([System.StringComparer]::Ordinal)
+    [pscustomobject]@{
+        Ok       = $true
+        Error    = ''
+        Packages = @($packages)
+        Roots    = @($rootList)
+    }
+}
+
 function Merge-CycloneDxBom {
     <#
     .SYNOPSIS
@@ -358,13 +668,14 @@ function Merge-CycloneDxBom {
         [Parameter(Mandatory)][string] $ProductVersion,
         [string] $SpecVersion = '1.6',
         [string] $CommitSha = '',
-        [object[]] $ExtraComponents = @()
+        [object[]] $ExtraComponents = @(),
+        [AllowEmptyCollection()][string[]] $ExcludeNugetPackages = @()
     )
 
     function New-MergeFailure {
         param([string] $Message)
         [pscustomobject]@{ Ok = $false; Error = $Message; Json = ''
-            NugetCount = 0; NpmCount = 0; ComponentCount = 0 }
+            NugetCount = 0; NpmCount = 0; ComponentCount = 0; ExcludedCount = 0 }
     }
 
     function Sort-OrdinalByKey {
@@ -432,6 +743,17 @@ function Merge-CycloneDxBom {
         $docs[$half.Name] = $doc
     }
 
+    # Name@Version entries from Get-DesignTimeOnlyPackages (issue #434), only in
+    # the NuGet half, ignoring case because NuGet ids do. Matched on the purl OR
+    # on the name and version fields, so a generator that starts encoding or
+    # qualifying its purls cannot quietly bring the packages back. A dropped
+    # component takes its own dependency entry and every edge to it, so the
+    # document never points at a ref it no longer carries.
+    $excluded = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($package in @($ExcludeNugetPackages)) { if ($package) { [void]$excluded.Add($package) } }
+    $droppedRefs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $droppedCount = 0
+
     $components = @()
     $dependencies = @()
     $subRoots = @()
@@ -447,6 +769,18 @@ function Merge-CycloneDxBom {
         }
         if ($doc.Contains('components')) {
             foreach ($component in @($doc['components'])) {
+                if ($half.Name -eq 'NuGet' -and $excluded.Count -gt 0) {
+                    $purl = if ($component.Contains('purl')) { "$($component['purl'])" } else { '' }
+                    $byPurl = $purl.StartsWith($half.PurlPrefix, [StringComparison]::OrdinalIgnoreCase) -and
+                        $excluded.Contains($purl.Substring($half.PurlPrefix.Length))
+                    $byName = $component.Contains('name') -and $component.Contains('version') -and
+                        $excluded.Contains("$($component['name'])@$($component['version'])")
+                    if ($byPurl -or $byName) {
+                        if ($component.Contains('bom-ref')) { [void]$droppedRefs.Add("$($component['bom-ref'])") }
+                        $droppedCount++
+                        continue
+                    }
+                }
                 $components += , $component
                 if ($component.Contains('purl') -and
                     "$($component['purl'])".StartsWith($half.PurlPrefix, [StringComparison]::Ordinal)) {
@@ -525,12 +859,15 @@ function Merge-CycloneDxBom {
     }
 
     $dependencies = @( , ([ordered]@{ ref = $productRef; dependsOn = @($subRoots) }) ) + $dependencies
+    $dependencies = @($dependencies | Where-Object { -not $droppedRefs.Contains("$($_['ref'])") })
     $dependencies = @($dependencies | ForEach-Object {
             # A List I own, so Sort really is in place; see Sort-OrdinalByKey
             # on why [System.Array]::Sort is not trustworthy through parameter
             # binding here.
             $on = [System.Collections.Generic.List[string]]@(
-                if ($_.Contains('dependsOn')) { $_['dependsOn'] } else { @() })
+                if ($_.Contains('dependsOn')) {
+                    @($_['dependsOn']) | Where-Object { -not $droppedRefs.Contains("$_") }
+                } else { @() })
             $on.Sort([System.StringComparer]::Ordinal)
             [ordered]@{ ref = "$($_['ref'])"; dependsOn = @($on) }
         })
@@ -558,7 +895,76 @@ function Merge-CycloneDxBom {
         NugetCount     = $counts['NuGet']
         NpmCount       = $counts['npm']
         ComponentCount = $components.Count
+        ExcludedCount  = $droppedCount
     }
+}
+
+# ---- Dashboard build (issue #549) -------------------------------------------
+# Impure, because it runs npm and writes wwwroot, but every path and the npm
+# command are parameters, so the self test drives it against a fixture
+# directory with a stand in for npm.
+
+function Invoke-FrontendBuild {
+    <#
+    .SYNOPSIS
+        Builds the dashboard into an empty wwwroot, and says whether it worked.
+    .DESCRIPTION
+        wwwroot is emptied first. It is gitignored, step 0 cleans only bin and
+        obj, and whatever is left in it is what the publish copies into the
+        MSI. Before issue #549 nothing emptied it and neither npm exit code was
+        read, so a failed build left the previous build's dashboard in place
+        and the index.html check passed on it. "npm run build" is
+        "tsc -b && vite build", so a type error stops it before vite runs, and
+        vite's own emptyOutDir never fires. A -Sign build then signed an
+        installer whose dashboard came from another commit.
+
+        Each half covers what the other misses. The exit codes alone would
+        trust a build that exits 0 having left the old files in place;
+        emptying alone would trust a build that writes index.html and then
+        fails. The index.html check stays for a build that exits 0 and writes
+        nothing.
+
+        npm's output goes to the host rather than the pipeline, so the result
+        object is the only thing this returns. $Npm is 'npm' in production,
+        which resolves to npm.ps1 on the release box and runs in process; the
+        self test passes both a script and a batch file in its place.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $FrontendDir,
+        [Parameter(Mandatory)][string] $WwwrootDir,
+        [string] $Npm = 'npm'
+    )
+
+    # NOTE: deliberately no -ErrorAction SilentlyContinue, for the reason the
+    # bin/obj clean gives: a file that cannot be deleted must stop the build,
+    # not stay behind to be packaged.
+    if (Test-Path -LiteralPath $WwwrootDir) { Remove-Item -LiteralPath $WwwrootDir -Recurse -Force }
+
+    # Literal arguments only. npm.ps1 (npm 11.17 on Node 24, measured on
+    # 2026-10-13) does not take its arguments from $args: it reparses the text
+    # of the statement that called it and evaluates every word after the first
+    # again, in its own scope, so a variable here would arrive empty. On
+    # PowerShell 7.6.6 that statement is the command alone, without the pipe
+    # to Out-Host, which is why the pipe is safe.
+    Push-Location -LiteralPath $FrontendDir
+    try {
+        & $Npm ci --silent | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            return [pscustomobject]@{ Ok = $false; Error = "npm ci failed (exit $LASTEXITCODE)." }
+        }
+        & $Npm run build | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            return [pscustomobject]@{ Ok = $false; Error = "npm run build failed (exit $LASTEXITCODE)." }
+        }
+    } finally {
+        Pop-Location
+    }
+
+    if (-not (Test-Path -LiteralPath (Join-Path $WwwrootDir 'index.html') -PathType Leaf)) {
+        return [pscustomobject]@{ Ok = $false; Error = 'npm run build exited 0 but did not produce wwwroot/index.html.' }
+    }
+    [pscustomobject]@{ Ok = $true; Error = '' }
 }
 
 # ---- Code signing helpers (issue #337) --------------------------------------
@@ -1271,21 +1677,13 @@ if (-not $SkipFrontend) {
         Write-Host "  npm not found — skipping frontend build" -ForegroundColor DarkYellow
         Write-Host "  Install Node.js and run 'npm install' in src/frontend first" -ForegroundColor DarkYellow
     } else {
-        Push-Location $FrontendDir
-        try {
-            npm ci --silent
-            npm run build
-
-            # Validate that the build produced output
-            $indexHtml = Join-Path $WwwrootDir "index.html"
-            if (-not (Test-Path $indexHtml)) {
-                Write-Host "  ERROR: npm run build did not produce wwwroot/index.html" -ForegroundColor Red
-                exit 1
-            }
-            Write-Host "  Frontend built → $WwwrootDir" -ForegroundColor Green
-        } finally {
-            Pop-Location
+        $frontend = Invoke-FrontendBuild -FrontendDir $FrontendDir -WwwrootDir $WwwrootDir
+        if (-not $frontend.Ok) {
+            Write-Host "  ERROR: $($frontend.Error)" -ForegroundColor Red
+            Write-Host "         wwwroot was emptied first, so no earlier build's dashboard can be packaged in its place." -ForegroundColor Red
+            exit 1
         }
+        Write-Host "  Frontend built → $WwwrootDir" -ForegroundColor Green
     }
 } else {
     Write-Host "[1/6] Skipping frontend build (--SkipFrontend)" -ForegroundColor DarkGray
@@ -1330,6 +1728,12 @@ $publishArgs = @(
 )
 if ($commitStamp) {
     $publishArgs += "/p:SourceRevisionId=$($commitStamp.Sha)"
+    # Issue #623: the commit's date, as AssemblyMetadata("CommitDate") through
+    # Directory.Build.props. Absent when nothing resolved one, which the
+    # Settings page reads as "no release age".
+    if ($commitStamp.Date) {
+        $publishArgs += "/p:CertusCommitDate=$($commitStamp.Date)"
+    }
 }
 
 dotnet publish $ServiceProject @publishArgs
@@ -1410,8 +1814,31 @@ if ($commitStamp) {
             exit 1
         }
         Write-Host "    $name ProductVersion: $productVersion" -ForegroundColor Gray
+        # Issue #623: the commit date lands in the assembly's blob heap as the
+        # UTF-8 value of AssemblyMetadata("CommitDate"). A byte search is a
+        # crude witness but the right one here: it needs no assembly load (which
+        # would pin the file the harvest is about to read) and it fails exactly
+        # when the ItemGroup in Directory.Build.props stops producing the
+        # attribute, which is the regression this guards against.
+        if ($commitStamp.Date) {
+            $dllBytes = [System.IO.File]::ReadAllBytes($stampedDll)
+            $dateBytes = [System.Text.Encoding]::UTF8.GetBytes([string]$commitStamp.Date)
+            if ((Find-ByteSequence -Haystack $dllBytes -Needle $dateBytes) -lt 0) {
+                Write-Host "  ERROR: $name carries no commit date (issue #623)." -ForegroundColor Red
+                Write-Host "         Expected AssemblyMetadata('CommitDate') = $($commitStamp.Date)" -ForegroundColor Red
+                Write-Host "         CertusCommitDate did not reach the compiler. Check the" -ForegroundColor Red
+                Write-Host "         AssemblyMetadata item in Directory.Build.props." -ForegroundColor Red
+                exit 1
+            }
+            Write-Host "    $name CommitDate: $($commitStamp.Date)" -ForegroundColor Gray
+        }
     }
     Write-Host "  Commit stamp verified" -ForegroundColor Green
+    if (-not $commitStamp.Date) {
+        Write-Host "  WARNING: the stamp carries no commit date, so the Settings page" -ForegroundColor Yellow
+        Write-Host "           shows no release age (issue #623). Build from a git" -ForegroundColor Yellow
+        Write-Host "           checkout or set CERTUS_COMMIT_DATE to stamp one." -ForegroundColor Yellow
+    }
 } else {
     Write-Host "  WARNING: no commit resolved, so the published binaries carry no" -ForegroundColor Yellow
     Write-Host "           commit stamp and the #112 check is skipped. Expected when" -ForegroundColor Yellow
@@ -1533,14 +1960,15 @@ if (-not $SkipSbom) {
     #       Do not take the hint.
     # -ed   drop packages flagged developmentDependency, which is what takes
     #       Microsoft.EntityFrameworkCore.Design out of a runtime bill. It does
-    #       not take that package's own transitive closure with it, so roughly
-    #       fifteen design time packages (Microsoft.CodeAnalysis.*, Newtonsoft.Json,
-    #       System.Composition.*) are listed here but are not in the product.
+    #       not take that package's own transitive closure with it, so eighteen
+    #       design time packages (Microsoft.CodeAnalysis.*, Newtonsoft.Json,
+    #       System.Composition.*) are left in this file. The merge below drops
+    #       them, from the list Get-DesignTimeOnlyPackages computes (issue #434).
     #       The tool's -ef filter would remove them AND their transitives, which
     #       sounds right and is not: measured, it also removes
     #       Microsoft.Extensions.Logging, .Options and .DependencyInjection,
     #       which the service is built on. Over-stating a bill of materials is
-    #       recoverable; under-stating one is the failure that matters, so the
+    #       recoverable; under-stating one is the failure that matters, so that
     #       filter is deliberately absent.
     # -t    exclude test projects.
     # -rt   the same RID the publish used, so the graph is the one that shipped.
@@ -1556,6 +1984,65 @@ if (-not $SkipSbom) {
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $NugetBomPath)) {
         Write-Host "  ERROR: the NuGet SBOM was not generated." -ForegroundColor Red
         exit 1
+    }
+
+    # Issue #434: what -ed leaves behind. The same assets files -rs read, found
+    # the same way, by following each project's own record of its references;
+    # see Get-DesignTimeOnlyPackages on why the published deps.json is the
+    # check rather than the filter.
+    $ReferencedAssetsJson = [System.Collections.Generic.List[string]]::new()
+    $seenAssets = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $pendingAssets = [System.Collections.Generic.Queue[string]]::new()
+    $pendingAssets.Enqueue([System.IO.Path]::GetFullPath($ServiceAssets))
+    $RootAssetsJson = $null
+    while ($pendingAssets.Count -gt 0) {
+        $assetsPath = $pendingAssets.Dequeue()
+        if (-not $seenAssets.Add($assetsPath)) { continue }
+        if (-not (Test-Path -LiteralPath $assetsPath -PathType Leaf)) {
+            Write-Host "  ERROR: $assetsPath is missing, so the design time packages cannot be told apart." -ForegroundColor Red
+            exit 1
+        }
+        $assetsJson = [System.IO.File]::ReadAllText($assetsPath, [System.Text.Encoding]::UTF8)
+        if ($null -eq $RootAssetsJson) { $RootAssetsJson = $assetsJson } else { $ReferencedAssetsJson.Add($assetsJson) }
+        $assetsDoc = $null
+        try { $assetsDoc = $assetsJson | ConvertFrom-Json -AsHashtable } catch { $assetsDoc = $null }
+        $restore = if ($assetsDoc -is [System.Collections.IDictionary] -and $assetsDoc.Contains('project') -and
+            $assetsDoc['project'] -is [System.Collections.IDictionary] -and $assetsDoc['project'].Contains('restore')) {
+            $assetsDoc['project']['restore'] } else { $null }
+        if ($restore -isnot [System.Collections.IDictionary]) {
+            Write-Host "  ERROR: $assetsPath is not valid JSON or has no project.restore section." -ForegroundColor Red
+            exit 1
+        }
+        if (-not $restore.Contains('frameworks')) { continue }
+        foreach ($framework in @($restore['frameworks'].Values)) {
+            if (-not $framework.Contains('projectReferences')) { continue }
+            # obj/ beside each project is where the generator looks too: its
+            # -biop is "required if folder 'obj' is relocated". Relocate it and
+            # both need the change. Step 0 cleans obj, so a file found here is
+            # from this build's restore and never a stale one.
+            foreach ($reference in @($framework['projectReferences'].Values)) {
+                $pendingAssets.Enqueue([System.IO.Path]::GetFullPath(
+                    (Join-Path (Split-Path -Parent $reference['projectPath']) 'obj/project.assets.json')))
+            }
+        }
+    }
+    $ServiceDepsPath = Join-Path $PublishDir "DucksInARow.Service.deps.json"
+    if (-not (Test-Path -LiteralPath $ServiceDepsPath -PathType Leaf)) {
+        Write-Host "  ERROR: $ServiceDepsPath is missing; the publish above should have written it." -ForegroundColor Red
+        exit 1
+    }
+    $designTime = Get-DesignTimeOnlyPackages -RootAssetsJson $RootAssetsJson `
+        -ReferencedAssetsJson @($ReferencedAssetsJson) `
+        -DepsJson ([System.IO.File]::ReadAllText($ServiceDepsPath, [System.Text.Encoding]::UTF8))
+    if (-not $designTime.Ok) {
+        Write-Host "  ERROR: $($designTime.Error)" -ForegroundColor Red
+        exit 1
+    }
+    # Names only. The count that matters is the merge's below: -ed has already
+    # taken the private roots themselves out, so the list is longer than what
+    # the BOM carried.
+    if (@($designTime.Roots).Count -gt 0) {
+        Write-Host "  Leaving out what only $(@($designTime.Roots) -join ', ') reaches" -ForegroundColor Gray
     }
 
     # Step 1 above only WARNS when npm is missing, and leaves $SkipFrontend
@@ -1627,7 +2114,8 @@ if (-not $SkipSbom) {
         -ProductVersion $ProductSemVer `
         -SpecVersion '1.6' `
         -CommitSha $(if ($commitStamp) { $commitStamp.Sha } else { '' }) `
-        -ExtraComponents @($HostingBundleComponent)
+        -ExtraComponents @($HostingBundleComponent) `
+        -ExcludeNugetPackages @($designTime.Packages)
     if (-not $mergedBom.Ok) {
         Write-Host "  ERROR: the SBOM merge failed: $($mergedBom.Error)" -ForegroundColor Red
         exit 1
@@ -1635,7 +2123,7 @@ if (-not $SkipSbom) {
 
     [System.IO.File]::WriteAllText($MergedBomPath, $mergedBom.Json, [System.Text.UTF8Encoding]::new($false))
     Write-Host "  SBOM → $MergedBomPath" -ForegroundColor Green
-    Write-Host "    $($mergedBom.ComponentCount) components: $($mergedBom.NugetCount) NuGet, $($mergedBom.NpmCount) npm, 1 declared" -ForegroundColor Gray
+    Write-Host "    $($mergedBom.ComponentCount) components: $($mergedBom.NugetCount) NuGet, $($mergedBom.NpmCount) npm, 1 declared ($($mergedBom.ExcludedCount) design time NuGet left out)" -ForegroundColor Gray
 } else {
     Write-Host ""
     Write-Host "[3/6] Skipping SBOM generation (--SkipSbom)" -ForegroundColor DarkGray
@@ -1802,6 +2290,18 @@ if (-not $SkipMsi) {
             exit 1
         }
 
+        # Hard guard: nothing in the publish output may sit under a top level
+        # modules folder (issue #495). Certus.wxs owns that folder, empty and
+        # protected, for the paid module's installer, and the module host reads
+        # whatever is in it as a module. A package or project that ever dropped
+        # a modules folder into the publish output would have the product
+        # install its own files there.
+        $modulesEntries = $xmlLines -match '<Directory Id="Dir_modules"'
+        if ($modulesEntries) {
+            Write-Host "  ERROR: the publish output carries a top level modules folder, which Certus.wxs reserves for the paid module (issue #495)." -ForegroundColor Red
+            exit 1
+        }
+
         $xmlLines | Out-File -FilePath $HarvestWxs -Encoding UTF8
         Write-Host "  Generated $fileCount file entries ($($subdirs.Count) directories)" -ForegroundColor Gray
 
@@ -1813,7 +2313,32 @@ if (-not $SkipMsi) {
         # $ProductSemVer: a prerelease suffix is not a legal MSI version.
         Write-Host "  MSI ProductVersion: $MsiProductVersion" -ForegroundColor Gray
 
-        wix build $WxsFile $UiWxsFile $HarvestWxs -d "ProductVersion=$MsiProductVersion" -o $MsiOutput -bindpath $PublishDir -bindpath $BrandingDir -ext WixToolset.Firewall.wixext -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext -arch x64
+        # The module contract the MSI records (issue #495), from the contract
+        # assembly's own project. Read here, inside the MSI branch, rather than
+        # at the top beside the product version: -SkipMsi never needs it, and
+        # the -Sign refusal tests run this script in a fixture holding only
+        # build.ps1 and Directory.Build.props. Then the published DLL must say
+        # the same, because that DLL is what ModuleHost reads its contract
+        # from, so the registry value and the running service cannot disagree.
+        $contractInfo = Get-ModuleContractInfo -CsprojPath $ContractProject
+        if (-not $contractInfo.Ok) {
+            Write-Host "  ERROR: $($contractInfo.Error)" -ForegroundColor Red
+            exit 1
+        }
+        try {
+            $publishedContract = [System.Reflection.AssemblyName]::GetAssemblyName((Join-Path $PublishDir 'Certus.Modules.Abstractions.dll')).Version
+        } catch {
+            Write-Host "  ERROR: the published Certus.Modules.Abstractions.dll could not be read ($($_.Exception.Message))." -ForegroundColor Red
+            if (Test-Path $HarvestWxs) { Remove-Item $HarvestWxs -Force }
+            exit 1
+        }
+        if ("$($publishedContract.Major).$($publishedContract.Minor)" -ne $contractInfo.Version) {
+            Write-Host "  ERROR: the published Certus.Modules.Abstractions.dll carries contract $publishedContract, but its project says $($contractInfo.Version)." -ForegroundColor Red
+            exit 1
+        }
+        Write-Host "  Module contract: $($contractInfo.Version)" -ForegroundColor Gray
+
+        wix build $WxsFile $UiWxsFile $HarvestWxs -d "ProductVersion=$MsiProductVersion" -d "ModuleContractVersion=$($contractInfo.Version)" -d "ModuleContractMajor=$($contractInfo.Major)" -o $MsiOutput -bindpath $PublishDir -bindpath $BrandingDir -ext WixToolset.Firewall.wixext -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext -arch x64
 
         if ($LASTEXITCODE -ne 0) {
             Write-Host "  MSI build failed!" -ForegroundColor Red

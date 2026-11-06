@@ -498,8 +498,9 @@ public sealed class EabCredentialService
     /// Parses a stored namespace column. The column is only ever written by
     /// this service from a normalized list, so an unparseable value means the
     /// database was edited by hand; treat it as no extra restriction and say
-    /// so loudly, the fail open stance AllowedDomainsPolicy takes for
-    /// unusable hand edited state.
+    /// so loudly. The global allowed domain list stays the ceiling either
+    /// way, and that list fails closed on hand edited state (issue #630), so
+    /// a broken namespace column can never widen issuance past it.
     /// </summary>
     private IReadOnlyList<string> ParseNamespaces(string namespacesJson, string credentialLabel)
     {

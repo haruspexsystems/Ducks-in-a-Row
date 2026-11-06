@@ -8,10 +8,11 @@ using Microsoft.Extensions.Options;
 namespace Certus.Core.Tests.Acme;
 
 /// <summary>
-/// Tests for AllowedDomainsPolicy. A missing wizard status file, the enabled
-/// flag off, or an enabled flag with no usable entries all mean no
-/// restriction; an enabled non empty list restricts orders to the listed
-/// domains and their subdomains, matched on label boundaries after
+/// Tests for AllowedDomainsPolicy. A missing wizard status file or the enabled
+/// flag off means no restriction; an enabled flag with no usable entries, and
+/// a file that cannot be read before the first good load, refuse every
+/// identifier (issue #630); an enabled non empty list restricts orders to the
+/// listed domains and their subdomains, matched on label boundaries after
 /// normalization to lowercase punycode A labels.
 /// </summary>
 public class AllowedDomainsPolicyTests : IDisposable
@@ -80,22 +81,85 @@ public class AllowedDomainsPolicyTests : IDisposable
         sut.FindDisallowed(Identifiers("anything.example.com")).Should().BeEmpty();
     }
 
+    // ---- Closed states: the operator asked for a restriction (issue #630) ----
+
     [Fact]
-    public void FindDisallowed_EnabledWithEmptyList_FailsOpen()
+    public void FindDisallowed_EnabledWithEmptyList_RefusesEverything()
     {
         // Only reachable by hand editing the file; the API refuses to save
-        // this state. Fail open rather than refusing every order.
+        // this state. The restriction is on, so refuse every order until the
+        // list is fixed rather than issue for any name.
         WriteStatus(enabled: true);
         var sut = BuildPolicy();
 
-        sut.FindDisallowed(Identifiers("anything.example.com")).Should().BeEmpty();
+        sut.FindDisallowed(Identifiers("anything.example.com", "other.example"))
+            .Should().Equal("anything.example.com", "other.example");
     }
 
     [Fact]
-    public void FindDisallowed_EnabledWithOnlyUnusableEntries_FailsOpen()
+    public void FindDisallowed_EnabledWithOnlyUnusableEntries_RefusesEverything()
     {
         WriteStatus(enabled: true, "*.home.local", "https://home.local", "1.2.3.4");
         var sut = BuildPolicy();
+
+        sut.FindDisallowed(Identifiers("anything.example.com"))
+            .Should().ContainSingle().Which.Should().Be("anything.example.com");
+    }
+
+    [Fact]
+    public void FindDisallowed_EmptyListFixedByAnEdit_RestrictsToTheNewEntry()
+    {
+        // The recovery path the error message names: add an entry. The
+        // closed answer must not be cached past the file's next write.
+        WriteStatus(enabled: true);
+        var sut = BuildPolicy();
+        sut.FindDisallowed(Identifiers("web.home.local")).Should().NotBeEmpty();
+
+        WriteStatus(enabled: true, "home.local");
+        var path = SetupStatus.GetStatusPath(_options);
+        File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddSeconds(1));
+
+        sut.FindDisallowed(Identifiers("web.home.local")).Should().BeEmpty();
+        sut.FindDisallowed(Identifiers("web.other.local")).Should().NotBeEmpty();
+    }
+
+    [Fact]
+    public void FindDisallowed_UnreadableBeforeFirstGoodLoad_RefusesEverything_ThenRecovers()
+    {
+        // A corrupt file at the first order: whether the restriction is on
+        // is unknown, so the policy refuses rather than guesses open. The
+        // file is overwritten in place so it keeps the owner and ACL the
+        // trusted file check accepts; only the JSON is broken.
+        WriteStatus(enabled: true, "home.local");
+        var path = SetupStatus.GetStatusPath(_options);
+        File.WriteAllText(path, "{ this is not json");
+        var sut = BuildPolicy();
+
+        sut.FindDisallowed(Identifiers("web.home.local"))
+            .Should().ContainSingle().Which.Should().Be("web.home.local");
+
+        // Nothing was cached against the broken file: once it is fixed the
+        // next order loads the list and enforces it as usual.
+        WriteStatus(enabled: true, "home.local");
+        File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddSeconds(1));
+
+        sut.FindDisallowed(Identifiers("web.home.local")).Should().BeEmpty();
+        sut.FindDisallowed(Identifiers("web.other.local")).Should().NotBeEmpty();
+    }
+
+    [Fact]
+    public void FindDisallowed_UnreadableAfterRestrictionOffWasLoaded_KeepsOff()
+    {
+        // Only the "never had a good load" case fails closed. A good load
+        // that read the restriction as off is a known state, and a transient
+        // read failure afterwards keeps it, like any other last known list.
+        WriteStatus(enabled: false);
+        var sut = BuildPolicy();
+        sut.FindDisallowed(Identifiers("anything.example.com")).Should().BeEmpty();
+
+        var path = SetupStatus.GetStatusPath(_options);
+        File.WriteAllText(path, "{ this is not json");
+        File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddSeconds(1));
 
         sut.FindDisallowed(Identifiers("anything.example.com")).Should().BeEmpty();
     }

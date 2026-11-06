@@ -131,6 +131,26 @@ public class AppleAttestationVerifierTests : IDisposable
     }
 
     [Fact]
+    public async Task Verify_MissingIntermediate_NeverFetchesTheIssuerTheLeafNames()
+    {
+        // The client leaves the intermediate out of x5c and names a download
+        // address for it in the leaf. Chain building must not follow that
+        // address: the service would be connecting where the client chose.
+        await using var listener = new AiaDownloadListener();
+        using var intermediate = SyntheticAttestationBuilder.CreateIntermediate(_root);
+        using var leaf = SyntheticAttestationBuilder.CreateLeaf(
+            intermediate, Serial, Udid, SyntheticAttestationBuilder.NonceFor(Token),
+            caIssuersUrl: listener.Url);
+        var attObj = SyntheticAttestationBuilder.BuildAttestationObject("apple", new[] { leaf });
+
+        var result = await _sut.VerifyAsync(Context(attObj, Serial));
+
+        result.IsValid.Should().BeFalse();
+        result.ErrorDetail.Should().Contain("not trusted").And.Contain("PartialChain");
+        listener.Connections.Should().Be(0, "the chain must not download the issuer the leaf names");
+    }
+
+    [Fact]
     public async Task Verify_ExpiredLeaf_Fails()
     {
         using var leaf = SyntheticAttestationBuilder.CreateLeaf(

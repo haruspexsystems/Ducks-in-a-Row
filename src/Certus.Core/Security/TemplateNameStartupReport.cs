@@ -1,5 +1,6 @@
 using Certus.Core.Acme.Services;
 using Certus.Core.Adcs;
+using Certus.Core.Configuration;
 using Microsoft.Extensions.Logging;
 
 namespace Certus.Core.Security;
@@ -44,14 +45,22 @@ public static class TemplateNameStartupReport
     /// <summary>
     /// Logs one warning when a template exposed over ACME carries a refused
     /// character in either of its names or in its OID, and nothing at all
-    /// otherwise.
+    /// otherwise. In monitor mode no template is exposed over ACME, so it says
+    /// nothing and makes no CA call (issue #532).
     /// </summary>
     public static async Task LogAsync(
         TemplateService templates,
         EnabledTemplatesPolicy enabledTemplates,
+        CertusInstanceMode instanceMode,
         ILogger logger,
         CancellationToken cancellationToken = default)
     {
+        if (instanceMode.IsMonitor)
+        {
+            logger.LogDebug("Template name check skipped: monitor mode exposes no template over ACME");
+            return;
+        }
+
         try
         {
             var published = await templates.GetTemplatesAsync(cancellationToken);

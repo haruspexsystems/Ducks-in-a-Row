@@ -144,7 +144,9 @@ soon as Test Connection passes, and the Review step checks everything again,
 with one row for each template you chose. The **Service rights on the CA** card
 on the Settings page runs the same check against the configured CA and the
 templates enabled for ACME. **Check again** reruns it, for when a right has been
-granted or taken away since.
+granted or taken away since. A right granted through a group shows only after
+this server's Kerberos tickets renew; see
+[granting to a group](ad-and-ca-team-request.md#granting-to-a-group).
 
 ![The Service rights on the CA card on the Settings page, showing a simulated report from the demo CA](images/settings-service-rights.png)
 
@@ -166,11 +168,15 @@ How each right is established:
   not.
 - **Issue and Manage Certificates** is reported by the CA, which reports the
   roles of any account holding Read or more. Only revocation needs this right,
-  so its row is marked optional.
+  the automatic revocation at finalize included, so its row is marked optional.
 - **Enroll on a template** is read from the template's permissions, in the order
   Windows evaluates them. It stays Inferred until something enrols from that
   template, because the CA's policy module decides with a token that can carry
   groups this server cannot see.
+
+For a row that reads Failed,
+[what to ask your AD and CA team](ad-and-ca-team-request.md#what-to-ask-for) says
+who usually grants each right and where.
 
 In the wizard, only the HTTPS certificate on the External URL step proves Enroll.
 It proves Request Certificates and Enroll on the template it uses. The wizard

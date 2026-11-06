@@ -165,7 +165,8 @@ MDM cannot present an HMAC key id.
 
 This has a concrete consequence: if EAB enforcement is set to **Required**, Apple
 devices cannot register an account and cannot enrol at all. That is expected, not
-a bug. The device attestation allowlist, not EAB, is the gate for device orders.
+a bug. A new install starts at Required, so lower it to Optional on the ACME page
+before you turn device attestation on. The device attestation allowlist, not EAB, is the gate for device orders.
 The mode applies to the whole server rather than to one template, so putting
 devices on a template of their own does not help: keep EAB at Off or Optional
 wherever device attestation is in use. An account a device registered before

@@ -48,6 +48,17 @@ public sealed class AuthOptions
     /// </summary>
     public string[] TrustedProxies { get; set; } = [];
 
+    /// <summary>
+    /// Refuse a dashboard sign in that used NTLM, so only Kerberos is accepted
+    /// (issue #633, CRA risk R06). Off by default: Kerberos needs an HTTP service
+    /// principal name for the address the browser uses, which the operator
+    /// registers, and the service cannot yet tell them whether it exists. The
+    /// refusal is a 401 problem document; the package every sign in used is
+    /// logged whether or not this is on, so an operator can check before
+    /// turning it on.
+    /// </summary>
+    public bool RequireKerberos { get; set; }
+
     /// <summary>True when authentication is disabled (development escape hatch).</summary>
     public bool IsDisabled =>
         string.Equals(Mode, ModeDisabled, StringComparison.OrdinalIgnoreCase);

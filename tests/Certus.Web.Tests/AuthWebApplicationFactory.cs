@@ -11,7 +11,7 @@ namespace Certus.Web.Tests;
 
 /// <summary>
 /// Factory for authentication integration tests: runs with the full auth stack
-/// enabled (Auth:Mode=Negotiate wiring — a fallback policy that denies by default,
+/// enabled (Auth:Mode=Negotiate wiring: a fallback policy that denies by default,
 /// admin group requirement, CSRF header guard, anonymous carve-outs) but with
 /// the Negotiate handler replaced by a header-driven test scheme, because
 /// TestServer cannot perform a real SPNEGO handshake. The live handshake is
@@ -47,12 +47,16 @@ public class AuthWebApplicationFactory : CertusWebApplicationFactory
 /// Test authentication driven by a request header: X-Test-User: admin yields a principal in
 /// the builtin Administrators role, any other value an authenticated non-admin,
 /// and no header an anonymous request (which the fallback policy turns into a
-/// 401 challenge).
+/// 401 challenge). X-Test-Auth-Type names the package the identity reports
+/// (Kerberos or NTLM), which is what a real WindowsIdentity.AuthenticationType
+/// carries and the Kerberos only middleware reads (issue #633); without it the
+/// identity reports the scheme name.
 /// </summary>
 public sealed class TestAuthHandler : AuthenticationHandler<AuthenticationSchemeOptions>
 {
     public const string SchemeName = "TestAuth";
     public const string UserHeader = "X-Test-User";
+    public const string AuthTypeHeader = "X-Test-Auth-Type";
     public const string AdminUser = "admin";
 
     private const string AdminRole = @"BUILTIN\Administrators";
@@ -75,7 +79,8 @@ public sealed class TestAuthHandler : AuthenticationHandler<AuthenticationScheme
         if (user == AdminUser)
             claims.Add(new(ClaimTypes.Role, AdminRole));
 
-        var identity = new ClaimsIdentity(claims, SchemeName);
+        var authType = Request.Headers[AuthTypeHeader].FirstOrDefault();
+        var identity = new ClaimsIdentity(claims, string.IsNullOrEmpty(authType) ? SchemeName : authType);
         var ticket = new AuthenticationTicket(new ClaimsPrincipal(identity), SchemeName);
         return Task.FromResult(AuthenticateResult.Success(ticket));
     }

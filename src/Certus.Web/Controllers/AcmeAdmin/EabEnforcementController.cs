@@ -1,5 +1,6 @@
 using Certus.Core.Acme.Services;
 using Certus.Core.Setup;
+using Certus.Web.Audit;
 using Certus.Web.Authentication;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -58,7 +59,9 @@ public sealed class EabEnforcementController : ControllerBase
     /// would wipe the wizard state.
     /// </summary>
     [HttpPut("enforcement")]
-    public IActionResult UpdateEnforcement([FromBody] UpdateEabEnforcementRequest request)
+    [AdminAudit("acme.eab-enforcement.changed")]
+    public async Task<IActionResult> UpdateEnforcement(
+        [FromBody] UpdateEabEnforcementRequest request, CancellationToken ct)
     {
         if (!EabEnforcementPolicy.TryParseMode(request.Mode, out var mode))
             return BadRequest(new
@@ -69,6 +72,13 @@ public sealed class EabEnforcementController : ControllerBase
         var status = _setupService.GetStatus();
         if (!status.SetupCompleted || !_setupService.IsCaEffectivelyConfigured)
             return Conflict(new { error = "Setup has not been completed. Finish the setup wizard first." });
+
+        // The audit row before the file write (issue #634); the filter appends
+        // a "not applied" row if the write below is refused.
+        await this.AdminAudit().RecordBeforeFileWriteAsync(
+            "EAB enforcement",
+            EabEnforcementPolicy.ModeName(_eabPolicy.Mode),
+            EabEnforcementPolicy.ModeName(mode), ct);
 
         if (!_setupService.UpdateEabEnforcement(mode))
             return Conflict(new

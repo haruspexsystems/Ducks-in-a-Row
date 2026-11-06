@@ -95,6 +95,8 @@ public sealed class AppleAttestationVerifier : IAttestationFormatVerifier
             {
                 chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
                 chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+                // The service calls only systems the operator configures, never a client's AIA URL (#642).
+                chain.ChainPolicy.DisableCertificateDownloads = true;
                 chain.ChainPolicy.CustomTrustStore.Add(_appleRoot);
                 foreach (var anchor in context.AdditionalTrustAnchors)
                     chain.ChainPolicy.CustomTrustStore.Add(anchor);

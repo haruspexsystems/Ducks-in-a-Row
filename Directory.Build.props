@@ -56,12 +56,26 @@
          SettingsController.GetInfo) without ever touching the MSI version. Update
          both together with the release tag; drop VersionSuffix entirely for a
          non prerelease version like 1.0.0. -->
-    <VersionPrefix>1.0.0</VersionPrefix>
+    <VersionPrefix>1.1.0</VersionPrefix>
     <Product>Ducks in a Row</Product>
     <Company>Haruspex Systems B.V.</Company>
     <Copyright>Copyright © Haruspex Systems B.V. 2026</Copyright>
     <Description>ACME-to-ADCS proxy — Make ADCS work like Let's Encrypt for your internal network.</Description>
   </PropertyGroup>
+
+  <!-- Issue #623. The date of the commit the build is stamped from, as
+       AssemblyMetadata("CommitDate") on every assembly, beside the sha that
+       SourceRevisionId puts on the informational version. build.ps1 resolves
+       it from git (the committer date, rewritten in UTC) and passes
+       /p:CertusCommitDate; the Settings page reads it to show the release's
+       age and warn past Certus:ReleaseAgeWarningDays. It is the commit's
+       date, never the build clock, so the binaries of one commit stay
+       identical (issue #396). The item is conditioned so a plain dotnet
+       build, or a build from the source snapshot with no .git, carries no
+       attribute at all rather than an empty one. -->
+  <ItemGroup Condition="'$(CertusCommitDate)' != ''">
+    <AssemblyMetadata Include="CommitDate" Value="$(CertusCommitDate)" />
+  </ItemGroup>
 
   <!-- Applied only on the deterministic (Release/CI) path. $(MSBuildThisFileDirectory)
        is the repo root with a trailing separator, so an absolute source path

@@ -62,7 +62,9 @@ expires.
   certificate it serves the dashboard and ACME endpoints with.
 - **Expiry alerts:** email (SMTP) and webhook notifications before certificates
   expire.
-- **Setup wizard:** guided setup in the browser, from zero to working in minutes.
+- **Setup wizard:** guided setup in the browser, about five minutes of clicking
+  once the approvals on your CA are in place. The approvals are usually the lead
+  time, so ask for them first.
 - **Windows Integrated Authentication:** the dashboard is limited to a configured
   administrator group.
 
@@ -84,6 +86,10 @@ on the server that will host Ducks in a Row, then complete the browser-based
 setup wizard. `Ducks-in-a-Row-Setup.exe` installs the ASP.NET Core runtime for
 you (offline capable); the bare MSI needs the runtime already present.
 
+To start read only on your production CA, tick **Monitor only** in the installer:
+it watches the CA and never issues or revokes, and turning issuance on later is a
+rights grant and a restart. See [monitor mode](docs/monitor-mode.md).
+
 The [documentation](docs/README.md) has the full walkthrough: a
 [quickstart](docs/quickstart.md), the
 [system requirements](docs/system-requirements.md), and a
@@ -102,11 +108,10 @@ Every release also carries a software bill of materials,
 `Ducks-in-a-Row-<version>.cdx.json`, in CycloneDX 1.6 format and listed in the
 same `SHA256SUMS` file. It covers the NuGet packages the service is built from,
 the npm packages the dashboard is built from, and the ASP.NET Core Hosting
-Bundle that `Ducks-in-a-Row-Setup.exe` embeds. Build tooling is left out, apart
-from about fifteen packages that only the database design tools use: those are
-listed although the service does not ship them, because the filter that would
-remove them also removes packages it does use. The bill errs toward listing too
-much rather than too little.
+Bundle that `Ducks-in-a-Row-Setup.exe` embeds. Build tooling is left out,
+including the packages that only the database design tools use. A package the
+published service lists as a dependency is never left out, and where the build
+cannot tell, the bill errs toward listing too much rather than too little.
 
 ## Prerequisites
 
@@ -117,8 +122,12 @@ much rather than too little.
   provide it. Build 20348.587 is confirmed too old; check yours with `winver`.
   Server 2019 predates the requirement and is unaffected; Server 2025 ships
   with it. See Troubleshooting below for what the failure looks like.
-- Domain-joined (required for DCOM authentication to the CA).
+- Domain joined (required for DCOM authentication to the CA).
 - Reachable ADCS certificate authority with the templates you want to expose.
+- The rights and firewall openings your AD and CA team grant.
+  [What to ask your AD and CA team](docs/ad-and-ca-team-request.md) lists them
+  with a change request ready to copy. Ask first, because they are usually the
+  lead time.
 
 ## Troubleshooting the install
 
@@ -150,7 +159,10 @@ license.
 Copyright © 2026 Haruspex Systems B.V. "Ducks in a Row" is a trademark of
 Haruspex Systems B.V. Haruspex Systems B.V. has its seat in Zevenaar, the
 Netherlands, was incorporated on 14 August 2026, and is registered with the
-Dutch Chamber of Commerce (KVK) under number 42142878.
+Dutch Chamber of Commerce (KVK) under number 42142878. Its postal address, the
+addresses to write to, and its website are in
+[the manufacturer](docs/intended-use.md#the-manufacturer), beside what the
+product is intended for and how long it is supported.
 
 ## More
 

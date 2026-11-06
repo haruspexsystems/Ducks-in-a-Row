@@ -53,6 +53,50 @@ public sealed class AcmeRateLimitOptions
     public int SegmentsPerWindow { get; set; } = 6;
 
     /// <summary>
+    /// The most replay nonces the server keeps at once. A nonce is stored on
+    /// every ACME protocol response and lives an hour, so without a cap an
+    /// unauthenticated client grows the store at line rate (issue #632, CRA
+    /// R04). When the store is full the oldest nonces are evicted; a client
+    /// whose nonce was evicted gets badNonce with a fresh one and retries, as
+    /// RFC 8555 section 6.5 requires it to. The default carries a busy estate:
+    /// a nonce is consumed by the request that uses it, so the live count is
+    /// the number of clients mid request plus the nonces no client consumed.
+    /// Values below 1 are raised to 1, because a store that holds nothing would
+    /// refuse every signed request.
+    /// </summary>
+    public int MaxStoredNonces { get; set; } = 10_000;
+
+    /// <summary>
+    /// The most identifiers one new-order request may carry. More is refused as
+    /// malformed before any identifier is examined, so the request cannot buy
+    /// one authorization and three challenges per identifier it names, nor a
+    /// policy audit row for each. 100 is the ceiling Let's Encrypt applies and
+    /// the one the 64 KB body cap (#573) was measured against. A value below 1
+    /// refuses every order; StartupValidator warns about it.
+    /// </summary>
+    public int MaxIdentifiersPerOrder { get; set; } = 100;
+
+    /// <summary>
+    /// The most orders one account may hold open at once. An order is open
+    /// while it is pending or ready and has not expired: the client has not
+    /// finalized it and nothing has invalidated it. A new-order request from
+    /// an account at the cap is refused as rateLimited, with no Retry-After,
+    /// because the cap clears when the client finalizes an order, deactivates
+    /// its authorizations, or lets it expire a week after it was placed, and
+    /// none of those is on a clock the server can name. A value below 1
+    /// refuses every order; StartupValidator warns about it.
+    /// </summary>
+    public int MaxPendingOrdersPerAccount { get; set; } = 1_000;
+
+    /// <summary>
+    /// The nonce store size actually used: <see cref="MaxStoredNonces"/> with a
+    /// floor of 1, for the same reason <see cref="EffectiveSegmentsPerWindow"/>
+    /// clamps rather than throws. The nonce service reads this, so the floor
+    /// lives in one place.
+    /// </summary>
+    public int EffectiveMaxStoredNonces => Math.Max(1, MaxStoredNonces);
+
+    /// <summary>
     /// An absolute URL for documentation about these limits. When set, a rate
     /// limited response carries a Link header with rel="help" and the policy name
     /// as its fragment, which RFC 8555 section 6.6 permits so a client can be

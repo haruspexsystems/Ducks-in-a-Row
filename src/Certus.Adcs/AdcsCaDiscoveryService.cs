@@ -21,6 +21,23 @@ namespace Certus.Adcs;
 /// </summary>
 public sealed class AdcsCaDiscoveryService : ICaDiscoveryService
 {
+    /// <summary>
+    /// Deadlines for the enrollment services search, so a domain controller
+    /// that stops answering the search cannot pin a thread pool thread for the
+    /// OS level TCP timeout while the wizard's CA step waits on it (issue
+    /// #466). The project notes require both on every
+    /// <see cref="DirectorySearcher"/>, and this search is paged, so the per
+    /// page limit is set too. The values are
+    /// <see cref="AdcsTemplateDirectoryLookup"/>'s: the wizard asks once when
+    /// the step opens rather than once per keystroke like the principal
+    /// picker, so it can afford the more patient pair. They bound the search
+    /// only: the binds before it, RootDSE and the search root, take no
+    /// deadline here or in any other reader, because a DirectoryEntry offers
+    /// no control for one.
+    /// </summary>
+    private static readonly TimeSpan SearchClientTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan SearchServerTimeLimit = TimeSpan.FromSeconds(20);
+
     private readonly ILogger<AdcsCaDiscoveryService> _logger;
 
     public AdcsCaDiscoveryService(ILogger<AdcsCaDiscoveryService> logger)
@@ -49,15 +66,7 @@ public sealed class AdcsCaDiscoveryService : ICaDiscoveryService
 
                 var path = $"LDAP://CN=Enrollment Services,CN=Public Key Services,CN=Services,{configContext}";
                 using var enrollmentEntry = new DirectoryEntry(path);
-                using var searcher = new DirectorySearcher(enrollmentEntry)
-                {
-                    Filter = "(objectClass=pKIEnrollmentService)",
-                    SearchScope = SearchScope.OneLevel,
-                    PageSize = 1000
-                };
-                searcher.PropertiesToLoad.Add("cn");
-                searcher.PropertiesToLoad.Add("dNSHostName");
-                searcher.PropertiesToLoad.Add("displayName");
+                using var searcher = CreateSearcher(enrollmentEntry);
 
                 using var found = searcher.FindAll();
                 foreach (SearchResult sr in found)
@@ -93,6 +102,29 @@ public sealed class AdcsCaDiscoveryService : ICaDiscoveryService
 
             return (IReadOnlyList<DiscoveredCa>)result;
         }, cancellationToken);
+    }
+
+    /// <summary>
+    /// Builds the one level search for the <c>pKIEnrollmentService</c> objects
+    /// under the Enrollment Services container. It is apart from the read so a
+    /// test can pin the deadlines without a domain: constructing a searcher, or
+    /// the entry it searches from, binds nothing.
+    /// </summary>
+    internal static DirectorySearcher CreateSearcher(DirectoryEntry enrollmentServices)
+    {
+        var searcher = new DirectorySearcher(enrollmentServices)
+        {
+            Filter = "(objectClass=pKIEnrollmentService)",
+            SearchScope = SearchScope.OneLevel,
+            PageSize = 1000,
+            ClientTimeout = SearchClientTimeout,
+            ServerTimeLimit = SearchServerTimeLimit,
+            ServerPageTimeLimit = SearchServerTimeLimit
+        };
+        searcher.PropertiesToLoad.Add("cn");
+        searcher.PropertiesToLoad.Add("dNSHostName");
+        searcher.PropertiesToLoad.Add("displayName");
+        return searcher;
     }
 
     private static string? GetSingle(SearchResult sr, string property)

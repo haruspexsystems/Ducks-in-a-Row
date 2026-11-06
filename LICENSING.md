@@ -16,7 +16,10 @@ renewal, revocation, monitoring, and alerting — for:
   managed IT service (for example, as a managed service provider).
 
 You do not owe us anything to use the free tier this way, no matter how many
-certificates you manage.
+certificates you manage. Discovery here means the inventory of the certificate
+authority you connect: every certificate that CA has issued, read from its
+database. As a product, the free tier connects one installation to one
+certificate authority; covering more is what the paid tier adds.
 
 ## What requires a commercial license
 
@@ -39,19 +42,19 @@ source modules that install alongside the core, under a commercial license from
 Haruspex Systems B.V. The four year conversion to Apache 2.0 described below
 applies to the core.
 
-## It becomes open source over time
+## It converts to the Apache License 2.0 over time
 
 Each released version of Ducks in a Row automatically converts to the
 **Apache License 2.0** four years after that version was first made available.
-At that point the version is fully open source.
+At that point the version is permissively licensed under Apache 2.0.
 
 ## Why BSL and not MIT or Apache from day one
 
 We want the source to be readable so you can audit exactly what talks to your
 certificate authority, and we want it free for real production use. BSL gives
 you both, while preventing someone from reselling our work against us before it
-ages into open source. It is the honest middle ground between closed source and
-permissive open source.
+converts to Apache 2.0. It is the honest middle ground between closed source and
+a permissive license from day one.
 
 ## Commercial licensing and questions
 

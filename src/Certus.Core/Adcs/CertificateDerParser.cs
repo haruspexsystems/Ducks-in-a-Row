@@ -1,3 +1,4 @@
+using System.Formats.Asn1;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using Certus.Core.Security;
@@ -132,7 +133,51 @@ public static class CertificateDerParser
             return new CertificateCapability(
                 ExtendedKeyUsageOids: ReadEkuOidList(cert),
                 KeyUsage: ReadKeyUsage(cert) is { } keyUsage ? (X509KeyUsageFlags)keyUsage : null,
-                IsCa: ReadIsCa(cert));
+                IsCa: ReadIsCa(cert),
+                ApplicationPolicyOids: ReadApplicationPolicyOids(cert));
+        }
+    }
+
+    /// <summary>szOID_APPLICATION_CERT_POLICIES.</summary>
+    private const string ApplicationPoliciesOid = "1.3.6.1.4.1.311.21.10";
+
+    /// <summary>
+    /// The Microsoft Application Policy OIDs, which Windows honours over the
+    /// EKU, so the capability ceiling judges them too (ESC15, issue #548).
+    /// The extension value is a CertificatePolicies structure (SEQUENCE OF
+    /// PolicyInformation, each a SEQUENCE whose first element is the policy
+    /// OID). Null for no extension, an empty one, or a malformed one, which the
+    /// ceiling treats as no Application Policies, the fail closed direction
+    /// being that an unreadable one simply does not widen the EKU verdict.
+    /// </summary>
+    private static IReadOnlyList<string>? ReadApplicationPolicyOids(X509Certificate2 cert)
+    {
+        try
+        {
+            var extension = cert.Extensions[ApplicationPoliciesOid];
+            if (extension == null)
+                return null;
+
+            var oids = new List<string>();
+            var reader = new AsnReader(extension.RawData, AsnEncodingRules.DER);
+            var policies = reader.ReadSequence();
+            while (policies.HasData)
+            {
+                var policy = policies.ReadSequence();
+                oids.Add(policy.ReadObjectIdentifier());
+                // Skip any policy qualifiers after the identifier.
+                while (policy.HasData)
+                    policy.ReadEncodedValue();
+            }
+            return oids.Count == 0 ? null : oids;
+        }
+        catch (AsnContentException)
+        {
+            return null;
+        }
+        catch (CryptographicException)
+        {
+            return null;
         }
     }
 

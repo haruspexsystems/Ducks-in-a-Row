@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, CheckCircle2, Loader2, ShieldOff, X } from 'lucide-react';
+import { errorText } from '@/api/client';
 import {
   fetchRevocationScope,
   updateRevocationScope,
@@ -143,7 +144,7 @@ export function RevocationScopeCard() {
       setModeEdit(null);
       setCustomEdit(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Saving failed');
+      setError(errorText(err, 'Saving failed'));
     } finally {
       setSaving(false);
     }

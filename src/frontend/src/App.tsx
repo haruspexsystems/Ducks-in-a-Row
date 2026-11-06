@@ -1,13 +1,15 @@
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { Layout } from '@/components/Layout';
+import { FullModeOnly } from '@/components/FullModeOnly';
 import { RequireSetup } from '@/components/RequireSetup';
 import { DashboardPage } from '@/pages/DashboardPage';
 import { CertificateListPage } from '@/pages/CertificateListPage';
 import { CertificateDetailPage } from '@/pages/CertificateDetailPage';
 import { AcmePage } from '@/pages/AcmePage';
 import { SettingsPage } from '@/pages/SettingsPage';
+import { AuditPage } from '@/pages/AuditPage';
 import { SetupWizard } from '@/pages/setup/SetupWizard';
 
 const queryClient = new QueryClient({
@@ -36,8 +38,9 @@ export default function App() {
               {/* One route, not a nested set: everything below /acme belongs
                   to the ACME protocol on this server, so the section's tabs
                   ride in the query string. See the note on AcmePage. */}
-              <Route path="/acme" element={<AcmePage />} />
+              <Route path="/acme" element={<FullModeOnly><AcmePage /></FullModeOnly>} />
               <Route path="/settings" element={<SettingsPage />} />
+              <Route path="/audit" element={<AuditPage />} />
             </Route>
 
             {/* Unknown paths fall back to the dashboard */}

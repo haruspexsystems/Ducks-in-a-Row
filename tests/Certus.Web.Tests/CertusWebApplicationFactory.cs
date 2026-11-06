@@ -7,13 +7,15 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 
 namespace Certus.Web.Tests;
 
 /// <summary>
-/// Custom WebApplicationFactory that provides a shared in-memory SQLite database
-/// for integration testing. The shared connection stays open for the lifetime
-/// of the factory, ensuring all scopes share the same database instance.
+/// Custom WebApplicationFactory that gives each factory its own SQLite database
+/// file in its temp data directory, so every scope in the host opens its own
+/// connection to it (see ConfigureWebHost for why it is not a shared in memory
+/// connection any more).
 /// Rate limiting is disabled in tests to avoid false 429 failures.
 /// Authentication is disabled (the escape hatch used only in Development); the auth
 /// stack itself is covered by <see cref="AuthWebApplicationFactory"/>.
@@ -34,6 +36,10 @@ public class CertusWebApplicationFactory : WebApplicationFactory<Program>
 {
     private readonly string _tempDataDir = Path.Combine(
         Path.GetTempPath(), "certus-tests-" + Guid.NewGuid().ToString("N"));
+
+    // The Serilog logger of every host this factory built, each holding its log file
+    // open. See Dispose.
+    private readonly List<Serilog.ILogger> _hostLoggers = [];
 
     /// <summary>
     /// The per factory data directory the host is redirected to. Subclasses
@@ -72,6 +78,19 @@ public class CertusWebApplicationFactory : WebApplicationFactory<Program>
         builder.UseSetting(
             $"{CertusOptions.SectionName}:{nameof(CertusOptions.SettingsOverlayPath)}",
             Path.Combine(_tempDataDir, "settings.json"));
+
+        // Keep the development host's log files out of the machine's data directory
+        // too. Its Serilog file sink writes under the resolved data directory, which
+        // only this Development override moves (CertusDataDirectory, issue #413).
+        // Without it every run of this suite wrote into
+        // C:\ProgramData\Ducks in a Row\logs, beside an installed service's own logs.
+        builder.UseSetting(CertusDataDirectory.DevelopmentKey, _tempDataDir);
+
+        // Full mode, named rather than left unset (issue #470): with the key unset the
+        // host would read the machine's registry, and a developer box with a monitor
+        // mode install would turn every test here into a monitor mode test. The monitor
+        // mode factories set it again after this, and the later value wins.
+        builder.UseSetting(CertusInstanceMode.DevelopmentKey, CertusInstanceMode.FullValue);
 
         Directory.CreateDirectory(_tempDataDir);
 
@@ -118,7 +137,9 @@ public class CertusWebApplicationFactory : WebApplicationFactory<Program>
 
             services.PostConfigure<CertusOptions>(o =>
             {
-                o.DatabasePath = Path.Combine(_tempDataDir, "certus.db");
+                // The file the DbContext above opens, so anything that reads the
+                // option rather than the context names the same database.
+                o.DatabasePath = databasePath;
                 // Keep the setup wizard's settings overlay out of the real
                 // ProgramData data directory.
                 o.SettingsOverlayPath = Path.Combine(_tempDataDir, "settings.json");
@@ -134,24 +155,55 @@ public class CertusWebApplicationFactory : WebApplicationFactory<Program>
         });
     }
 
+    protected override IHost CreateHost(IHostBuilder builder)
+    {
+        var host = base.CreateHost(builder);
+        // Building the host made its logger the static Serilog logger, and only one
+        // host boots at a time, so this is a logger this factory has to close. A list,
+        // because a factory derived with WithWebHostBuilder builds its host through this
+        // method too, and keeping only the latest lost the parent's own logger.
+        lock (_hostLoggers)
+            _hostLoggers.Add(Serilog.Log.Logger);
+        return host;
+    }
+
     protected override void Dispose(bool disposing)
     {
         base.Dispose(disposing);
         if (disposing)
         {
-            // The pooled connections to the file hold it open, so the delete
-            // below fails until they are closed.
+            // The pooled connections to the file and the host's file logger both
+            // hold files in the folder open, so the delete below fails until they
+            // are closed. Serilog closes a host's logger only through the static
+            // one, and hosts here can overlap: three classes in the ACME collection
+            // boot their own host while the collection's host is alive, and the
+            // later boot replaces the static logger. The earlier host's file then
+            // stayed open until the process ended, and its folder was left behind
+            // (measured on 2026-10-02). So each factory closes the loggers its own
+            // hosts built; closing one twice is harmless.
+            lock (_hostLoggers)
+            {
+                foreach (var logger in _hostLoggers)
+                    (logger as IDisposable)?.Dispose();
+            }
             SqliteConnection.ClearAllPools();
-            try
+            for (var attempt = 1; attempt <= 5; attempt++)
             {
-                Directory.Delete(_tempDataDir, recursive: true);
-            }
-            catch (IOException)
-            {
-                // Best effort: a stray temp folder is harmless.
-            }
-            catch (UnauthorizedAccessException)
-            {
+                try
+                {
+                    Directory.Delete(_tempDataDir, recursive: true);
+                    break;
+                }
+                catch (DirectoryNotFoundException)
+                {
+                    break;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // Best effort: a stray temp folder is harmless.
+                    if (attempt < 5)
+                        Thread.Sleep(200);
+                }
             }
         }
     }

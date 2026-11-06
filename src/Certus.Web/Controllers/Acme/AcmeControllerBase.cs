@@ -6,6 +6,7 @@ using Certus.Core.Adcs;
 using Certus.Core.Configuration;
 using Certus.Core.Data.Entities;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Options;
 
@@ -15,11 +16,36 @@ namespace Certus.Web.Controllers.Acme;
 /// Base class for ACME controllers. Provides helper methods for ACME-compliant responses.
 /// The whole /acme/ surface is exempt from the global authorization fallback
 /// policy: ACME clients authenticate with JWS signatures (RFC 8555 §6.2), not
-/// HTTP authentication. The attribute is inherited by every derived controller.
+/// HTTP authentication. Both attributes are inherited by every derived controller,
+/// so an endpoint added later is anonymous and size capped without repeating either.
 /// </summary>
 [AllowAnonymous]
+[RequestSizeLimit(MaxRequestBytes)]
 public abstract class AcmeControllerBase : ControllerBase
 {
+    /// <summary>
+    /// Cap on the whole request body of every ACME endpoint (issue #300). Without it
+    /// every endpoint but the challenge fell back to Kestrel's 30 MB default, and
+    /// each one reads its whole body and decodes the JWS payload before acting on it.
+    ///
+    /// The largest honest bodies are a finalize CSR and a revoke-cert certificate,
+    /// because both grow with the names a certificate carries. One hundred names
+    /// (the per certificate ceiling Let's Encrypt applies) at the 253 character DNS
+    /// maximum, with RSA 4096 keys on both the account and the certificate, comes to
+    /// about 50 KB of JWS for the finalize and 53 KB for the revocation. The account
+    /// endpoint's largest honest body, ten contacts of 255 characters
+    /// (<see cref="AccountService.MaxContactEntries"/>,
+    /// <see cref="AccountService.MaxContactLength"/>) with every character escaped
+    /// to six bytes, is about 22 KB. An authorization deactivation is a few hundred
+    /// bytes. 64 KB holds all of them with room to spare.
+    ///
+    /// The challenge endpoint keeps its own larger cap, declared on its action so it
+    /// overrides this one, because a device attestation object is the one honest
+    /// body that can be bigger. AcmeRequestSizeLimitTests derives the honest sizes
+    /// above from the same constants and fails if this cap stops holding them.
+    /// </summary>
+    public const int MaxRequestBytes = 65_536;
+
     /// <summary>
     /// Returns an ACME error response with application/problem+json content type.
     /// RFC 8555 §6.7
@@ -113,10 +139,11 @@ public abstract class AcmeControllerBase : ControllerBase
     /// <summary>
     /// Resolves the template named in the URL and maps every refusal to its ACME problem
     /// response, so a caller only has to check whether Error is null. Resolution reaches the
-    /// CA, which can be down: without the guard the exception escapes the action and faults to
-    /// a bare 500 with no problem document and no nonce, which is what new-account and
-    /// new-order did until issue #147. Keeping the guard on the base means an endpoint added
-    /// later inherits it rather than repeating the omission.
+    /// CA, which can be down or can refuse the service: without the guard the exception
+    /// escapes the action and faults to a bare 500 with no problem document and no nonce,
+    /// which is what new-account and new-order did until issue #147, and what every ACME
+    /// route did on a refusal until issue #476. Keeping the guard on the base means an
+    /// endpoint added later inherits it rather than repeating the omission.
     /// </summary>
     protected async Task<(TemplateResolution Resolution, IActionResult? Error)> ResolveTemplateAsync(
         TemplateService templateService,
@@ -132,6 +159,19 @@ public abstract class AcmeControllerBase : ControllerBase
         {
             return (default!, AcmeError(503, AcmeErrorType.ServiceUnavailable,
                 "The ADCS Certificate Authority is unavailable. Try again shortly."));
+        }
+        catch (CaAccessDeniedException)
+        {
+            // The CA refused this service's own account the template list (issue
+            // #476). Before this arm the refusal escaped as a bare 500 with no
+            // problem document and no nonce, the issue #147 shape. 503
+            // serviceUnavailable for the reason the finalize gives the same
+            // refusal (issue #336): the client is authorized and can do nothing but
+            // come back later, so 403 unauthorized would send it off to re-register.
+            // The remedy names the service's computer account, so it stays off this
+            // wire; AdcsClient logs it at Error on every refused read.
+            return (default!, AcmeError(503, AcmeErrorType.ServiceUnavailable,
+                "The server could not read its certificate templates from the CA. Try again shortly."));
         }
 
         return (resolution, TemplateAccessError(resolution, template));
@@ -178,13 +218,48 @@ public abstract class AcmeControllerBase : ControllerBase
     }
 
     /// <summary>
-    /// Result of kid-based JWS authentication.
+    /// Reads the whole request body as text, the way every ACME endpoint reads its JWS.
+    /// The size limit on this class bounds the read: past it the server's body stream
+    /// throws <see cref="BadHttpRequestException"/> carrying 413, which is answered here
+    /// as an ACME problem document instead of escaping the action. The same exception
+    /// also carries a malformed chunked body (400) and a body sent too slowly (408),
+    /// which are not about size, so they keep their own status and a neutral detail.
+    /// </summary>
+    protected async Task<(string Body, IActionResult? Error)> ReadRequestBodyAsync(
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return (await new StreamReader(Request.Body).ReadToEndAsync(cancellationToken), null);
+        }
+        catch (BadHttpRequestException ex) when (ex.StatusCode == StatusCodes.Status413PayloadTooLarge)
+        {
+            // The feature holds the limit that applied to this request: this class's
+            // cap, or an action's own where one overrides it.
+            var limit = HttpContext.Features.Get<IHttpMaxRequestBodySizeFeature>()?.MaxRequestBodySize;
+            return (string.Empty, AcmeError(StatusCodes.Status413PayloadTooLarge, AcmeErrorType.Malformed,
+                limit is null
+                    ? "The request body is larger than this endpoint accepts."
+                    : $"The request body is larger than the {limit} bytes this endpoint accepts."));
+        }
+        catch (BadHttpRequestException ex)
+        {
+            return (string.Empty, AcmeError(ex.StatusCode, AcmeErrorType.Malformed,
+                "The request body could not be read."));
+        }
+    }
+
+    /// <summary>
+    /// Result of kid-based JWS authentication. <see cref="Kid"/> is the kid URL exactly as the
+    /// client sent it, set on success; key-change compares its inner 'account' against it
+    /// (RFC 8555 §7.3.5).
     /// </summary>
     protected sealed record KidAuthResult(
         bool IsAuthenticated,
         AcmeAccount? Account = null,
         byte[]? PayloadBytes = null,
-        IActionResult? ErrorResult = null);
+        IActionResult? ErrorResult = null,
+        string? Kid = null);
 
     /// <summary>
     /// Authenticates a JWS request using kid (account URL) in the protected header.
@@ -199,7 +274,10 @@ public abstract class AcmeControllerBase : ControllerBase
         CancellationToken cancellationToken)
     {
         // 1. Read and parse JWS body
-        var body = await new StreamReader(Request.Body).ReadToEndAsync(cancellationToken);
+        var (body, readError) = await ReadRequestBodyAsync(cancellationToken);
+        if (readError != null)
+            return new KidAuthResult(false, ErrorResult: readError);
+
         JwsFlattenedRequest? jws;
         try
         {
@@ -252,7 +330,7 @@ public abstract class AcmeControllerBase : ControllerBase
         if (kidError != null)
             return new KidAuthResult(false, ErrorResult: kidError);
 
-        return new KidAuthResult(true, account, validation.PayloadBytes);
+        return new KidAuthResult(true, account, validation.PayloadBytes, Kid: validation.Header.Kid);
     }
 
     /// <summary>
@@ -281,7 +359,10 @@ public abstract class AcmeControllerBase : ControllerBase
         CancellationToken cancellationToken)
     {
         // 1. Read and parse JWS body
-        var body = await new StreamReader(Request.Body).ReadToEndAsync(cancellationToken);
+        var (body, readError) = await ReadRequestBodyAsync(cancellationToken);
+        if (readError != null)
+            return new RevocationAuthResult(false, ErrorResult: readError);
+
         JwsFlattenedRequest? jws;
         try
         {

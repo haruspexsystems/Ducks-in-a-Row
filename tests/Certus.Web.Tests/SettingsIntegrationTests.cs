@@ -232,6 +232,10 @@ public class SettingsIntegrationTests : IDisposable
         version.Should().NotContain("+",
             "the build metadata belongs in the commit field, not the version the page shows");
 
+        // Issue #470: the badge and the hidden controls read this. A host with no
+        // mode configured is full, exactly as before.
+        body.GetProperty("mode").GetString().Should().Be("full");
+
         body.TryGetProperty("commit", out var commit).Should().BeTrue(
             "the dashboard reads this field and must not have to guess whether it exists");
         commit.ValueKind.Should().BeOneOf(JsonValueKind.String, JsonValueKind.Null);
@@ -239,5 +243,45 @@ public class SettingsIntegrationTests : IDisposable
         {
             commit.GetString().Should().NotBeNullOrWhiteSpace();
         }
+    }
+
+    /// <summary>
+    /// Issue #623. The About block shows the release's date and age and the
+    /// runtimes the process runs on, all read off the process itself. Same
+    /// stance as the commit test above: the shape is asserted, not a date,
+    /// because this suite runs on an unstamped build. On such a build the
+    /// date is null, the age is null, and the warning is off, which is the
+    /// one combination a build with no stamp may report. The threshold is
+    /// the 180 day default because no test configuration sets it.
+    /// </summary>
+    [Fact]
+    public async Task GetInfo_ReportsTheReleaseAgeFieldsAndTheRuntimes()
+    {
+        var response = await _client.GetAsync("/api/settings/info");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body = await ParseJsonAsync(response);
+
+        body.TryGetProperty("commitDate", out var commitDate).Should().BeTrue();
+        commitDate.ValueKind.Should().BeOneOf(JsonValueKind.String, JsonValueKind.Null);
+
+        body.TryGetProperty("releaseAgeDays", out var ageDays).Should().BeTrue();
+        body.GetProperty("releaseAgeWarningDays").GetInt32().Should().Be(180,
+            "the default threshold from the decision of 2026-10-21 on #623");
+        body.TryGetProperty("releaseOutdated", out var outdated).Should().BeTrue();
+
+        if (commitDate.ValueKind == JsonValueKind.Null)
+        {
+            ageDays.ValueKind.Should().Be(JsonValueKind.Null, "no date, no age");
+            outdated.GetBoolean().Should().BeFalse("no age, nothing to warn about");
+        }
+        else
+        {
+            DateTimeOffset.TryParse(commitDate.GetString(), out _).Should().BeTrue();
+            ageDays.GetInt32().Should().BeGreaterThanOrEqualTo(0);
+        }
+
+        body.GetProperty("runtimeVersion").GetString().Should().StartWith(".NET ");
+        body.GetProperty("aspNetCoreVersion").GetString().Should().MatchRegex(@"^\d+\.\d+");
     }
 }

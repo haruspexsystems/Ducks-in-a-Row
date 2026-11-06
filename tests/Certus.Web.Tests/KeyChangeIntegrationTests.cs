@@ -107,6 +107,53 @@ public class KeyChangeIntegrationTests : IDisposable
             "the 409 points at the account that already holds the key (RFC 8555 §7.3.5)");
     }
 
+    [Fact]
+    public async Task KeyChange_KidUnderAnotherTemplateName_InnerAccountIsTheKid_Succeeds()
+    {
+        // Issue #607: the kid carries WebServer, the key-change URL carries another name, and
+        // the inner account is the kid, as RFC 8555 §7.3.5 tells the client to send. The server
+        // used to rebuild the account URL from the key-change template and refuse this as
+        // malformed.
+        var (account, oldKey) = await CreateAccountAsync();
+        var newKey = NewKey();
+        const string otherKeyChangePath = "/acme/OtherTemplate/key-change";
+
+        var jws = await BuildKeyChangeJws(
+            oldKey, newKey, account.Kid, account.Kid, keyChangePath: otherKeyChangePath);
+        var response = await PostJws(otherKeyChangePath, jws);
+
+        var body = await response.Content.ReadAsStringAsync();
+        response.StatusCode.Should().Be(HttpStatusCode.OK,
+            "the inner account equals the outer kid; the response body was {0}", body);
+
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<CertusDbContext>();
+        var stored = await db.AcmeAccounts.FirstAsync(a => a.AccountId == account.AccountId);
+        stored.JwkThumbprint.Should().Be(JwsService.ComputeThumbprint(ExportRsaJwk(newKey)));
+    }
+
+    [Fact]
+    public async Task KeyChange_InnerAccountIsNotTheKid_Returns400Malformed()
+    {
+        // The inner account names the same account under the key-change URL's template name, but
+        // it is not the kid the outer JWS was signed with. RFC 8555 §7.3.5 asks for the kid, so
+        // this is refused even though the account id matches.
+        var (account, oldKey) = await CreateAccountAsync();
+        var newKey = NewKey();
+        const string otherKeyChangePath = "/acme/OtherTemplate/key-change";
+        var accountUrlUnderOtherTemplate =
+            ToAbsoluteUrl($"/acme/OtherTemplate/acct/{account.AccountId}");
+
+        var jws = await BuildKeyChangeJws(
+            oldKey, newKey, account.Kid, accountUrlUnderOtherTemplate, keyChangePath: otherKeyChangePath);
+        var response = await PostJws(otherKeyChangePath, jws);
+
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        var error = JsonSerializer.Deserialize<AcmeError>(await response.Content.ReadAsStringAsync());
+        error!.Type.Should().Be(AcmeErrorType.Malformed);
+        error.Detail.Should().Contain("'kid'");
+    }
+
     #region Helpers
 
     private record AccountInfo(string Kid, string AccountId);
@@ -150,12 +197,14 @@ public class KeyChangeIntegrationTests : IDisposable
     /// <summary>
     /// Builds a key-change request: the outer JWS is signed by the old account key (kid) and its
     /// payload is an inner JWS signed by the new key (jwk) carrying { account, oldKey }. Pass
-    /// oldKeyOverride to put a different key in the inner oldKey field than the account's current one.
+    /// oldKeyOverride to put a different key in the inner oldKey field than the account's current one,
+    /// and keyChangePath to sign for a key-change URL under another template name.
     /// </summary>
     private async Task<JwsFlattenedRequest> BuildKeyChangeJws(
-        RSA oldKey, RSA newKey, string kid, string accountUrl, RSA? oldKeyOverride = null)
+        RSA oldKey, RSA newKey, string kid, string accountUrl, RSA? oldKeyOverride = null,
+        string keyChangePath = KeyChangePath)
     {
-        var url = ToAbsoluteUrl(KeyChangePath);
+        var url = ToAbsoluteUrl(keyChangePath);
 
         // Inner JWS — signed by the new key, no nonce (RFC 8555 §7.3.5).
         var newJwk = ExportRsaJwk(newKey);

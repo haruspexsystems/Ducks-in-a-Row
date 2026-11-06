@@ -275,6 +275,15 @@ def parse_lines(lines, path="<string>"):
             blocks.extend(produced)
             continue
 
+        # An HTML comment renders nothing on GitHub, so it renders nothing here
+        # either. It is a note to whoever edits the source, such as where the
+        # declaration of conformity's address goes once one exists (#629). Only
+        # a comment that starts a block is recognised; one inside a paragraph
+        # stays part of that paragraph's text and fails the build as before.
+        if stripped.startswith("<!--"):
+            i = _skip_comment(lines, i, path)
+            continue
+
         # Anything left is a paragraph, which ends at a blank line or at the
         # start of any other construct.
         block, i = _read_paragraph(lines, i, path)
@@ -410,6 +419,30 @@ def _read_list_item(lines, i, path):
         "marker": marker,
     }
     return [item] + produced, i
+
+
+def _skip_comment(lines, i, path):
+    """Return the index after an HTML comment that opens on line i.
+
+    Text after the closing marker on the same line would be rendered by GitHub
+    and dropped here, so it is refused, as every other construct the parser
+    cannot carry is.
+    """
+    opener = i
+    while i < len(lines):
+        head, marker, tail = lines[i].partition("-->")
+        if marker:
+            if tail.strip():
+                raise GuideSyntaxError(
+                    path, i + 1, lines[i],
+                    "text after the end of an HTML comment on the same line "
+                    "would be dropped; put it on the next line",
+                )
+            return i + 1
+        i += 1
+    raise GuideSyntaxError(
+        path, opener + 1, lines[opener], "HTML comment is never closed"
+    )
 
 
 def _read_paragraph(lines, i, path):

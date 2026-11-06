@@ -73,7 +73,12 @@ public sealed class ChallengeValidationService : BackgroundService
         _logger.LogInformation("Challenge validation service stopped");
     }
 
-    private async Task ProcessPendingChallengesAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// One sweep. Internal so Certus.Core.Tests can drive the whole loop through a
+    /// real scope, which is the only way to see what one throwing challenge does to
+    /// the ones after it (issue #632).
+    /// </summary>
+    internal async Task ProcessPendingChallengesAsync(CancellationToken cancellationToken)
     {
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<CertusDbContext>();
@@ -98,8 +103,34 @@ public sealed class ChallengeValidationService : BackgroundService
 
         foreach (var challenge in challenges)
         {
-            await ValidateSingleChallengeAsync(
-                db, validators, orderService, auditService, challenge, cancellationToken);
+            // One catch per challenge, never one per sweep. The loop level catch in
+            // ExecuteAsync kept the worker alive, but an exception a validator let
+            // out (an IOException from a handshake that died mid stream) ended the
+            // pass, so every challenge loaded after it went unvalidated, and the
+            // next pass loaded the same list in the same order and stalled at the
+            // same place, every tick, until the order expired (issue #632). The
+            // throwing challenge stays "processing": nothing says the client's
+            // answer was wrong, so the next sweep retries it, and the expiry guard
+            // ends it if it never stops throwing. Cancellation is let through so a
+            // stop request still ends the sweep. Pinned by
+            // ChallengeValidationWorkerStallTests.
+            try
+            {
+                await ValidateSingleChallengeAsync(
+                    db, validators, orderService, auditService, challenge, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "Challenge {ChallengeId} ({Type}) threw during validation and stays " +
+                    "processing for the next sweep; the remaining challenges in this sweep " +
+                    "are still being validated",
+                    challenge.ChallengeId, challenge.Type);
+            }
         }
     }
 
@@ -123,8 +154,10 @@ public sealed class ChallengeValidationService : BackgroundService
         // RFC 8555 §7.5.2: the client has said it no longer holds this authorization,
         // so nothing may validate under it. The sweep selects on the challenge's own
         // status, so a challenge that was already "processing" when the deactivation
-        // landed still arrives here, and the success path below would set the
+        // landed still arrives here. The success path below used to set the
         // authorization back to "valid", undoing a deactivation nobody asked to undo.
+        // Since issue #481 it promotes only from "pending", and this guard still
+        // keeps the validator from being called at all.
         //
         // The authorization's own status is deliberately left alone. "deactivated" is
         // terminal and is what the client asked for; overwriting it with "invalid"
@@ -138,11 +171,7 @@ public sealed class ChallengeValidationService : BackgroundService
         if (string.Equals(authz.Status, "deactivated", StringComparison.Ordinal))
         {
             challenge.Status = "invalid";
-            challenge.ErrorJson = JsonSerializer.Serialize(new AcmeError
-            {
-                Type = AcmeErrorType.Unauthorized,
-                Detail = "The authorization has been deactivated."
-            });
+            challenge.ErrorJson = JsonSerializer.Serialize(ClosedAuthorizationError(authz.Status));
             await db.SaveChangesAsync(cancellationToken);
             _logger.LogInformation(
                 "Challenge {ChallengeId} ({Type}) abandoned: its authorization is deactivated",
@@ -166,17 +195,46 @@ public sealed class ChallengeValidationService : BackgroundService
             return;
         }
 
+        // RFC 8555 §7.1.6: a challenge can only ever move its authorization out of
+        // "pending". Once a sibling has failed and made the authorization "invalid"
+        // (issue #481), nothing this challenge does can change it, so close it out
+        // without calling the validator, the way the deactivated guard above does.
+        // The sweep loads every processing challenge in one graph, so a second
+        // challenge answered on the same authorization reaches here holding the
+        // status the first one just wrote.
+        //
+        // "valid" is let through on purpose. A client may answer a second challenge
+        // on an authorization a sibling already proved, and the processing order
+        // comment in OrderService.RecalculateOrderStatusAsync names exactly that
+        // case. Neither outcome can change the authorization: a pass finds nothing
+        // to promote, and a failure never demotes.
+        //
+        // An allow list, so a status added later fails closed.
+        if (!string.Equals(authz.Status, "pending", StringComparison.Ordinal) &&
+            !string.Equals(authz.Status, "valid", StringComparison.Ordinal))
+        {
+            challenge.Status = "invalid";
+            challenge.ErrorJson = JsonSerializer.Serialize(ClosedAuthorizationError(authz.Status));
+            await db.SaveChangesAsync(cancellationToken);
+            _logger.LogInformation(
+                "Challenge {ChallengeId} ({Type}) abandoned: its authorization is {Status}",
+                challenge.ChallengeId, challenge.Type, authz.Status);
+            // Normally a no-op, since whatever closed the authorization settled the
+            // order too. Run anyway so this arm leaves the order agreeing with the
+            // authorization on its own, as the expiry arm above does.
+            await orderService.RecalculateOrderStatusAsync(authz.OrderId, cancellationToken);
+            return;
+        }
+
         var validator = validators.FirstOrDefault(v => v.ChallengeType == challenge.Type);
         if (validator == null)
         {
             _logger.LogWarning("No validator registered for challenge type {Type}", challenge.Type);
-            challenge.Status = "invalid";
-            challenge.ErrorJson = JsonSerializer.Serialize(new AcmeError
+            await FailChallengeAsync(db, challenge, new AcmeError
             {
                 Type = AcmeErrorType.ServerInternal,
                 Detail = $"No validator available for challenge type '{challenge.Type}'."
-            });
-            await db.SaveChangesAsync(cancellationToken);
+            }, cancellationToken);
             await orderService.RecalculateOrderStatusAsync(authz.OrderId, cancellationToken);
             return;
         }
@@ -197,23 +255,18 @@ public sealed class ChallengeValidationService : BackgroundService
 
         if (result.IsValid)
         {
-            challenge.Status = "valid";
-            challenge.ValidatedAt = DateTime.UtcNow;
-            // At least one valid challenge makes the authorization valid.
-            authz.Status = "valid";
+            await PassChallengeAsync(db, challenge, result.Attested, cancellationToken);
 
-            // A device attestation carries the attested identity; persist it on the
-            // authorization so finalize can bind the CSR key to the attested key.
-            if (result.Attested is { } attested)
-            {
-                authz.AttestedSpki = attested.SpkiBase64;
-                authz.AttestationFormat = attested.Format;
-                authz.AttestedPropertiesJson = attested.PropertiesJson;
-            }
-
-            _logger.LogInformation(
-                "Challenge {ChallengeId} ({Type}) for {Domain} validated successfully",
-                challenge.ChallengeId, challenge.Type, domain);
+            if (string.Equals(challenge.Status, "valid", StringComparison.Ordinal))
+                _logger.LogInformation(
+                    "Challenge {ChallengeId} ({Type}) for {Domain} validated successfully",
+                    challenge.ChallengeId, challenge.Type, domain);
+            else
+                _logger.LogInformation(
+                    "Challenge {ChallengeId} ({Type}) for {Domain} passed, but its " +
+                    "authorization became {Status} while it was being validated, so it " +
+                    "was not counted",
+                    challenge.ChallengeId, challenge.Type, domain, authz.Status);
         }
         else if (result.Transient && challenge.ValidationAttempts + 1 < _options.MaxValidationAttempts)
         {
@@ -231,26 +284,19 @@ public sealed class ChallengeValidationService : BackgroundService
         else
         {
             challenge.ValidationAttempts++;
-            challenge.Status = "invalid";
-            challenge.ErrorJson = JsonSerializer.Serialize(new AcmeError
+            await FailChallengeAsync(db, challenge, new AcmeError
             {
                 // A validator supplied type (badAttestationStatement) wins; otherwise
                 // distinguish "we never got a usable answer" from "the answer was wrong".
                 Type = result.ErrorType
                     ?? (result.Transient ? AcmeErrorType.Connection : AcmeErrorType.IncorrectResponse),
                 Detail = result.ErrorDetail ?? "Challenge validation failed."
-            });
-
-            // If every challenge in the authorization is now invalid, the authz is invalid.
-            if (authz.Challenges.All(c => c.Status == "invalid"))
-                authz.Status = "invalid";
+            }, cancellationToken);
 
             _logger.LogWarning(
                 "Challenge {ChallengeId} ({Type}) for {Domain} failed: {Error}",
                 challenge.ChallengeId, challenge.Type, domain, result.ErrorDetail);
         }
-
-        await db.SaveChangesAsync(cancellationToken);
 
         // Recalculate order status using the scoped OrderService (real logger and ADCS client).
         await orderService.RecalculateOrderStatusAsync(authz.OrderId, cancellationToken);
@@ -274,4 +320,152 @@ public sealed class ChallengeValidationService : BackgroundService
                 cancellationToken);
         }
     }
+
+    /// <summary>
+    /// Records a terminal challenge failure, and with it the authorization's.
+    /// RFC 8555 section 7.1.6 has a pending authorization become invalid when a
+    /// challenge under it fails. Until issue #481 the authorization went invalid
+    /// only once every one of its challenges had, and a network name is offered
+    /// three, so one failed answer left the authorization and its order pending
+    /// until they expired. A client that waits on the authorization rather than
+    /// the challenge, as cert-manager does, then saw a timeout instead of the
+    /// failure.
+    ///
+    /// <para>
+    /// The authorization is written as a conditional UPDATE from "pending" only,
+    /// never as a tracked assignment. The tracked copy was loaded by the sweep
+    /// before the validator ran, which for a network challenge can take seconds,
+    /// so a test of that copy is a stale read. Two outcomes depend on the
+    /// predicate. A "valid" authorization is never demoted: a sibling challenge
+    /// already proved it, and an order can only be "processing" because every
+    /// authorization was valid at the finalize claim, which
+    /// <see cref="OrderService.RecalculateOrderStatusAsync"/> relies on. And a
+    /// deactivation another request committed meanwhile is never overwritten,
+    /// because "deactivated" is what the client asked for.
+    /// </para>
+    ///
+    /// <para>
+    /// The challenge and the authorization commit together. One SaveChanges used to
+    /// cover both, and ExecuteUpdate cannot be batched into SaveChanges, so an
+    /// explicit transaction keeps a crash in between from leaving an invalid
+    /// challenge under an authorization that still reads pending. No network call
+    /// happens inside it. No retrying execution strategy is configured, so no
+    /// strategy wrapper is needed; if one is ever added, this block and
+    /// <see cref="PassChallengeAsync"/> have to be wrapped with the others.
+    /// </para>
+    /// </summary>
+    private static async Task FailChallengeAsync(
+        CertusDbContext db,
+        Data.Entities.AcmeChallenge challenge,
+        AcmeError error,
+        CancellationToken cancellationToken)
+    {
+        var authz = challenge.Authorization;
+        challenge.Status = "invalid";
+        challenge.ErrorJson = JsonSerializer.Serialize(error);
+
+        await using (var tx = await db.Database.BeginTransactionAsync(cancellationToken))
+        {
+            await db.SaveChangesAsync(cancellationToken);
+
+            await db.AcmeAuthorizations
+                .Where(a => a.Id == authz.Id && a.Status == "pending")
+                .ExecuteUpdateAsync(setters => setters
+                    .SetProperty(a => a.Status, "invalid"),
+                    cancellationToken);
+
+            await tx.CommitAsync(cancellationToken);
+        }
+
+        // ExecuteUpdate goes round the change tracker, and the caller goes on to
+        // RecalculateOrderStatusAsync, which reads the authorizations through this
+        // same scoped DbContext. Identity resolution would hand it the stale tracked
+        // copy still reading "pending", and the order would never be demoted.
+        await db.Entry(authz).ReloadAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Records a challenge that passed. The authorization is promoted from
+    /// "pending" only, by a conditional UPDATE, for the reason
+    /// <see cref="FailChallengeAsync"/> gives. Before issue #481 the promotion was
+    /// an unconditional tracked write, so a validation that finished after another
+    /// request deactivated the authorization set it back to "valid". Once a failure
+    /// can make an authorization invalid while siblings remain, the same write
+    /// would also have resurrected an invalid one.
+    ///
+    /// <para>
+    /// When the authorization is no longer pending or valid by the time the result
+    /// is recorded, the challenge is closed out as the guards at the top of
+    /// ValidateSingleChallengeAsync would have closed it a moment earlier, rather
+    /// than reading "valid" under an authorization it could not make valid.
+    /// </para>
+    /// </summary>
+    private static async Task PassChallengeAsync(
+        CertusDbContext db,
+        Data.Entities.AcmeChallenge challenge,
+        AttestedDeviceData? attested,
+        CancellationToken cancellationToken)
+    {
+        var authz = challenge.Authorization;
+
+        await using var tx = await db.Database.BeginTransactionAsync(cancellationToken);
+
+        await db.AcmeAuthorizations
+            .Where(a => a.Id == authz.Id && a.Status == "pending")
+            .ExecuteUpdateAsync(setters =>
+            {
+                setters.SetProperty(a => a.Status, "valid");
+
+                // A device attestation carries the attested identity; persist it on
+                // the authorization so finalize can bind the CSR key to the attested
+                // key. In the same statement as the promotion, so a valid device
+                // authorization never exists without it.
+                if (attested is not null)
+                {
+                    setters.SetProperty(a => a.AttestedSpki, attested.SpkiBase64);
+                    setters.SetProperty(a => a.AttestationFormat, attested.Format);
+                    setters.SetProperty(a => a.AttestedPropertiesJson, attested.PropertiesJson);
+                }
+            },
+            cancellationToken);
+
+        // Read back what the row settled on, inside the transaction, so the
+        // challenge is written to agree with it. The reload also keeps the tracked
+        // copy current for RecalculateOrderStatusAsync, as in FailChallengeAsync.
+        await db.Entry(authz).ReloadAsync(cancellationToken);
+
+        if (string.Equals(authz.Status, "valid", StringComparison.Ordinal))
+        {
+            challenge.Status = "valid";
+            challenge.ValidatedAt = DateTime.UtcNow;
+        }
+        else
+        {
+            challenge.Status = "invalid";
+            challenge.ErrorJson = JsonSerializer.Serialize(ClosedAuthorizationError(authz.Status));
+        }
+
+        await db.SaveChangesAsync(cancellationToken);
+        await tx.CommitAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// The problem document for a challenge closed out because its authorization
+    /// can no longer be made valid. A deactivation keeps the wording and type it
+    /// had before issue #481, since "deactivated" is what the client asked for and
+    /// says why the challenge stopped.
+    /// </summary>
+    private static AcmeError ClosedAuthorizationError(string authorizationStatus) =>
+        string.Equals(authorizationStatus, "deactivated", StringComparison.Ordinal)
+            ? new AcmeError
+            {
+                Type = AcmeErrorType.Unauthorized,
+                Detail = "The authorization has been deactivated."
+            }
+            : new AcmeError
+            {
+                Type = AcmeErrorType.Malformed,
+                Detail = "The authorization is no longer pending, so this challenge " +
+                         "can no longer make it valid."
+            };
 }

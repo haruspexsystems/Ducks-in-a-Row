@@ -96,7 +96,10 @@ public sealed record CertificateAlertFacts(
 
 /// <summary>
 /// The install wide facts, resolved once by the caller: the alert options, which
-/// notifiers report themselves enabled, and whether this serial is one of ours.
+/// notifiers report themselves enabled, and whether this serial is one of ours
+/// that automatic renewal owns. A certificate of ours that nothing renews, with
+/// renewal turned off or in monitor mode, is false here (issue #470), so it reads
+/// as monitored like any other, which is what the expiry monitor does with it.
 /// </summary>
 public sealed record AlertLadderContext(
     bool AlertingEnabled,
@@ -218,6 +221,7 @@ public static class CertificateAlertLadder
             entry.State = row.Success ? AlertThresholdState.Sent : AlertThresholdState.Failed;
             entry.SentAt = row.SentAt;
             entry.Channels = row.Channels;
+            entry.DeliveredChannels = row.DeliveredChannels;
             entry.ErrorMessage = row.ErrorMessage;
             return entry;
         }
@@ -336,15 +340,25 @@ public sealed class CertificateAlertThreshold
 
     /// <summary>
     /// The channels that were <em>attempted</em>, not the ones that delivered.
-    /// The row aggregates the whole batch, so on a failure this does not say
-    /// which channel failed and the page must not imply that it does.
     /// </summary>
     [JsonPropertyName("channels")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Channels { get; set; }
 
     /// <summary>
-    /// The last failing channel's error, which is all the row carries.
+    /// The attempted channels that delivered, empty when none did (issue #206).
+    /// Null when no row exists, and on a failed row written before the outcome
+    /// was kept per channel, which says only that at least one channel failed;
+    /// the page must not imply which one for such a row.
+    /// </summary>
+    [JsonPropertyName("deliveredChannels")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? DeliveredChannels { get; set; }
+
+    /// <summary>
+    /// The failing channels' errors: the error alone when one channel failed,
+    /// one named line per channel when several did. A row written before
+    /// issue #206 carries the last failing channel's error only.
     /// </summary>
     [JsonPropertyName("errorMessage")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]

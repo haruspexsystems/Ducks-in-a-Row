@@ -139,7 +139,7 @@ public class CaStatusCodeTests
     [Fact]
     public void DescribeRefusal_TheLabCase_TurnsABareDecisionIntoAReason()
     {
-        // The exact string the manual2025 CA answered a template Enroll denial with on
+        // The exact string the lab CA answered a template Enroll denial with on
         // 2026-08-24, request 109. This one assertion is the issue.
         CaStatusCode.DescribeRefusal("Denied by Policy Module", TemplateDeniedFromCom)
             .Should().Be(

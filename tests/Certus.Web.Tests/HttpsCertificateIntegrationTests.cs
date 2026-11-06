@@ -3,6 +3,9 @@ using System.Text;
 using System.Text.Json;
 using Certus.Core.Configuration;
 using Certus.Core.Setup;
+using Certus.Web.Tests.MonitorMode;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Certus.Web.Tests;
 
@@ -20,6 +23,20 @@ public class HttpsCertificateIntegrationTests : IDisposable
     private sealed class Factory : CertusWebApplicationFactory
     {
         public string DataDir => TempDataDir;
+    }
+
+    /// <summary>A host whose machine store holds whatever the test minted.</summary>
+    private sealed class StoreFactory : CertusWebApplicationFactory
+    {
+        public ExistingCertificateIntegrationTests.ListStore Store { get; } = new();
+
+        public string DataDir => TempDataDir;
+
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            base.ConfigureWebHost(builder);
+            builder.ConfigureServices(services => services.AddSingleton<IHttpsCertificateStore>(Store));
+        }
     }
 
     private readonly Factory _factory = new();
@@ -165,6 +182,12 @@ public class HttpsCertificateIntegrationTests : IDisposable
         var autoRenewal = body.GetProperty("autoRenewal");
         autoRenewal.GetProperty("enabled").GetBoolean().Should().BeTrue();
         autoRenewal.GetProperty("windowDays").GetInt32().Should().Be(30);
+
+        // The dev host store holds nothing, so who installed the certificate cannot
+        // be asked (issue #535), and a missing certificate is one the renewal
+        // replaces.
+        body.GetProperty("installedByService").ValueKind.Should().Be(JsonValueKind.Null);
+        autoRenewal.GetProperty("renewsThisCertificate").GetBoolean().Should().BeTrue();
         autoRenewal.GetProperty("failed").GetBoolean().Should().BeFalse();
         autoRenewal.GetProperty("lastOutcome").ValueKind.Should().Be(JsonValueKind.Null);
 
@@ -172,6 +195,43 @@ public class HttpsCertificateIntegrationTests : IDisposable
         // not the served one and a restart is genuinely pending.
         body.GetProperty("restartPending").GetBoolean().Should().BeTrue();
         body.GetProperty("servedThumbprint").ValueKind.Should().Be(JsonValueKind.Null);
+    }
+
+    /// <summary>
+    /// Issue #535. A certificate without the service's friendly name was installed by
+    /// somebody else, typically picked in monitor mode and renewed by Windows
+    /// autoenrolment. The card says so, and that the automatic renewal, although on,
+    /// leaves it to whoever issued it.
+    /// </summary>
+    [Fact]
+    public async Task GetHttpsCertificate_CertificateSomebodyElseInstalled_SaysTheRenewalLeavesIt()
+    {
+        using var factory = new StoreFactory();
+        using var autoenrolled = ExistingCertificateIntegrationTests.Mint("certus.example.com");
+        factory.Store.Certificates.Add(autoenrolled);
+        using var client = factory.CreateClient();
+
+        new SetupStatus
+        {
+            SetupCompleted = true,
+            CompletedAt = DateTime.UtcNow,
+            EnabledTemplates = ["WebServer"],
+            ExternalUrl = "https://certus.example.com:5001",
+        }.Save(Path.Combine(factory.DataDir, SetupStatus.FileName));
+        SettingsOverlay.Save(
+            new SettingsOverlay.OverlaySettings(
+                null, "https://certus.example.com:5001",
+                HttpsCertificateThumbprint: autoenrolled.Thumbprint),
+            Path.Combine(factory.DataDir, "settings.json"));
+
+        var body = await ParseJsonAsync(await client.GetAsync("/api/settings/https-certificate"));
+
+        body.GetProperty("inStore").GetBoolean().Should().BeTrue();
+        body.GetProperty("installedByService").GetBoolean().Should().BeFalse();
+        var autoRenewal = body.GetProperty("autoRenewal");
+        autoRenewal.GetProperty("enabled").GetBoolean().Should().BeTrue(
+            "the setting is on; it is this certificate the renewal leaves alone");
+        autoRenewal.GetProperty("renewsThisCertificate").GetBoolean().Should().BeFalse();
     }
 
     [Fact]

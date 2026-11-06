@@ -432,9 +432,9 @@ public class EabIntegrationTests : IClassFixture<EabIntegrationTests.EabFactory>
             var accountService = scope.ServiceProvider.GetRequiredService<AccountService>();
             var row = await db.AcmeAccounts.SingleAsync(a => a.AccountId == account.AccountId);
 
-            var outcome = await accountService.ChangeKeyAsync(row, ExportRsaJwk(newRsa));
+            var result = await accountService.ChangeKeyAsync(row, ExportRsaJwk(newRsa));
 
-            outcome.Should().Be(KeyChangeOutcome.Changed);
+            result.Outcome.Should().Be(KeyChangeOutcome.Changed);
         }
 
         using (var scope = _factory.Services.CreateScope())

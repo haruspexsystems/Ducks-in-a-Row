@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Tests that boot the real Windows service host, DucksInARow.Service, rather than the
+       development host Certus.Web.Tests boots (issue #413). The service targets
+       net10.0-windows, so this project does too. -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="FluentAssertions" />
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" />
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Certus.Service\Certus.Service.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The synthetic attestation and device CSR builders, shared with Certus.Core.Tests
+         and Certus.Web.Tests as source links rather than copied. -->
+    <Compile Include="..\Certus.Core.Tests\Acme\Attestation\SyntheticAttestationBuilder.cs"
+             Link="DeviceAttest\SyntheticAttestationBuilder.cs" />
+    <Compile Include="..\Certus.Core.Tests\Acme\Attestation\DeviceCsrBuilder.cs"
+             Link="DeviceAttest\DeviceCsrBuilder.cs" />
+    <!-- The route sampler the monitor mode gate tests share with Certus.Web.Tests, so
+         both hosts are sampled the same way (issue #470). -->
+    <Compile Include="..\Certus.Web.Tests\MonitorMode\ProtocolRouteSamples.cs"
+             Link="MonitorMode\ProtocolRouteSamples.cs" />
+    <!-- The issue #381 thread pool aware bound, so a host that never boots reports rather than hangs. -->
+    <Compile Include="..\Shared\PoolAwareWait.cs" Link="Shared\PoolAwareWait.cs" />
+    <!-- Stand in module assemblies with chosen references, shared with Certus.Core.Tests (issue #538). -->
+    <Compile Include="..\Shared\ModuleAssemblyBuilder.cs" Link="Shared\ModuleAssemblyBuilder.cs" />
+
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+    <Using Include="FluentAssertions" />
+  </ItemGroup>
+
+</Project>

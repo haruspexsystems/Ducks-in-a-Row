@@ -163,6 +163,83 @@ public class AdcsColumnMappingTests
     }
 
     [Fact]
+    public void MapToCertificateInfo_SanitizesTheRequester()
+    {
+        // Issue #429. The CA composes this from the submitting account, so whoever
+        // names an account names it, and before the fix it was the one name in
+        // this row mapper that reached the database with no strip.
+        var row = IssuedRow();
+        row["RequesterName"] = "HOME\\web" + (char)0x202e + "01$" + (char)0x2028;
+
+        var info = CreateClient().MapToCertificateInfo(row, EmptyTemplateMap);
+
+        info.Should().NotBeNull();
+        info!.Requestor.Should().Be("HOME\\web01$");
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\u202e\u200b")]
+    public void MapToCertificateInfo_RequesterWithNothingUsable_IsNull(string requester)
+    {
+        // Null rather than empty: the column is nullable and the dashboard renders
+        // a missing requester as unknown, which is the truth for these rows.
+        var row = IssuedRow();
+        row["RequesterName"] = requester;
+
+        var info = CreateClient().MapToCertificateInfo(row, EmptyTemplateMap);
+
+        info.Should().NotBeNull();
+        info!.Requestor.Should().BeNull();
+        // The column was read, so this null is the CA's answer and the sync
+        // must take it, which is why the flag stays down for these values.
+        info.RequestorColumnMissing.Should().BeFalse();
+    }
+
+    [Fact]
+    public void MapToCertificateInfo_RequesterColumnNotResolved_FlagsItAsMissing()
+    {
+        // Issue #547. A column the view did not resolve is never registered, so
+        // ReadColumnValues files no key for it on any row. The requester is null
+        // either way; the flag is what tells the sync not to write that null over
+        // a requester an earlier pass stored.
+        var row = IssuedRow();
+        row.Remove("RequesterName");
+
+        var info = CreateClient().MapToCertificateInfo(row, EmptyTemplateMap);
+
+        info.Should().NotBeNull();
+        info!.Requestor.Should().BeNull();
+        info.RequestorColumnMissing.Should().BeTrue();
+    }
+
+    [Fact]
+    public void MapToCertificateInfo_RequesterColumnResolvedButNull_IsNotMissing()
+    {
+        // The other half of the same distinction. ReadColumnValues stores null for
+        // a resolved column whose value is empty or could not be read, under its
+        // key, so the row says "no requester" rather than "no reading".
+        var row = IssuedRow();
+        row["RequesterName"] = null;
+
+        var info = CreateClient().MapToCertificateInfo(row, EmptyTemplateMap);
+
+        info.Should().NotBeNull();
+        info!.Requestor.Should().BeNull();
+        info.RequestorColumnMissing.Should().BeFalse();
+    }
+
+    [Fact]
+    public void MapToCertificateInfo_RequesterColumnPresent_IsNotMissing()
+    {
+        var info = CreateClient().MapToCertificateInfo(IssuedRow(), EmptyTemplateMap);
+
+        info.Should().NotBeNull();
+        info!.RequestorColumnMissing.Should().BeFalse();
+    }
+
+    [Fact]
     public void MapToCertificateInfo_RevokedRow_PopulatesRevocationFields()
     {
         var revokedWhen = new DateTime(2026, 7, 5, 12, 0, 0, DateTimeKind.Utc);
@@ -398,8 +475,8 @@ public class AdcsColumnMappingTests
         // stored bare with no "CN=" prefix.
         var der = CreateCertificate("", san =>
         {
-            san.AddDnsName("linux.manual2025.local");
-            san.AddDnsName("alt.manual2025.local");
+            san.AddDnsName("linux.corp.example.com");
+            san.AddDnsName("alt.corp.example.com");
         });
         var row = IssuedRow();
         row["CommonName"] = "";
@@ -409,9 +486,9 @@ public class AdcsColumnMappingTests
         var info = CreateClient().MapToCertificateInfo(row, EmptyTemplateMap);
 
         info.Should().NotBeNull();
-        info!.Subject.Should().Be("linux.manual2025.local");
+        info!.Subject.Should().Be("linux.corp.example.com");
         info.SubjectAlternativeNames.Should().Be(
-            "dns:linux.manual2025.local, dns:alt.manual2025.local");
+            "dns:linux.corp.example.com, dns:alt.corp.example.com");
     }
 
     [Fact]

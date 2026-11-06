@@ -1,6 +1,7 @@
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
+using Certus.Core.Configuration;
 using Microsoft.Extensions.Logging;
 
 namespace Certus.Core.Setup;
@@ -43,11 +44,29 @@ public sealed class ExternalUrlProbe : IExternalUrlProbe
     private static readonly HttpRequestOptionsKey<SslPolicyErrors> SslPolicyErrorsKey =
         new("Certus.ExternalUrlProbe.SslPolicyErrors");
 
-    public ExternalUrlProbe(HttpClient httpClient, ILogger<ExternalUrlProbe> logger)
+    private readonly CertusInstanceMode _instanceMode;
+
+    public ExternalUrlProbe(
+        HttpClient httpClient, CertusInstanceMode instanceMode, ILogger<ExternalUrlProbe> logger)
     {
         _httpClient = httpClient;
+        _instanceMode = instanceMode;
         _logger = logger;
     }
+
+    /// <summary>
+    /// The notice for a server whose certificate does not validate from here. It
+    /// names who will have to trust the certificate: ACME clients in full mode, and
+    /// browsers opening the dashboard in monitor mode, which serves no ACME
+    /// directory (issue #532).
+    /// </summary>
+    internal static string DescribeCertificateWarning(
+        string authority, SslPolicyErrors errors, bool monitorMode) =>
+        $"The server answered at {authority}, but its TLS certificate does not " +
+        $"validate from here ({errors}). " +
+        (monitorMode
+            ? "Browsers opening the dashboard will need to trust the certificate or its issuing CA."
+            : "ACME clients will need to trust the certificate or its issuing CA.");
 
     /// <summary>
     /// The message handler for the probe's typed HttpClient. Accepts every
@@ -92,10 +111,7 @@ public sealed class ExternalUrlProbe : IExternalUrlProbe
             if (request.Options.TryGetValue(SslPolicyErrorsKey, out var sslErrors)
                 && sslErrors != SslPolicyErrors.None)
             {
-                certificateWarning =
-                    $"The server answered at {authority}, but its TLS certificate does not " +
-                    $"validate from here ({sslErrors}). ACME clients will need to trust the " +
-                    "certificate or its issuing CA.";
+                certificateWarning = DescribeCertificateWarning(authority, sslErrors, _instanceMode.IsMonitor);
             }
 
             _logger.LogInformation(

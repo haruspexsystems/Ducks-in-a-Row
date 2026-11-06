@@ -35,6 +35,12 @@ export interface ServiceRightsRow {
   /** True for a right only an optional feature needs (Issue and Manage, for revocation). */
   optional: boolean;
   template: string | null;
+  /**
+   * Why the row does not matter on this server, or null when it does. "monitorMode"
+   * marks a right only issuance or revocation uses, on a server that does neither
+   * (issue #470). The status still says what the check found.
+   */
+  notNeeded?: 'monitorMode' | null;
 }
 
 export interface ServiceRightsIdentity {
@@ -53,6 +59,12 @@ export interface ServiceRightsReport {
   /** True on the dev host: the report describes an example estate, not a real CA. */
   simulated: boolean;
   checkedAt: string;
+  /**
+   * How many templates enabled for ACME the Settings check left out, because one
+   * check reads a limited number (issue #478). They have no rows, so the card says
+   * so. Always 0 from the wizard's check, which refuses a longer list instead.
+   */
+  templatesNotChecked: number;
 }
 
 /**

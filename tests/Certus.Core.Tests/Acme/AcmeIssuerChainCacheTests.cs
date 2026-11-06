@@ -82,6 +82,29 @@ public class AcmeIssuerChainCacheTests
         afterRecovery.Should().NotBeNull();
     }
 
+    [Fact]
+    public async Task GetPemChainAsync_CaRefusal_PropagatesAndDoesNotCacheTheFailure()
+    {
+        // Issue #476: a CA refusing the service the chain leaves as itself, so the
+        // endpoint can answer it apart from an outage, and like an outage it is not
+        // remembered: the right granted back must take effect on the next request.
+        var der = SelfSignedDer("CN=Issuing CA");
+        _adcs.GetCaCertificateChainAsync(Arg.Any<CancellationToken>())
+            .Returns(
+                _ => throw new CaAccessDeniedException(
+                    CaAccessDeniedException.ChainReadPermissionMessage, new UnauthorizedAccessException()),
+                _ => Task.FromResult<IReadOnlyList<byte[]>>(new[] { der }));
+        var cache = NewCache();
+
+        var refused = async () => await cache.GetPemChainAsync();
+        await refused.Should().ThrowAsync<CaAccessDeniedException>();
+
+        var afterTheGrant = await cache.GetPemChainAsync();
+
+        afterTheGrant.Should().NotBeNull();
+        await _adcs.Received(2).GetCaCertificateChainAsync(Arg.Any<CancellationToken>());
+    }
+
     private static byte[] SelfSignedDer(string subject)
     {
         using var rsa = RSA.Create(2048);

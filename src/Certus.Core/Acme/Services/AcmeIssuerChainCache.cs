@@ -66,6 +66,11 @@ public sealed class AcmeIssuerChainCache
     /// <see cref="IAdcsClient.GetCaCertificateChainAsync"/> documents), or null
     /// when the CA is unavailable.
     /// </summary>
+    /// <exception cref="CaAccessDeniedException">
+    /// The CA refused the service the chain (issue #476). Left to the caller rather
+    /// than folded into the null, so the endpoint can say which of the two it was,
+    /// and never cached, like an outage: nothing is stored on the way out.
+    /// </exception>
     public async Task<string?> GetPemChainAsync(CancellationToken cancellationToken = default)
     {
         if (ReadFresh() is { } cached)

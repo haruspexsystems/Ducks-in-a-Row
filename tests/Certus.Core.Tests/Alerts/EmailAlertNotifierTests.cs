@@ -19,7 +19,7 @@ public class EmailAlertNotifierTests
     /// The same prefix scheme as the EAB tests' fake: recognisable blobs
     /// unprotect, anything else reports the keyring-mismatch null.
     /// </summary>
-    private sealed class FakeSecretProtector : ISecretProtector
+    private sealed class FakeSecretProtector : ISmtpSecretProtector
     {
         private const string Prefix = "protected:";
 
@@ -29,6 +29,8 @@ public class EmailAlertNotifierTests
             protectedValue.StartsWith(Prefix, StringComparison.Ordinal)
                 ? protectedValue[Prefix.Length..]
                 : null;
+
+        public string Rewrite(string protectedValue) => protectedValue;
     }
 
     private static EmailAlertNotifier CreateNotifier(SmtpOptions? smtp) =>
@@ -218,9 +220,46 @@ public class EmailAlertNotifierTests
         result.ErrorMessage.Should().Be("No valid recipient addresses");
     }
 
+    [Fact]
+    public async Task SendLicenceAlert_WhenNotConfigured_ReturnsFailure()
+    {
+        var sut = CreateNotifier(null);
+
+        var result = await sut.SendLicenceAlertAsync(CreateLicenceAlert());
+
+        result.Success.Should().BeFalse();
+        result.ErrorMessage.Should().Be("SMTP not configured");
+    }
+
+    [Fact]
+    public async Task SendLicenceAlert_WhenAllRecipientsMalformed_ReturnsFailure()
+    {
+        var sut = CreateNotifier(new SmtpOptions
+        {
+            Host = "smtp.example.com",
+            Recipients = ["not an email"]
+        });
+
+        var result = await sut.SendLicenceAlertAsync(CreateLicenceAlert());
+
+        result.Success.Should().BeFalse();
+        result.ErrorMessage.Should().Be("No valid recipient addresses");
+    }
+
+    private static LicenceAlert CreateLicenceAlert() => new(
+        LicenceAlertKind.Expiring,
+        LicenceAlertStages.Days7,
+        "0192a3b4-c5d6-7e8f-9a0b-1c2d3e4f5a6b",
+        "standard",
+        new DateTimeOffset(2027, 1, 1, 0, 0, 0, TimeSpan.Zero),
+        new DateTimeOffset(2027, 1, 31, 0, 0, 0, TimeSpan.Zero),
+        6);
+
     [Theory]
     [InlineData("expiry")]
     [InlineData("server")]
+    [InlineData("crl")]
+    [InlineData("licence")]
     [InlineData("test")]
     public async Task Send_WhenBuildingTheMessageThrows_ReturnsFailureRatherThanThrowing(string kind)
     {
@@ -243,6 +282,9 @@ public class EmailAlertNotifierTests
         {
             "expiry" => await sut.SendExpiryAlertAsync(CreateTestBatch()),
             "server" => await sut.SendServerCertificateAlertAsync(new ServerCertificateAlert("denied")),
+            "crl" => await sut.SendCrlAlertAsync(new CrlAlert(
+                "30", "CN=Example Issuing CA", "base", "issuing", DateTime.UtcNow.AddDays(30), 720, ["ca"])),
+            "licence" => await sut.SendLicenceAlertAsync(CreateLicenceAlert()),
             _ => await sut.SendTestAlertAsync(new TestAlert("CONTOSO\\alice", DateTime.UtcNow)),
         };
 
@@ -285,6 +327,29 @@ public class EmailAlertNotifierTests
 
         message.Headers["X-Certus-Alert-Kind"].Should().Be("test");
         ((MimeKit.TextPart)message.Body!).Text!.Should().Contain("CONTOSO\\alice");
+    }
+
+    [Fact]
+    public void BuildServerCertificateMessage_CarriesTheDetailThatNamesTheAccount()
+    {
+        // Issue #485 keeps the computer account off the webhook only. The mail goes to
+        // the operator's own recipients, and the account is the one to grant Enroll to,
+        // so it carries the full detail and not the account free form.
+        var smtp = new SmtpOptions { Host = "smtp.example.com", Recipients = ["admin@example.com"] };
+        var recipients = EmailAlertNotifier.ParseRecipients(smtp.Recipients, out _);
+
+        var message = EmailAlertNotifier.BuildServerCertificateMessage(
+            new ServerCertificateAlert(
+                "Denied",
+                Detail: "The service enrolls as the computer account DUCKS01$ in domain ad.example.com.",
+                Template: "WebServer",
+                DaysRemaining: 9,
+                WireDetail: "The service's computer account lacks Enroll permission."),
+            smtp, recipients);
+
+        var body = ((MimeKit.TextPart)message.Body!).Text!;
+        body.Should().Contain("DUCKS01$ in domain ad.example.com");
+        body.Should().NotContain("lacks Enroll permission");
     }
 
     private static MimeKit.MimeMessage BuildTest()

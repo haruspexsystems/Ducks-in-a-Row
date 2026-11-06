@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using Certus.Core.Acme.Services;
 using Microsoft.Extensions.Options;
 
@@ -46,6 +48,28 @@ public class ChallengeHttpHandlerFactoryTests
 
         thrown.InnerException.Should().BeOfType<AddressBlockedException>()
             .Which.Message.Should().Contain("port 8080");
+    }
+
+    [Fact]
+    public async Task SslOptions_NeverDownloadAnIssuerTheChallengeCertificateNames()
+    {
+        // After a redirect to https, SslStream builds the challenge server's chain with this
+        // policy, so it decides whether a download address in the presented certificate is
+        // followed (#642). Server authentication stays required of the chain, as SslStream's
+        // own default policy requires it.
+        await using var listener = new AiaDownloadListener();
+        using var leaf = listener.CreateOrphanLeaf();
+        using var handler = ChallengeHttpHandlerFactory.Create(
+            Guard(), new ChallengeValidationOptions { AllowRedirects = true });
+        var policy = handler.SslOptions.CertificateChainPolicy;
+        policy.Should().NotBeNull("without a policy SslStream builds the chain with downloads on");
+        policy!.ApplicationPolicy.Cast<Oid>().Select(o => o.Value).Should().Equal("1.3.6.1.5.5.7.3.1");
+
+        using var chain = new X509Chain { ChainPolicy = policy.Clone() };
+        chain.Build(leaf).Should().BeFalse();
+
+        chain.ChainStatus.Select(s => s.Status).Should().Contain(X509ChainStatusFlags.PartialChain);
+        listener.Connections.Should().Be(0, "the chain must not download the issuer the certificate names");
     }
 
     private static AddressGuard Guard() =>

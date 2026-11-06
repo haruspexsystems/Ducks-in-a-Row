@@ -2,6 +2,7 @@ using System.Text.Json;
 using Certus.Core.Acme.Crypto;
 using Certus.Core.Acme.Models;
 using Certus.Core.Acme.Services;
+using Certus.Core.Data.Entities;
 using Certus.Core.Security;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
@@ -9,8 +10,8 @@ using Microsoft.AspNetCore.RateLimiting;
 namespace Certus.Web.Controllers.Acme;
 
 /// <summary>
-/// ACME challenge endpoint: respond to challenges to prove domain control.
-/// RFC 8555 §7.5.1
+/// ACME challenge endpoint: read a challenge (POST-as-GET), or respond to it to
+/// prove control of the identifier. RFC 8555 §7.5.1
 /// </summary>
 [ApiController]
 [EnableRateLimiting(AcmeRateLimitPolicies.General)]
@@ -20,7 +21,11 @@ public sealed class ChallengeController : AcmeControllerBase
     /// Cap on the whole challenge POST body. Network challenges post an
     /// empty object; only a device attestation carries bulk, and a real
     /// Apple attestation object is a few kilobytes, so a quarter megabyte
-    /// of JWS envelope is generous for any honest client.
+    /// of JWS envelope is generous for any honest client. Declared on the
+    /// action, so it overrides <see cref="AcmeControllerBase.MaxRequestBytes"/>
+    /// for this endpoint alone. It must also hold the largest attObj that
+    /// <see cref="MaxAttestationObjectChars"/> admits once the JWS has encoded
+    /// the payload again, which is about 130 KB.
     /// </summary>
     private const int MaxChallengeRequestBytes = 262_144;
 
@@ -48,12 +53,18 @@ public sealed class ChallengeController : AcmeControllerBase
     }
 
     /// <summary>
-    /// POST /acme/{template}/chall/{challengeId} — respond to a challenge.
-    /// For the network challenge types the client POSTs an empty JSON object
-    /// {} to indicate it has provisioned the challenge response and is ready
-    /// for validation (RFC 8555 §7.5.1). For device-attest-01 the response
-    /// carries the attestation itself as {"attObj": base64url}
-    /// (draft-ietf-acme-device-attest-08 section 5.1).
+    /// POST /acme/{template}/chall/{challengeId}: read a challenge or respond to it.
+    ///
+    /// One URL, two operations, told apart by the payload, as the authorization and
+    /// account URLs are. An empty payload is a POST-as-GET (RFC 8555 §6.3) and reads
+    /// the challenge for every type, changing nothing. Anything else is a response.
+    /// For the network challenge types the client POSTs an empty JSON object {} to
+    /// indicate it has provisioned the challenge response and is ready for validation
+    /// (RFC 8555 §7.5.1). For device-attest-01 the response carries the attestation
+    /// itself as {"attObj": base64url} (draft-ietf-acme-device-attest-08 section 5.1).
+    ///
+    /// Every 200 carries the Link rel="up" header naming the authorization the
+    /// challenge belongs to (RFC 8555 §7.1), whichever arm answered.
     /// </summary>
     [HttpPost("/acme/{template}/chall/{challengeId}")]
     [Consumes("application/jose+json")]
@@ -81,20 +92,22 @@ public sealed class ChallengeController : AcmeControllerBase
         // accepted attObj is the one that gets validated, and a re-POST
         // cannot replace it.
         if (challenge.Status != "pending")
-        {
-            var currentResponse = OrderService.ToChallengeResponse(challenge, template, AcmeUrl);
-            return Ok(currentResponse);
-        }
+            return ChallengeOk(challenge, template);
+
+        // An empty payload is POST-as-GET (RFC 8555 §6.3): read the challenge and
+        // change nothing, for every challenge type. Only a payload answers it
+        // (§7.5.1). Until issue #482 only device-attest-01 made this test, so a
+        // client reading a pending http-01, dns-01 or tls-alpn-01 challenge started
+        // its validation, possibly before it had provisioned the response.
+        // JwsService decodes an absent payload to an empty array, never null, so
+        // length is the whole test. It must stay above the deactivated authorization
+        // refusal below, whose comment says why.
+        if (auth.PayloadBytes is not { Length: > 0 })
+            return ChallengeOk(challenge, template);
 
         string? attestationObject = null;
         if (challenge.Type == DeviceAttest01ChallengeValidator.TypeName)
         {
-            // POST-as-GET (empty payload) fetches the resource without
-            // answering it, so a client can poll a pending device challenge
-            // without spending its attestation.
-            if (auth.PayloadBytes is not { Length: > 0 })
-                return Ok(OrderService.ToChallengeResponse(challenge, template, AcmeUrl));
-
             var intakeError = TryReadAttestationObject(auth.PayloadBytes, out attestationObject);
             if (intakeError != null)
                 return intakeError;
@@ -114,6 +127,24 @@ public sealed class ChallengeController : AcmeControllerBase
             return AcmeError(403, AcmeErrorType.Unauthorized,
                 "The authorization for this challenge has been deactivated.");
 
+        // RFC 8555 §7.1.6: once one challenge has failed, its authorization is
+        // invalid and stays that way (issue #481), so a sibling challenge can no
+        // longer make it valid. Refused here so the client learns that at once,
+        // rather than watching the sibling move to "processing" only for the
+        // validation worker to close it out unvalidated. Placed after the
+        // deactivated check, which keeps its own 403, and for the same reason it
+        // sits here: only the state change is refused, not the read paths above.
+        //
+        // An allow list. "valid" stays answerable because a client may answer a
+        // second challenge on an authorization a sibling already proved, which
+        // changes nothing either way, and refusing it would be a behaviour change
+        // nobody asked for. A status added later fails closed.
+        if (!string.Equals(challenge.Authorization.Status, "pending", StringComparison.Ordinal) &&
+            !string.Equals(challenge.Authorization.Status, "valid", StringComparison.Ordinal))
+            return AcmeError(400, AcmeErrorType.Malformed,
+                "The authorization for this challenge is no longer pending, so the " +
+                "challenge cannot be responded to.");
+
         // Transition to "processing" — the background validation service will pick it up
         var moved = await _orderService.RespondToChallengeAsync(challengeId, attestationObject, ct);
         if (!moved)
@@ -125,14 +156,24 @@ public sealed class ChallengeController : AcmeControllerBase
         if (challenge == null)
             return AcmeError(500, AcmeErrorType.ServerInternal,
                 "Challenge could not be reloaded after the state transition.");
-        var response = OrderService.ToChallengeResponse(challenge, template, AcmeUrl);
 
-        // Return the challenge URL in the Link header as required by RFC 8555
+        return ChallengeOk(challenge, template);
+    }
+
+    /// <summary>
+    /// Answers 200 with the challenge object and a Link rel="up" header naming its
+    /// authorization. RFC 8555 §7.1 gives the "up" relation to challenge resources
+    /// for exactly that, and certbot reads it off the response to its answer. Every
+    /// arm that answers 200 goes through here, so a read and a response cannot
+    /// drift apart on the header.
+    /// </summary>
+    private IActionResult ChallengeOk(AcmeChallenge challenge, string template)
+    {
         var authzUrl = AcmeUrl(
             $"/acme/{template}/authz/{challenge.Authorization.AuthorizationId}");
         Response.Headers.Append("Link", $"<{authzUrl}>;rel=\"up\"");
 
-        return Ok(response);
+        return Ok(OrderService.ToChallengeResponse(challenge, template, AcmeUrl));
     }
 
     /// <summary>

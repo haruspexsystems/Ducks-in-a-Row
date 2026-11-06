@@ -249,7 +249,7 @@ public class ServiceRightsCheckTests : IDisposable
     [Fact]
     public async Task AnInstalledHttpsCertificateFromThisCa_ProvesItsTemplate()
     {
-        var (caCertificate, leaf) = IssueHttpsCertificate(ServiceRightsCheck.HttpsCertificateFriendlyName);
+        var (caCertificate, leaf) = IssueHttpsCertificate(HttpsCertificateOwnership.FriendlyName);
         RecordHttpsCertificate("WebServerACME");
         _store.Find("AB12").Returns(_ => new X509Certificate2(leaf));
         _client.GetCaCertificateChainAsync(Arg.Any<CancellationToken>()).Returns(new List<byte[]> { caCertificate.RawData });
@@ -265,8 +265,8 @@ public class ServiceRightsCheckTests : IDisposable
     {
         // A thumbprint left behind by an earlier install against a different
         // CA: installed, ours, and still no proof about the CA being checked.
-        var (_, leaf) = IssueHttpsCertificate(ServiceRightsCheck.HttpsCertificateFriendlyName, "CN=Previous CA");
-        var (thisCa, _) = IssueHttpsCertificate(ServiceRightsCheck.HttpsCertificateFriendlyName);
+        var (_, leaf) = IssueHttpsCertificate(HttpsCertificateOwnership.FriendlyName, "CN=Previous CA");
+        var (thisCa, _) = IssueHttpsCertificate(HttpsCertificateOwnership.FriendlyName);
         RecordHttpsCertificate("WebServerACME");
         _store.Find("AB12").Returns(_ => new X509Certificate2(leaf));
         _client.GetCaCertificateChainAsync(Arg.Any<CancellationToken>()).Returns(new List<byte[]> { thisCa.RawData });
@@ -293,7 +293,7 @@ public class ServiceRightsCheckTests : IDisposable
     [Fact]
     public async Task ARecordWithNoTemplate_ProvesNothing()
     {
-        var (caCertificate, leaf) = IssueHttpsCertificate(ServiceRightsCheck.HttpsCertificateFriendlyName);
+        var (caCertificate, leaf) = IssueHttpsCertificate(HttpsCertificateOwnership.FriendlyName);
         RecordHttpsCertificate(template: null);
         _store.Find("AB12").Returns(_ => new X509Certificate2(leaf));
         _client.GetCaCertificateChainAsync(Arg.Any<CancellationToken>()).Returns(new List<byte[]> { caCertificate.RawData });

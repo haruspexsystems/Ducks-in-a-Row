@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { CheckCircle2, Server, FileCheck2, Globe, Loader2, AlertTriangle, RefreshCw, Copy, KeyRound, ShieldAlert, ShieldCheck } from 'lucide-react';
+import { CheckCircle2, Server, FileCheck2, Globe, Loader2, AlertTriangle, RefreshCw, Copy, KeyRound, ShieldAlert, ShieldCheck, BellRing, Bell } from 'lucide-react';
 import { completeSetup, waitForServiceRestart, type SetupUnreachableUrlResponse } from '@/api/setup';
+import { ReleaseNotice } from '@/components/ReleaseNotice';
+import { SecurityNotices } from '@/components/SecurityNotices';
+import { recordedEabEnforcement, recordedTemplates } from '@/lib/setupWizard';
 import { certbotKeyFlags, resolveTemplateKey } from '@/lib/templateKey';
 import { ServiceRightsAcknowledgement } from './ServiceRightsAcknowledgement';
 import type { WizardState } from './SetupWizard';
@@ -8,12 +11,16 @@ import type { WizardState } from './SetupWizard';
 interface ReviewStepProps {
   state: WizardState;
   onUpdate: (updates: Partial<WizardState>) => void;
-  onComplete: () => void;
+  /** Leave the wizard, for the dashboard or the given path. */
+  onComplete: (path?: string) => void;
 }
 
 type Phase = 'review' | 'restarting' | 'completed' | 'manual-restart';
 
 export function ReviewStep({ state, onUpdate, onComplete }: ReviewStepProps) {
+  // Monitor mode records no template and no domain restriction, and alerts are
+  // what it is for, so the review points there (issue #471).
+  const monitorMode = state.mode === 'monitor';
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>('review');
@@ -42,10 +49,11 @@ export function ReviewStep({ state, onUpdate, onComplete }: ReviewStepProps) {
     try {
       const outcome = await completeSetup({
         caConnectionString: state.caConnectionString,
-        enabledTemplates: state.selectedTemplates,
+        enabledTemplates: recordedTemplates(state.mode, state.selectedTemplates),
         externalUrl: state.externalUrl,
-        allowedDomainsEnabled: state.allowedDomainsEnabled,
-        allowedDomains: state.allowedDomains,
+        allowedDomainsEnabled: monitorMode ? false : state.allowedDomainsEnabled,
+        allowedDomains: monitorMode ? [] : state.allowedDomains,
+        eabEnforcement: recordedEabEnforcement(state.mode, state.eabEnforcement),
         // Either confirmed at the URL step, or confirmed just now in the
         // refusal panel below.
         confirmUnreachableExternalUrl:
@@ -118,6 +126,60 @@ export function ReviewStep({ state, onUpdate, onComplete }: ReviewStepProps) {
     );
   }
 
+  if (phase === 'completed' && monitorMode) {
+    return (
+      <div className="space-y-6 text-center py-8">
+        <CheckCircle2 className="h-16 w-16 text-emerald-500 mx-auto" />
+        <div>
+          <h2 className="text-2xl font-bold text-ink">Setup Complete!</h2>
+          <p className="text-sm text-muted mt-2">
+            Ducks in a Row is watching your certificate authority. It never issues or revokes.
+          </p>
+        </div>
+
+        <div className="bg-certus-50 dark:bg-certus-500/10 border border-certus-200 dark:border-certus-500/30 rounded-lg p-4 text-left max-w-md mx-auto">
+          <h3 className="text-sm font-semibold text-certus-900 dark:text-certus-200 mb-2">Next steps:</h3>
+          <ol className="text-sm text-certus-700 dark:text-certus-300 space-y-1.5 list-decimal list-inside">
+            <li>
+              Set up alerts. In monitor mode they are how an expiring certificate or a stale
+              revocation list reaches you, and nothing is sent until a channel is set up.
+            </li>
+            <li>Watch the first certificate sync fill the inventory on the dashboard.</li>
+            <li>Check the revocation lists card on the Settings page.</li>
+          </ol>
+        </div>
+
+        <div className="bg-sunken border border-hairline rounded-lg p-4 text-left max-w-md mx-auto">
+          <div className="flex items-center gap-2 mb-2">
+            <BellRing className="h-4 w-4 text-certus-600 dark:text-certus-300" />
+            <h3 className="text-sm font-semibold text-ink">Hear about security fixes and updates</h3>
+          </div>
+          <SecurityNotices />
+          {/* Issue #623: said once here, and for good on the Settings page. */}
+          <ReleaseNotice className="mt-3" />
+        </div>
+
+        <div className="flex flex-wrap items-center justify-center gap-3">
+          <button
+            onClick={() => onComplete('/settings#alerts')}
+            className="inline-flex items-center gap-2 px-6 py-2.5 text-sm font-medium text-white
+                       bg-certus-600 rounded-lg hover:bg-certus-700 transition-colors"
+          >
+            <Bell className="h-4 w-4" />
+            Set up alerts
+          </button>
+          <button
+            onClick={() => onComplete()}
+            className="inline-flex items-center gap-2 px-6 py-2.5 text-sm font-medium text-ink-soft
+                       bg-surface border border-hairline-strong rounded-lg hover:bg-sunken transition-colors"
+          >
+            Go to Dashboard
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   if (phase === 'completed') {
     // The saved ExternalUrl is not normalized; a trailing slash would put a
     // double slash in the path, which the ACME routes do not match.
@@ -141,6 +203,17 @@ export function ReviewStep({ state, onUpdate, onComplete }: ReviewStepProps) {
                 {directoryUrl}
               </code>
             </li>
+            {state.eabEnforcement === 'required' && (
+              // Issue #631: binding is required, so the first client cannot
+              // register until it holds a credential. Leaving it on is the
+              // point; this says what it costs.
+              <li>
+                Create a credential for each client on the ACME page
+                (Credentials, New credential) and give it the key ID and HMAC
+                key. Binding is on so that only clients you hand a credential
+                can register.
+              </li>
+            )}
             <li>Configure HTTP-01, DNS-01, or TLS-ALPN-01 challenge validation</li>
             <li>Request your first certificate!</li>
           </ol>
@@ -150,10 +223,23 @@ export function ReviewStep({ state, onUpdate, onComplete }: ReviewStepProps) {
           directoryUrl={directoryUrl}
           keyAlgorithm={state.templateKeyAlgorithm}
           minimalKeySize={state.templateMinimalKeySize}
+          eabRequired={state.eabEnforcement === 'required'}
         />
 
+        {/* Issue #242: the one moment setup has the operator's attention, so
+            the sign up is offered here. The Settings page keeps it after. */}
+        <div className="bg-sunken border border-hairline rounded-lg p-4 text-left max-w-md mx-auto">
+          <div className="flex items-center gap-2 mb-2">
+            <BellRing className="h-4 w-4 text-certus-600 dark:text-certus-300" />
+            <h3 className="text-sm font-semibold text-ink">Hear about security fixes and updates</h3>
+          </div>
+          <SecurityNotices />
+          {/* Issue #623: said once here, and for good on the Settings page. */}
+          <ReleaseNotice className="mt-3" />
+        </div>
+
         <button
-          onClick={onComplete}
+          onClick={() => onComplete()}
           className="inline-flex items-center gap-2 px-6 py-2.5 text-sm font-medium text-white
                      bg-certus-600 rounded-lg hover:bg-certus-700 transition-colors"
         >
@@ -196,6 +282,7 @@ export function ReviewStep({ state, onUpdate, onComplete }: ReviewStepProps) {
         </div>
 
         {/* Templates */}
+        {!monitorMode && (
         <div className="border border-hairline rounded-lg p-4">
           <div className="flex items-center gap-2 mb-2">
             <FileCheck2 className="h-4 w-4 text-certus-600" />
@@ -214,8 +301,32 @@ export function ReviewStep({ state, onUpdate, onComplete }: ReviewStepProps) {
             ))}
           </div>
         </div>
+        )}
+
+        {/* External account binding (issue #631) */}
+        {!monitorMode && (
+        <div className="border border-hairline rounded-lg p-4">
+          <div className="flex items-center gap-2 mb-2">
+            <KeyRound className="h-4 w-4 text-certus-600" />
+            <h3 className="text-sm font-semibold text-ink">External Account Binding</h3>
+          </div>
+          {state.eabEnforcement === 'required' ? (
+            <p className="text-sm text-ink">
+              Required. A client registers only with a credential you create on
+              the ACME page.
+            </p>
+          ) : (
+            <p className="text-sm text-ink">
+              {state.eabEnforcement === 'optional' ? 'Optional' : 'Off'}. Any
+              client that can reach this server can register without a
+              credential.
+            </p>
+          )}
+        </div>
+        )}
 
         {/* Domain restriction */}
+        {!monitorMode && (
         <div className="border border-hairline rounded-lg p-4">
           <div className="flex items-center gap-2 mb-2">
             <ShieldCheck className="h-4 w-4 text-certus-600" />
@@ -244,6 +355,7 @@ export function ReviewStep({ state, onUpdate, onComplete }: ReviewStepProps) {
             </p>
           )}
         </div>
+        )}
 
         {/* External URL */}
         <div className="border border-hairline rounded-lg p-4">
@@ -253,14 +365,36 @@ export function ReviewStep({ state, onUpdate, onComplete }: ReviewStepProps) {
           </div>
           <p className="text-sm text-ink font-mono">{state.externalUrl}</p>
           <p className="text-xs text-muted mt-1">
-            ACME directories will be available at {state.externalUrl}/acme/{'{template}'}/directory
+            {monitorMode
+              ? 'The dashboard address. Monitor mode serves no ACME directory.'
+              : `ACME directories will be available at ${state.externalUrl}/acme/{template}/directory`}
           </p>
         </div>
+
+        {/* Alerts: in monitor mode they are the product (issue #471). */}
+        {monitorMode && (
+          <div className="border border-hairline rounded-lg p-4">
+            <div className="flex items-center gap-2 mb-2">
+              <Bell className="h-4 w-4 text-certus-600" />
+              <h3 className="text-sm font-semibold text-ink">Alerts</h3>
+            </div>
+            <p className="text-sm text-ink">
+              In monitor mode alerts are how an expiring certificate or a stale revocation list
+              reaches you. Nothing is sent until a channel is set up.
+            </p>
+            <p className="text-xs text-muted mt-1">
+              Once setup completes, set up email on the Settings page, where the SMTP password can be
+              saved too, or configure a webhook under Certus:Alerts:Webhook in appsettings.json. The
+              dashboard shows a warning until one of them can deliver.
+            </p>
+          </div>
+        )}
       </div>
 
       <ServiceRightsAcknowledgement
         caConnectionString={state.caConnectionString}
-        templates={state.selectedTemplates}
+        templates={recordedTemplates(state.mode, state.selectedTemplates)}
+        monitorMode={monitorMode}
         onReadyChange={setRightsAcknowledged}
       />
 
@@ -337,10 +471,13 @@ function RsaKeyNote({
   directoryUrl,
   keyAlgorithm,
   minimalKeySize,
+  eabRequired,
 }: {
   directoryUrl: string;
   keyAlgorithm: string | null;
   minimalKeySize: number | null;
+  /** Binding is required (issue #631), so the command must carry a credential. */
+  eabRequired: boolean;
 }) {
   const [copied, setCopied] = useState(false);
   const copyTimer = useRef<ReturnType<typeof setTimeout>>();
@@ -399,8 +536,11 @@ function RsaKeyNote({
     );
   }
 
+  // Without a credential a first registration is refused with
+  // externalAccountRequired, so the command names where the two values go.
   const commandPrefix =
     `certbot certonly --standalone --server ${directoryUrl} -d <your host> ` +
+    (eabRequired ? '--eab-kid <key ID> --eab-hmac-key <HMAC key> ' : '') +
     '-m <your-email@example.com> --agree-tos --no-eff-email';
   const command = `${commandPrefix} ${keyFlags}`;
 

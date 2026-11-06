@@ -73,6 +73,22 @@ ds-bundle/
 # Claude worktrees
 .claude/worktrees/
 
+# Claude per machine permissions (issue #613). Each checkout keeps its own; the
+# shared read only allow list lives in .claude/settings.json.
+.claude/settings.local.json
+
+# Where release/Publish-Release.ps1 archives each public release (issue #626).
+# A host path, so it lives in this untracked file or in an environment
+# variable, never in the script.
+release/Publish-Release.local.json
+
 # Python bytecode from docs/generate_guide.py
 __pycache__/
 *.pyc
+
+# The installation guide is rendered, never committed (issue #662): by the PR
+# build as an artifact and by release/Publish-Release.ps1 into the public
+# source snapshot. A local render stays out of git, and so does the inputs
+# digest an older checkout may still carry.
+docs/Ducks-in-a-Row-Installation-Guide.pdf
+docs/guide-inputs.sha256

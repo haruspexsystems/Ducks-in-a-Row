@@ -47,16 +47,7 @@ public class AlertQueryServiceTests : IDisposable
     /// one Ducks serves its own web interface with. Same shape as the helper in
     /// <see cref="ExpiryMonitorServiceTests"/>.
     /// </summary>
-    private static ServerCertificateIdentity NoServerCertificate() =>
-        new(Substitute.For<IHttpsCertificateStore>(),
-            Options.Create(new CertusOptions
-            {
-                // A path that does not exist, so a unit test never reads the
-                // operator's real ProgramData overlay.
-                SettingsOverlayPath = Path.Combine(
-                    Path.GetTempPath(), "certus-no-such-overlay-" + Guid.NewGuid().ToString("N") + ".json"),
-            }),
-            NullLogger<ServerCertificateIdentity>.Instance);
+    private static ServerCertificateIdentity NoServerCertificate() => ServerCertificateFixtures.None();
 
     private static IAlertNotifier EnabledNotifier(string channel)
     {
@@ -188,6 +179,56 @@ public class AlertQueryServiceTests : IDisposable
         failed!.ErrorMessage.Should().Be("SMTP timeout");
     }
 
+    [Fact]
+    public async Task GetHistory_CarriesTheDeliveredChannels()
+    {
+        _db.AlertsSent.Add(new AlertSent
+        {
+            CertificateId = _db.AlertsSent.First(a => a.ThresholdDays == 14).CertificateId,
+            ThresholdDays = 7,
+            SentAt = DateTime.UtcNow,
+            Channels = "email,webhook",
+            DeliveredChannels = "email",
+            Success = false,
+            ErrorMessage = "Webhook returned 500",
+        });
+        await _db.SaveChangesAsync();
+
+        var result = await _sut.GetHistoryAsync();
+
+        var partial = result.Items.Single(a => a.ThresholdDays == 7);
+        partial.Channels.Should().Be("email,webhook");
+        partial.DeliveredChannels.Should().Be("email");
+        result.Items.Single(a => a.ThresholdDays == 14).DeliveredChannels.Should().BeNull(
+            "a failed row written before issue #206 does not know which channel delivered");
+    }
+
+    /// <summary>
+    /// A row naming two failed channels can be twice one message's length. The
+    /// read must not cut it back to one message's cap, or the second channel's
+    /// error the row was written to keep is gone again (issue #206).
+    /// </summary>
+    [Fact]
+    public async Task GetHistory_KeepsEveryChannelsErrorInALongRow()
+    {
+        var webhookError = "webhook: " + new string('w', 400);
+        _db.AlertsSent.Add(new AlertSent
+        {
+            CertificateId = _db.AlertsSent.First(a => a.ThresholdDays == 14).CertificateId,
+            ThresholdDays = 7,
+            SentAt = DateTime.UtcNow,
+            Channels = "email,webhook",
+            DeliveredChannels = "",
+            Success = false,
+            ErrorMessage = "email: " + new string('e', 450) + "\n" + webhookError,
+        });
+        await _db.SaveChangesAsync();
+
+        var result = await _sut.GetHistoryAsync();
+
+        result.Items.Single(a => a.ThresholdDays == 7).ErrorMessage.Should().EndWith(webhookError);
+    }
+
     // ---- Per certificate ladder (issue #160) ----------------------------
     //
     // The ladder's own decisions are covered in CertificateAlertLadderTests,
@@ -244,6 +285,54 @@ public class AlertQueryServiceTests : IDisposable
 
         history!.Coverage.Should().Be(AlertCoverage.Monitored);
         history.EnabledChannels.Should().Equal("email");
+    }
+
+    /// <summary>
+    /// Issue #470: the detail page says what the expiry monitor does. The server's own
+    /// certificate reads as suppressed only while automatic renewal owns it; with renewal
+    /// off, or in monitor mode, it reads as monitored like every other certificate. Since
+    /// issue #535 a certificate somebody else installed reads as monitored too, because
+    /// the renewal leaves it to whoever issued it.
+    /// </summary>
+    [Theory]
+    [InlineData(true, false, true, AlertCoverage.OwnCertificate)]
+    [InlineData(false, false, true, AlertCoverage.Monitored)]
+    [InlineData(true, true, true, AlertCoverage.Monitored)]
+    [InlineData(true, false, false, AlertCoverage.Monitored)]
+    public async Task GetForCertificate_ServerOwnCertificate_IsSuppressedOnlyWhileRenewalOwnsIt(
+        bool autoRenewalEnabled, bool monitorMode, bool installedByService, string expected)
+    {
+        var (identity, certificate) = ServerCertificateFixtures.WithSerial(
+            [0x00, 0xAB, 0xCD], autoRenewalEnabled,
+            monitorMode ? CertusInstanceMode.Monitor : CertusInstanceMode.Full,
+            installedByService);
+        using var _ = certificate;
+        var own = new SyncedCertificate
+        {
+            RequestId = 3,
+            SerialNumber = "abcd",
+            Subject = "CN=certus.home.local",
+            TemplateName = "WebServer",
+            NotBefore = DateTime.UtcNow.AddDays(-30),
+            NotAfter = DateTime.UtcNow.AddDays(20),
+            Status = "Issued",
+            RequestDate = DateTime.UtcNow.AddDays(-30),
+        };
+        _db.SyncedCertificates.Add(own);
+        await _db.SaveChangesAsync();
+
+        var alertOptions = new AlertOptions();
+        alertOptions.NormalizeThresholdDays();
+        var sut = new AlertQueryService(
+            _db,
+            NullLogger<AlertQueryService>.Instance,
+            Options.Create(alertOptions),
+            [EnabledNotifier("email")],
+            identity);
+
+        var history = await sut.GetForCertificateAsync(own.Id);
+
+        history!.Coverage.Should().Be(expected);
     }
 
     [Fact]

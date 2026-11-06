@@ -1,3 +1,5 @@
+using Certus.Core.Configuration;
+
 namespace Certus.Core.ServiceRights;
 
 /// <summary>One right, or one prerequisite, and what the check could establish about it.</summary>
@@ -58,8 +60,15 @@ public sealed record ServiceRightsReport(
     bool Simulated,
     DateTimeOffset CheckedAt)
 {
-    /// <summary>The report as the API carries it, with every enum as its camelCase name.</summary>
-    public ServiceRightsReportWire ToWire() => new(
+    /// <summary>
+    /// The report as the API carries it, with every enum as its camelCase name. Given
+    /// the instance mode, a row whose right only issuance or revocation uses carries
+    /// <c>notNeeded: "monitorMode"</c> in monitor mode (issue #470), so the page does
+    /// not send an operator to collect rights the mode never uses. The check itself is
+    /// untouched and the row keeps what it measured; only what the page makes of it
+    /// changes, which is the use <see cref="RightNeededFor"/> was added for.
+    /// </summary>
+    public ServiceRightsReportWire ToWire(CertusInstanceMode? instanceMode = null) => new(
         CaConnectionString,
         Identity,
         Rows.Select(row => new ServiceRightsRowWire(
@@ -72,18 +81,40 @@ public sealed record ServiceRightsReport(
             row.Detail,
             row.Remedy,
             row.Optional,
-            row.Template)).ToList(),
+            row.Template,
+            instanceMode?.IsMonitor == true && IsNotNeededInMonitorMode(row.NeededFor)
+                ? ServiceRightsWire.NotNeededInMonitorMode
+                : null)).ToList(),
         Simulated,
         CheckedAt);
+
+    /// <summary>
+    /// True when everything the right is needed for is something monitor mode never
+    /// does. Written as "nothing outside issuance and revocation" rather than as a list
+    /// of the rows it covers, so a purpose added to <see cref="RightNeededFor"/> later
+    /// keeps its rows needed until someone decides otherwise. A row that lists nothing
+    /// is needed for the same reason.
+    /// </summary>
+    public static bool IsNotNeededInMonitorMode(RightNeededFor neededFor) =>
+        neededFor != RightNeededFor.None
+        && (neededFor & ~(RightNeededFor.Issuance | RightNeededFor.Revocation)) == RightNeededFor.None;
 }
 
 /// <summary>The report on the wire.</summary>
+/// <param name="TemplatesNotChecked">
+/// How many of the template names enabled for ACME were left out because one check
+/// reads at most <see cref="ServiceRightsCheck.MaxTemplates"/> (issue #478), so the
+/// page can say that those templates have no rows rather than let their absence
+/// read as a clean answer. Only the Settings route sets it. The wizard's route
+/// refuses a longer list instead, so it always sends 0.
+/// </param>
 public sealed record ServiceRightsReportWire(
     string CaConnectionString,
     ServiceRightsIdentity Identity,
     IReadOnlyList<ServiceRightsRowWire> Rows,
     bool Simulated,
-    DateTimeOffset CheckedAt);
+    DateTimeOffset CheckedAt,
+    int TemplatesNotChecked = 0);
 
 /// <summary>A row on the wire.</summary>
 public sealed record ServiceRightsRowWire(
@@ -96,7 +127,8 @@ public sealed record ServiceRightsRowWire(
     string Detail,
     string? Remedy,
     bool Optional,
-    string? Template);
+    string? Template,
+    string? NotNeeded = null);
 
 /// <summary>
 /// What a lab measurement established about the CA's behaviour, which decides
@@ -123,7 +155,7 @@ public sealed record ServiceRightsFindings(
     bool ViewOpenProvesInventory)
 {
     /// <summary>
-    /// Measured on lab 2019 (Server 2019, LAB2019-CA) on 2026-09-26, running the
+    /// Measured on lab 2019 (Server 2019) on 2026-09-26, running the
     /// probe as SYSTEM on the Certus host, so as the service's own computer
     /// account, through four states of that account's rights on the CA:
     ///
@@ -144,7 +176,7 @@ public sealed record ServiceRightsFindings(
     /// held one issued row, which was thin.</item>
     /// </list>
     ///
-    /// Issue #469 measured the view again on lab 2025 (Server 2025, LAB2025-CA)
+    /// Issue #469 measured the view again on lab 2025 (Server 2025)
     /// on 2026-10-03, seeded to 17 issued and 5 revoked rows from three
     /// requesters. With Read, and Request Certificates only through
     /// Authenticated Users, the view returned the same request ids as the

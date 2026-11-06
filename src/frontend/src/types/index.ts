@@ -115,13 +115,14 @@ export interface CertificateDetail extends CertificateSummary {
   canDownload: boolean;
 
   /**
-   * Why the revoke action is unavailable: "guardrail" when the TLS
-   * capability ceiling refuses the certificate, "out-of-scope" when the
-   * configured revocation scope does not cover it. Absent when revocation
-   * is available, or when the row is not revocable at all (not Issued, or
-   * no serial), where the button does not render in the first place.
+   * Why the revoke action is unavailable: "monitor-mode" when the server
+   * never revokes at all (issue #470), "guardrail" when the TLS capability
+   * ceiling refuses the certificate, "out-of-scope" when the configured
+   * revocation scope does not cover it. Absent when revocation is available,
+   * or when the row is not revocable at all (not Issued, or no serial), where
+   * the button does not render in the first place.
    */
-  revocationBlocked?: 'guardrail' | 'out-of-scope';
+  revocationBlocked?: 'monitor-mode' | 'guardrail' | 'out-of-scope';
   /**
    * The sentence behind revocationBlocked, the same text the revoke
    * endpoint returns as its 403 problem detail.

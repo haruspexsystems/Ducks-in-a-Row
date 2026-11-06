@@ -8,6 +8,7 @@ using Certus.Core.Data;
 using Certus.Core.Security;
 using Certus.Core.Services;
 using Certus.Core.Setup;
+using Certus.Web.Audit;
 using Certus.Web.Authentication;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -34,6 +35,7 @@ public sealed class CertificatesController : ControllerBase
     private readonly CertificateRevocationService _revocationService;
     private readonly SetupService _setupService;
     private readonly CertusOptions _certusOptions;
+    private readonly CertusInstanceMode _instanceMode;
     private readonly ILogger<CertificatesController> _logger;
 
     public CertificatesController(
@@ -43,6 +45,7 @@ public sealed class CertificatesController : ControllerBase
         CertificateRevocationService revocationService,
         SetupService setupService,
         IOptions<CertusOptions> certusOptions,
+        CertusInstanceMode instanceMode,
         ILogger<CertificatesController> logger)
     {
         _queryService = queryService;
@@ -51,6 +54,7 @@ public sealed class CertificatesController : ControllerBase
         _revocationService = revocationService;
         _setupService = setupService;
         _certusOptions = certusOptions.Value;
+        _instanceMode = instanceMode;
         _logger = logger;
     }
 
@@ -146,11 +150,25 @@ public sealed class CertificatesController : ControllerBase
     /// and no revoke from the list view.
     /// </summary>
     [HttpPost("{id:int}/revoke")]
+    [AdminAudit("certificate.revoked")]
     public async Task<IActionResult> RevokeCertificate(
         int id,
         [FromBody] RevokeCertificateRequest request,
         CancellationToken ct)
     {
+        // First, ahead of any validation: in monitor mode there is no revocation to
+        // validate a request for (issue #470). The eligibility gate below says the
+        // same thing, for the detail page and for any other caller of the service.
+        if (_instanceMode.IsMonitor)
+        {
+            _logger.LogWarning(
+                "Refused a dashboard revocation of certificate {CertificateId}: this server runs " +
+                "in monitor mode", id);
+            return MonitorModeProblem.Refuse(this,
+                "This server runs in monitor mode, so it never revokes a certificate. Nothing " +
+                "was sent to the certification authority.");
+        }
+
         if (string.IsNullOrWhiteSpace(request.SerialNumber))
         {
             return Problem(
@@ -173,6 +191,9 @@ public sealed class CertificatesController : ControllerBase
             switch (result.Status)
             {
                 case CertificateRevocationStatus.Revoked:
+                    this.AdminAudit().Describe(
+                        $"certificate serial {request.SerialNumber}",
+                        after: $"revoked at the CA, reason {request.Reason}");
                     // Re-read after the resync so the page renders the CA's
                     // own account of the revocation.
                     var detail = await _queryService.GetDetailByIdAsync(id, ct);
@@ -235,6 +256,11 @@ public sealed class CertificatesController : ControllerBase
                                 "The revocation scope configured in Settings does not cover " +
                                 "this certificate.",
                         statusCode: StatusCodes.Status403Forbidden);
+
+                case CertificateRevocationStatus.MonitorMode:
+                    return MonitorModeProblem.Refuse(this,
+                        result.RefusalDetail ??
+                        "This server runs in monitor mode, so it never revokes a certificate.");
 
                 case CertificateRevocationStatus.NotFound:
                     return NotFound();
@@ -411,11 +437,15 @@ public sealed class CertificatesController : ControllerBase
     /// CertificateSyncService.
     /// </summary>
     [HttpPost("sync")]
+    [AdminAudit("certificates.synced")]
     public async Task<IActionResult> TriggerSync(CancellationToken ct)
     {
         try
         {
             var result = await _syncService.SyncCertificatesAsync(ct);
+            this.AdminAudit().Describe(
+                "certificate inventory",
+                after: $"{result.Processed} processed, {result.Created} created, {result.Updated} updated");
             return Ok(result);
         }
         catch (CaUnavailableException ex)
@@ -539,6 +569,17 @@ public sealed class CertificatesController : ControllerBase
                 type: DashboardProblemType.CaUnavailable,
                 title: "Certificate Authority is unavailable",
                 detail: "The ADCS Certificate Authority cannot be reached. Try again shortly.",
+                statusCode: 503);
+        }
+        catch (CaAccessDeniedException ex)
+        {
+            // Above the general arm, which would report a missing right as an
+            // unexpected error (issue #476). Same shape as the sync's refusal.
+            _logger.LogError(ex, "Templates endpoint: CA denied access");
+            return Problem(
+                type: DashboardProblemType.CaAccessDenied,
+                title: "CA template list access denied",
+                detail: ex.Message,
                 statusCode: 503);
         }
         catch (Exception ex)

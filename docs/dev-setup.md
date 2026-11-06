@@ -19,6 +19,16 @@ dotnet run --project src/Certus.Web
 # Health check: http://localhost:5000/health
 ```
 
+The printable installation guide is rendered from the markdown in `docs/` and is
+not in the source tree between releases; each release carries it. To build it, or
+to check that a documentation change still renders:
+
+```bash
+pip install -r docs/requirements.txt
+python docs/generate_guide.py            # writes docs/Ducks-in-a-Row-Installation-Guide.pdf
+python docs/generate_guide.py --check    # renders to a temporary file and discards it
+```
+
 ## ADCS Lab CA Setup (for Integration Testing)
 
 Integration testing against a real ADCS CA requires a lab environment. You don't need this for day-to-day development — the `MockAdcsClient` provides realistic behavior.
@@ -117,17 +127,14 @@ dotnet test --filter "Category=Integration"
 
 ### DCOM Configuration
 
-For the Ducks in a Row server to communicate with a remote CA via DCOM:
-
-1. The service account must have DCOM launch and access permissions on the CA server
-2. The CA server's firewall must allow DCOM and RPC traffic (TCP 135 + dynamic ports)
-3. The server must be domain-joined to the same forest as the CA
-4. The service account must have the "Read" permission on the CA itself, granted
-   via the Certificate Authority console (CA Properties -> Security). This is required for
-   the dashboard certificate sync, which reads the CA database through the certificate view
-   interface (ICertView). It is a separate permission from certificate request/submission:
-   without it, enrollment still works but the dashboard shows no certificates and the service
-   log reports "CA view access denied".
+A development server reaching a real CA needs the same rights and network paths
+as a production one. [What to ask your AD and CA team](ad-and-ca-team-request.md)
+is the single list: Enroll on each template, Request Certificates and Read on the
+CA, membership of the CA server's Certificate Service DCOM Access group (which
+holds Authenticated Users on a default CA), domain membership in the CA's
+forest, and TCP 135 plus 49152 to 65535 to the CA. Without Read, enrollment still
+works but the dashboard shows no certificates and the service log reports
+"CA view access denied".
 
 ## Project Architecture
 

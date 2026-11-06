@@ -301,6 +301,16 @@ public sealed record CertificateCryptoDetail(
 /// <paramref name="CryptoDetail"/> is null, and treated the same way: nothing
 /// new to say, leave whatever an earlier pass captured alone.
 /// </param>
+/// <param name="RequestorColumnMissing">
+/// True when the CA view this row came from did not expose the requester column
+/// at all, so <paramref name="Requestor"/> is null because nothing was read, not
+/// because the CA recorded no requester (issue #547). The real client resolves
+/// every view column separately and degrades past one the CA build does not
+/// recognise, so this can happen for a whole query while every other column is
+/// healthy. The sync then keeps the requester an earlier pass stored. False, the
+/// default, means the column was read and <paramref name="Requestor"/> is the
+/// CA's answer, null included, which is what every other client reports.
+/// </param>
 public sealed record CertificateInfo(
     int RequestId,
     string SerialNumber,
@@ -317,7 +327,8 @@ public sealed record CertificateInfo(
     CertificateCryptoDetail? CryptoDetail = null,
     string? DispositionMessage = null,
     int? StatusCode = null,
-    byte[]? RawCertificate = null);
+    byte[]? RawCertificate = null,
+    bool RequestorColumnMissing = false);
 
 /// <summary>
 /// Query parameters for searching the CA certificate database.

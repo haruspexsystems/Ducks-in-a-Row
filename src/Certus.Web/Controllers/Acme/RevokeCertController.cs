@@ -45,6 +45,28 @@ public sealed class RevokeCertController : AcmeControllerBase
     /// POST /acme/{template}/revoke-cert — revoke a certificate.
     /// RFC 8555 §7.6
     /// </summary>
+    /// <remarks>
+    /// The <paramref name="template"/> segment is advisory and is deliberately never read
+    /// (the product decision on issue #245). It is not passed to ResolveTemplateAsync, and it
+    /// is not compared with the template the certificate's order recorded.
+    ///
+    /// Either check would put a template setting between a client and the revocation of its
+    /// own certificate, and a key compromise revocation must never wait on a dashboard
+    /// setting. That is the same stance that exempts this path from the revocation scope
+    /// modes. Resolving the segment would refuse a template an administrator has since
+    /// stopped offering over ACME, or one the TLS ceiling blocks, and would make the
+    /// revocation wait on the CA answering a template read first. Comparing it would refuse a
+    /// client that revokes through another template's directory, which RFC 8555 does not
+    /// forbid, and would protect nothing: the request is bound to the certificate by byte
+    /// equality with the stored leaf and authorized by the owning account's key or the
+    /// certificate's own key, below.
+    ///
+    /// The order, finalize, authz, challenge, cert, account and key-change endpoints do not
+    /// check their segment either (renewalInfo, which is also keyed by an id, does), and
+    /// docs/acme-clients.md and docs/revocation.md tell administrators so.
+    /// RevokeCertIntegrationTests.Revoke_ThroughAnyTemplateSegment_Returns200 pins this
+    /// behaviour, so adding a check here is a product decision, not a tidy up.
+    /// </remarks>
     [HttpPost("/acme/{template}/revoke-cert")]
     [Consumes("application/jose+json")]
     public async Task<IActionResult> RevokeCert(string template, CancellationToken ct)

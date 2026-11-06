@@ -5,6 +5,7 @@ using Certus.Core.Acme.Models;
 using Certus.Core.Data;
 using Certus.Core.Data.Entities;
 using Certus.Core.Services;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
@@ -145,12 +146,24 @@ public sealed class AccountService
     /// Swaps an account's key to a new one (ACME account key rollover, RFC 8555 §7.3.5).
     /// The caller has already verified the inner JWS was signed by the new key, that the inner
     /// payload's oldKey matches this account, and (via <see cref="FindByThumbprintAsync"/>) that
-    /// the new key is not already registered. This persists the swap. The unique index on
-    /// JwkThumbprint is the final arbiter: if a concurrent request claimed the same new key in
-    /// between the pre-check and here, SaveChanges throws and we report a conflict rather than
-    /// letting the violation surface as a 500.
+    /// the new key is not already registered. This persists the swap.
+    ///
+    /// <para>
+    /// The unique index on JwkThumbprint is the final arbiter: if a concurrent request claimed
+    /// the same new key in between the pre-check and here, SaveChanges fails with a unique
+    /// constraint violation, and this reports a conflict carrying the account that now holds
+    /// the key. The caller needs that account, because RFC 8555 §7.3.5 makes the 409 point at
+    /// it with a Location header, exactly as the pre-check's 409 does.
+    /// </para>
+    ///
+    /// <para>
+    /// Only a unique constraint violation is a conflict. Any other failure to save, a busy or
+    /// locked database for one, says nothing about who holds the key, so it propagates and the
+    /// client gets a 500 rather than being told its key is already in use when it is not
+    /// (issue #127). That is the answer <see cref="CreateAccountAsync"/> gives for the same case.
+    /// </para>
     /// </summary>
-    public async Task<KeyChangeOutcome> ChangeKeyAsync(
+    public async Task<KeyChangeResult> ChangeKeyAsync(
         AcmeAccount account,
         string newJwkJson,
         CancellationToken cancellationToken = default)
@@ -165,24 +178,48 @@ public sealed class AccountService
         {
             await _db.SaveChangesAsync(cancellationToken);
         }
-        catch (DbUpdateException)
+        catch (DbUpdateException ex) when (IsUniqueConstraintViolation(ex))
         {
             // Lost a race: another request registered this key (or rolled another account onto
-            // it) first, so the unique JwkThumbprint index rejected the swap. Report a conflict
-            // so the controller returns 409 (RFC 8555 §7.3.5) instead of a 500. The scoped
-            // DbContext is disposed at the end of this request, so leaving the entity in its
-            // modified state is harmless — nothing re-saves it.
+            // it) first, so the unique JwkThumbprint index rejected the swap. Put the tracked
+            // entity back to what the database holds, so the caller's object does not claim a
+            // key it never got and a later save on this context cannot retry the swap.
+            var entry = _db.Entry(account);
+            entry.CurrentValues.SetValues(entry.OriginalValues);
+            entry.State = EntityState.Unchanged;
+
+            var holder = await _db.AcmeAccounts.AsNoTracking()
+                .FirstOrDefaultAsync(a => a.JwkThumbprint == newThumbprint, cancellationToken);
+            if (holder == null)
+                throw;
+
             _logger.LogDebug(
-                "Key-change for account {AccountId} conflicted on thumbprint {Thumbprint}",
-                account.AccountId, newThumbprint);
-            return KeyChangeOutcome.Conflict;
+                "Key-change for account {AccountId} conflicted on thumbprint {Thumbprint}, held by account {HolderAccountId}",
+                account.AccountId, newThumbprint, holder.AccountId);
+            return new KeyChangeResult(KeyChangeOutcome.Conflict, holder);
         }
 
         _logger.LogInformation(
             "Rolled ACME account {AccountId} to a new key (thumbprint {Thumbprint})",
             account.AccountId, newThumbprint);
-        return KeyChangeOutcome.Changed;
+        return new KeyChangeResult(KeyChangeOutcome.Changed, KeyHolder: null);
     }
+
+    /// <summary>
+    /// True when a failed save was refused by a unique index, and by nothing else. SQLite
+    /// reports that as the primary code SQLITE_CONSTRAINT (19) with the extended code
+    /// SQLITE_CONSTRAINT_UNIQUE (2067); a busy or locked database is a different primary code
+    /// entirely, and so is every other constraint (NOT NULL, foreign key, check).
+    /// </summary>
+    private static bool IsUniqueConstraintViolation(DbUpdateException exception) =>
+        exception.InnerException is SqliteException
+        {
+            SqliteErrorCode: SqliteConstraint,
+            SqliteExtendedErrorCode: SqliteConstraintUnique
+        };
+
+    private const int SqliteConstraint = 19;
+    private const int SqliteConstraintUnique = 2067;
 
     /// <summary>
     /// Searches, sorts, and pages the account inventory for the dashboard.
@@ -490,7 +527,16 @@ public sealed class AccountService
         // crash in between from leaving open orders under a deactivated account.
         // No retrying execution strategy is configured, so no strategy wrapper is
         // needed here.
-        await using var tx = await _db.Database.BeginTransactionAsync(cancellationToken);
+        //
+        // When the dashboard is the caller, the administrator audit filter has
+        // already opened a transaction on this scoped context so the audit row
+        // and this change commit together (issue #634). Joining it is the whole
+        // point; opening a second one would throw. The ACME account URL path
+        // arrives with none open and gets its own, as before.
+        var ownsTransaction = _db.Database.CurrentTransaction is null;
+        await using var tx = ownsTransaction
+            ? await _db.Database.BeginTransactionAsync(cancellationToken)
+            : null;
 
         // One conditional UPDATE naming the statuses it is legal to cancel from,
         // rather than a select and a loop, so nothing can move between the read and
@@ -542,7 +588,8 @@ public sealed class AccountService
         account.UpdatedAt = DateTime.UtcNow;
         await _db.SaveChangesAsync(cancellationToken);
 
-        await tx.CommitAsync(cancellationToken);
+        if (tx is not null)
+            await tx.CommitAsync(cancellationToken);
 
         // No ReloadAsync here, unlike DeactivateAuthorizationAsync and the finalize
         // claim. That reload exists when a caller re-reads the same rows through
@@ -728,6 +775,15 @@ public enum KeyChangeOutcome
     /// <summary>A concurrent request claimed the new key first; the swap was rejected.</summary>
     Conflict
 }
+
+/// <summary>Result of <see cref="AccountService.ChangeKeyAsync"/>.</summary>
+/// <param name="Outcome">Whether the key was swapped.</param>
+/// <param name="KeyHolder">
+/// On <see cref="KeyChangeOutcome.Conflict"/>, the account that holds the new key, read
+/// after the swap was refused, so the 409 can carry its URL as Location (RFC 8555 §7.3.5).
+/// Never null on a conflict; null on <see cref="KeyChangeOutcome.Changed"/>.
+/// </param>
+public sealed record KeyChangeResult(KeyChangeOutcome Outcome, AcmeAccount? KeyHolder);
 
 /// <summary>Binding filter for the dashboard account list.</summary>
 public enum AcmeAccountBindingFilter

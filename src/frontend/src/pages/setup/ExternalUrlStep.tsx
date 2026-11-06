@@ -8,6 +8,7 @@ import {
   ShieldCheck,
   BadgeCheck,
   ExternalLink,
+  RefreshCw,
 } from 'lucide-react';
 import {
   validateExternalUrl,
@@ -19,6 +20,7 @@ import {
   type TlsProvisionResult,
 } from '@/api/setup';
 import type { WizardState } from './SetupWizard';
+import { ExistingCertificatePicker } from './ExistingCertificatePicker';
 
 interface ExternalUrlStepProps {
   state: WizardState;
@@ -37,7 +39,11 @@ type CertPhase =
   | 'revalidating'
   | 'installed'
   | 'continueElsewhere'
-  | 'manualRestart';
+  | 'manualRestart'
+  // Monitor mode only: the service is going back to its self signed
+  // certificate, and this page, loaded over HTTPS with the certificate being
+  // given up, cannot reconnect by itself (issue #471).
+  | 'reloadNeeded';
 
 /**
  * How long the cross origin continue link stays locked after the install
@@ -58,6 +64,10 @@ interface CertMismatch {
 }
 
 export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
+  // Monitor mode serves no ACME directory and never enrols the server's own
+  // certificate, so the step names the dashboard and offers a certificate
+  // already in the machine store instead (issue #471).
+  const monitorMode = state.mode === 'monitor';
   const [validating, setValidating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
@@ -98,7 +108,8 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
       urlStepBusy:
         certPhase === 'enrolling' ||
         certPhase === 'restarting' ||
-        certPhase === 'revalidating',
+        certPhase === 'revalidating' ||
+        certPhase === 'reloadNeeded',
       continueElsewhereUrl: certPhase === 'continueElsewhere' ? continueUrl : null,
       continueUnlocked: false,
     });
@@ -122,8 +133,12 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
 
     try {
       // The probe targets the ACME directory of the first selected template,
-      // the same URL the success copy tells clients to use.
-      const result = await validateExternalUrl(state.externalUrl, state.selectedTemplates[0]);
+      // the same URL the success copy tells clients to use. Monitor mode serves
+      // no directory, so the server probes its status endpoint instead.
+      const result = await validateExternalUrl(
+        state.externalUrl,
+        monitorMode ? undefined : state.selectedTemplates[0],
+      );
 
       if (!result.valid) {
         setError(result.errorMessage ?? 'Invalid URL');
@@ -262,6 +277,35 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
     setCertPhase('installed');
   };
 
+  // Monitor mode: an earlier pick was cleared, and the service restarts to
+  // serve its self signed certificate again.
+  const handleSelfSignedRestored = async (restartScheduled: boolean) => {
+    onUpdate({ tlsCertificateThumbprint: null, tlsCertificateInstalled: false });
+    if (!restartScheduled) {
+      setCertPhase('manualRestart');
+      return;
+    }
+    if (window.location.protocol === 'https:') {
+      // This page came over HTTPS with the certificate being given up, and a
+      // fetch cannot accept the self signed one, so polling would only time out.
+      setCertPhase('reloadNeeded');
+      return;
+    }
+    setCertPhase('restarting');
+    const up = await waitForServiceUp();
+    if (!up) {
+      setCertMessage(
+        'The service did not come back in time. Restart it manually (Restart-Service ' +
+          'DucksInARow), then validate the URL again.',
+      );
+      setCertPhase('idle');
+      return;
+    }
+    setCertPhase('revalidating');
+    await handleValidate();
+    setCertPhase('idle');
+  };
+
   const handleApplyMismatched = async () => {
     if (!mismatch) return;
     const applied = mismatch;
@@ -316,8 +360,11 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
       <div>
         <h2 className="text-xl font-bold text-ink">External URL</h2>
         <p className="text-sm text-muted mt-1">
-          This is the base URL that ACME clients will use to reach the Ducks in a Row server.
-          It must be reachable from every machine that needs to request certificates.
+          {monitorMode
+            ? 'This is the address you open the Ducks in a Row dashboard at. Monitor mode serves ' +
+              'no ACME directory, so only the browsers you use for the dashboard need to reach it.'
+            : 'This is the base URL that ACME clients will use to reach the Ducks in a Row server. ' +
+              'It must be reachable from every machine that needs to request certificates.'}
         </p>
       </div>
 
@@ -325,11 +372,15 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
         <div className="flex items-start gap-3">
           <Globe className="h-5 w-5 text-faint mt-0.5" />
           <div className="text-sm text-ink-soft space-y-1">
-            <p>ACME clients will construct directory URLs like:</p>
-            <code className="block bg-surface border border-hairline rounded px-3 py-1.5 text-xs font-mono text-certus-700 dark:text-certus-300 mt-1">
-              {directoryPreview}
-            </code>
-            <p className="text-xs text-muted mt-2">
+            {!monitorMode && (
+              <>
+                <p>ACME clients will construct directory URLs like:</p>
+                <code className="block bg-surface border border-hairline rounded px-3 py-1.5 text-xs font-mono text-certus-700 dark:text-certus-300 mt-1">
+                  {directoryPreview}
+                </code>
+              </>
+            )}
+            <p className={`text-xs text-muted ${monitorMode ? '' : 'mt-2'}`}>
               Use HTTPS for production, and include the port. The service listens on 5001 for
               HTTPS (5000 for HTTP) instead of 443, because IIS and the ADCS web roles often
               occupy 443 on Windows servers and a port collision would stop the service from
@@ -385,8 +436,14 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
                 : probe && !probe.attempted
                   ? 'Reachability was not checked in demo mode. '
                   : ''}
-              ACME clients should target:{' '}
-              <code className="font-mono">{state.externalUrl}/acme/{'{template}'}/directory</code>
+              {monitorMode ? (
+                'Open the dashboard there once setup completes.'
+              ) : (
+                <>
+                  ACME clients should target:{' '}
+                  <code className="font-mono">{state.externalUrl}/acme/{'{template}'}/directory</code>
+                </>
+              )}
             </p>
           </div>
         </div>
@@ -429,7 +486,21 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
       {/* TLS certificate: the URL answered but its certificate does not
           validate (the shipped self signed fallback does not). Offer to
           enroll a real one from the CA with the selected template. */}
-      {certificateWarning && certPhase === 'idle' && (
+      {/* Monitor mode never enrols: choose a certificate already in the
+          machine store, or keep the self signed one (issue #471). */}
+      {/* Also once a certificate is installed, so the choice can still be
+          changed, or undone with "Go back to the self signed certificate". */}
+      {monitorMode && state.urlValidated && (certPhase === 'idle' || certPhase === 'installed') && (
+        <ExistingCertificatePicker
+          caConnectionString={state.caConnectionString}
+          externalUrl={state.externalUrl}
+          certificateWarning={certificateWarning}
+          onRecorded={handleProvisionResult}
+          onSelfSignedRestored={handleSelfSignedRestored}
+        />
+      )}
+
+      {!monitorMode && certificateWarning && certPhase === 'idle' && (
         <div className="bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/30 rounded-lg p-4 flex items-start gap-3">
           <ShieldAlert className="h-5 w-5 text-amber-600 mt-0.5" />
           <div className="space-y-2">
@@ -469,7 +540,10 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
           <div>
             <p className="text-sm font-semibold text-ink">
               {certPhase === 'enrolling' && 'Requesting a certificate from the CA'}
-              {certPhase === 'restarting' && 'Certificate installed, the service is restarting'}
+              {certPhase === 'restarting' &&
+                (monitorMode
+                  ? 'Certificate chosen, the service is restarting'
+                  : 'Certificate installed, the service is restarting')}
               {certPhase === 'revalidating' && 'Service is back, checking the URL again'}
             </p>
             <p className="text-xs text-muted mt-0.5">
@@ -581,13 +655,39 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
         </div>
       )}
 
+      {/* Monitor mode, back to the self signed certificate over HTTPS: this page
+          cannot reconnect by itself, so it says to reload. */}
+      {certPhase === 'reloadNeeded' && (
+        <div className="bg-certus-50 dark:bg-certus-500/10 border border-certus-200 dark:border-certus-500/30 rounded-lg p-4 flex items-start gap-3">
+          <RefreshCw className="h-5 w-5 text-certus-600 mt-0.5" />
+          <div className="space-y-2">
+            <p className="text-sm font-semibold text-certus-900 dark:text-certus-200">
+              The service is restarting with its self signed certificate
+            </p>
+            <p className="text-sm text-certus-800 dark:text-certus-300">
+              This page was loaded with the certificate the service is giving up, so it cannot
+              reconnect by itself. Reload it in a few seconds and accept the browser's warning about
+              the self signed certificate. Your progress is saved.
+            </p>
+            <button
+              onClick={() => window.location.reload()}
+              className="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold
+                         text-white bg-certus-600 rounded-lg hover:bg-certus-700 transition-colors"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              Reload
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Console/development run: installed but the service cannot restart itself. */}
       {certPhase === 'manualRestart' && (
         <div className="bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/30 rounded-lg p-4 flex items-start gap-3">
           <AlertTriangle className="h-5 w-5 text-amber-600 mt-0.5" />
           <div>
             <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">
-              Certificate installed, restart needed
+              {monitorMode ? 'Restart needed' : 'Certificate installed, restart needed'}
             </p>
             <p className="text-xs text-amber-700 dark:text-amber-300 mt-0.5">
               The service could not restart itself. Restart it manually
@@ -611,7 +711,9 @@ export function ExternalUrlStep({ state, onUpdate }: ExternalUrlStepProps) {
                 ? 'The service restarted with the new certificate, but it still does not ' +
                   'validate from the server itself — check that this machine trusts your ' +
                   'CA’s root certificate.'
-                : 'The service restarted and now serves the certificate issued by your CA.'}
+                : monitorMode
+                  ? 'The service restarted and now serves the certificate you chose.'
+                  : 'The service restarted and now serves the certificate issued by your CA.'}
             </p>
           </div>
         </div>

@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState, type ReactNode } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useSearchParams } from 'react-router';
 import { useQuery, useQueryClient, keepPreviousData } from '@tanstack/react-query';
 import { AlertTriangle } from 'lucide-react';
 import {

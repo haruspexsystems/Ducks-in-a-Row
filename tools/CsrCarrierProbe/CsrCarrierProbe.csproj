@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <AssemblyName>CsrCarrierProbe</AssemblyName>
+    <RootNamespace>CsrCarrierProbe</RootNamespace>
+    <Description>Diagnostic for Certus security issue #548 (CRA risks R02, R03) and Certus-Security #15. Submits PKCS#10 requests that carry subject alternative name content, and requested Application Policies, to a live ADCS CA through several attribute carriers the product's finalize parser does not read: the Microsoft certificate extensions attribute (szOID_CERT_EXTENSIONS 1.3.6.1.4.1.311.2.1.14), the enrolment name and value pair attribute (1.3.6.1.4.1.311.13.2.1), and a second value of the standard PKCS#9 extensionRequest. Reports what the CA puts in the issued certificate. Answers, before any server hardening is trusted, whether ADCS honours any of these carriers on an enrollee supplies subject template.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- A source link, not a ProjectReference, following tools/DeviceAttestProbe:
+         the probe keeps the tools/ convention of standing alone with no assembly
+         dependency on the product, and Certus.Core would drag EF Core,
+         BouncyCastle, MailKit and Serilog behind it for a self contained publish
+         that only needs one static class. The template guard and its character
+         scanner are a security invariant (issue #175, CVE-2026-54121): the probe
+         builds the CertificateTemplate attribute through the product's own guard
+         rather than interpolating it, so this is never the one place in the repo
+         that hands a live CA an unchecked request attribute string. A copy would
+         be free to drift. Any dependency the guard grows needs the same line, and
+         only `dotnet build tools/CsrCarrierProbe` catches a missed link, since
+         the probe is outside Certus.sln and the test suite. -->
+    <Compile Include="../../src/Certus.Core/Security/DeceptiveCharacters.cs"
+             Link="DeceptiveCharacters.cs" />
+    <Compile Include="../../src/Certus.Core/Adcs/AdcsRequestAttributes.cs"
+             Link="AdcsRequestAttributes.cs" />
+  </ItemGroup>
+
+</Project>

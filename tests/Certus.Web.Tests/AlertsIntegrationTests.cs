@@ -1,5 +1,7 @@
 using System.Net;
 using System.Text.Json;
+using Certus.Core.Alerts;
+using Certus.Core.Crl;
 using Certus.Core.Data;
 using Certus.Core.Data.Entities;
 using Microsoft.EntityFrameworkCore;
@@ -286,5 +288,25 @@ public class AlertsIntegrationTests
         }
 
         after.Should().Be(before);
+    }
+
+    [Fact]
+    public void TheWebhookClient_CarriesNoFactoryLogger()
+    {
+        // The HTTP client factory's loggers write each request URI at Information
+        // with the path whole, where Slack, Discord and Teams connector URLs carry
+        // their secret. The CRL client keeps them, which proves the walk sees them.
+        static IReadOnlyList<string> Chain(IServiceProvider services, string client)
+        {
+            var names = new List<string>();
+            HttpMessageHandler? handler =
+                services.GetRequiredService<IHttpMessageHandlerFactory>().CreateHandler(client);
+            for (; handler is DelegatingHandler delegating; handler = delegating.InnerHandler)
+                names.Add(delegating.GetType().Name);
+            return names;
+        }
+
+        Chain(_factory.Services, nameof(HttpCrlFetcher)).Should().Contain(n => n.Contains("Logg"));
+        Chain(_factory.Services, nameof(WebhookAlertNotifier)).Should().NotContain(n => n.Contains("Logg"));
     }
 }

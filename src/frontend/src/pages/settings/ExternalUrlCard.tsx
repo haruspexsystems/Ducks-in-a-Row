@@ -1,5 +1,6 @@
 import { useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMonitorMode } from '@/hooks/useSystemInfo';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -9,6 +10,7 @@ import {
   ShieldAlert,
   ShieldCheck,
 } from 'lucide-react';
+import { errorText } from '@/api/client';
 import {
   fetchExternalUrlSettings,
   updateExternalUrl,
@@ -39,6 +41,7 @@ export function ExternalUrlCard() {
   // certificate warning below drives it through this handle so there is one
   // implementation of the enroll and restart machine.
   const certSectionRef = useRef<HttpsCertificateSectionHandle>(null);
+  const monitorMode = useMonitorMode();
 
   const { data: settings, isLoading, isError } = useQuery({
     queryKey: ['settings', 'external-url'],
@@ -94,7 +97,7 @@ export function ExternalUrlCard() {
       setProbe(result.probe ?? null);
       setValidated(true);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Validation failed');
+      setError(errorText(err, 'Validation failed'));
     } finally {
       setValidating(false);
     }
@@ -132,7 +135,7 @@ export function ExternalUrlCard() {
       // would blank the banner until something else refetches it.
       await queryClient.invalidateQueries({ queryKey: ['settings', 'external-url'] });
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Saving failed');
+      setError(errorText(err, 'Saving failed'));
     } finally {
       setSaving(false);
     }
@@ -379,6 +382,9 @@ export function ExternalUrlCard() {
               <ShieldAlert className="h-4 w-4 text-amber-600 mt-0.5" />
               <div className="space-y-2">
                 <p className="text-xs text-amber-800 dark:text-amber-300">{probe.certificateWarning}</p>
+                {/* Monitor mode never enrolls (issue #470), so there is
+                    nothing to hand off to. */}
+                {!monitorMode && (
                 <button
                   onClick={() => certSectionRef.current?.beginProvision()}
                   className="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold
@@ -388,6 +394,7 @@ export function ExternalUrlCard() {
                   <ShieldCheck className="h-3.5 w-3.5" />
                   Provision a certificate
                 </button>
+                )}
               </div>
             </div>
           )}

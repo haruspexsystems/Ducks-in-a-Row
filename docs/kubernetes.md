@@ -438,15 +438,17 @@ Two points are documented upstream and have not been run here:
 | 403 "not enabled for ACME" | The template is not enabled for ACME | Enable it in the setup wizard, or point the Issuer at one that is |
 | `serverInternal` with `Denied by Policy Module` | The key does not suit the template | Match `privateKey` to the template; see [key type](#key-type) |
 | A challenge stays pending and the server log shows no attempt | cert-manager's own check cannot fetch the token, often because the cluster cannot resolve the name | Make the zone resolvable in the cluster, or use `waitInsteadOfSelfCheck` |
-| cert-manager keeps waiting after it accepted the challenge, then reports a timeout | The server's HTTP-01 attempt failed | Read the reason in the server log, fix it, then `cmctl renew`; see below |
+| The Challenge fails soon after cert-manager accepted it, and the order fails with it | The server's HTTP-01 attempt failed | Read the reason on the Challenge or in the server log, fix it, then `cmctl renew`; see below |
 | `rateLimited` | Many certificates at once through one source address | Retry later, or see [rate limits](configuration.md#rate-limits-partition-per-source-address) |
 
-**A failed HTTP-01 check can look like waiting.** This is read from the server's
-code and cert-manager's, and has not been run. When the server's HTTP-01 attempt
-fails, the server marks that challenge invalid, but it leaves the authorization
-pending while the other challenges it offered for the same name, DNS-01 and
-TLS-ALPN-01, are still unanswered. cert-manager waits on the authorization, not
-the challenge, for up to two minutes at a time, so it can report a timeout
-rather than the reason. The reason is in the server's log, in a warning of the
-form `Challenge <id> (http-01) for <name> failed: <reason>`, where the reason is
-something like a refused connection or `server returned HTTP 308`.
+**A failed HTTP-01 check fails the order.** When the server's HTTP-01 attempt
+fails, the server marks that challenge invalid and, as RFC 8555 section 7.1.6
+requires, the authorization and the order invalid with it, even though the other
+challenges it offered for the same name, DNS-01 and TLS-ALPN-01, were never
+answered. cert-manager waits on the authorization, not the challenge, so it sees
+the failure as soon as the attempt ends. The reason travels on the failed
+challenge, and the server's log carries it too, in a warning of the form
+`Challenge <id> (http-01) for <name> failed: <reason>`, where the reason is
+something like a refused connection or `server returned HTTP 308`. A failed
+order cannot be retried, so once the cause is fixed, `cmctl renew` starts a new
+one. The cert-manager side of this is read from its code and has not been run.

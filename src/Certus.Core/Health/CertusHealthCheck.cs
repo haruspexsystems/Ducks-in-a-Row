@@ -10,23 +10,27 @@ namespace Certus.Core.Health;
 /// Health check that verifies:
 /// 1. Database connectivity (SQLite can be queried)
 /// 2. ADCS CA accessibility (optional — degraded if unavailable)
+/// 3. Free space on the data folder's volume (degraded below the threshold, issue #632)
 /// </summary>
 public sealed class CertusHealthCheck : IHealthCheck
 {
     private readonly CertusDbContext _db;
     private readonly IAdcsClient _adcsClient;
     private readonly CaHealthCache _caHealthCache;
+    private readonly DataFolderFreeSpaceMonitor _freeSpace;
     private readonly ILogger<CertusHealthCheck> _logger;
 
     public CertusHealthCheck(
         CertusDbContext db,
         IAdcsClient adcsClient,
         CaHealthCache caHealthCache,
+        DataFolderFreeSpaceMonitor freeSpace,
         ILogger<CertusHealthCheck> logger)
     {
         _db = db;
         _adcsClient = adcsClient;
         _caHealthCache = caHealthCache;
+        _freeSpace = freeSpace;
         _logger = logger;
     }
 
@@ -122,6 +126,16 @@ public sealed class CertusHealthCheck : IHealthCheck
         {
             throw;
         }
+
+        // Free space on the data folder's volume (issue #632). Degraded, like the
+        // CA: the instance still serves, but it is about to stop being able to
+        // write. The CA reason wins when both apply, because it is the one that
+        // already stops issuance; the disk line is in the data either way. The
+        // monitor throttles its own warning, so this costs no log line per probe.
+        var disk = _freeSpace.Check();
+        data["dataFolderFreeSpace"] = disk.Describe();
+        if (disk.Low)
+            degradedReason ??= "Free space on the data folder's volume is low";
 
         // Database failure outranks CA degradation: if the database is down the
         // instance cannot serve, so report Unhealthy (503) even when the CA is also down.

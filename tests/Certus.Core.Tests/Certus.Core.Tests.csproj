@@ -26,6 +26,14 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Stand in module assemblies with chosen references, shared with Certus.Service.Tests (issue #538). -->
+    <Compile Include="..\Shared\ModuleAssemblyBuilder.cs" Link="Shared\ModuleAssemblyBuilder.cs" />
+    <Compile Include="..\Shared\AuthenticodeTestSigner.cs" Link="Shared\AuthenticodeTestSigner.cs" />
+    <!-- The real time backstop for a wait a regression would leave pending (issues #289 and #381). -->
+    <Compile Include="..\Shared\PoolAwareWait.cs" Link="Shared\PoolAwareWait.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Using Include="Xunit" />
     <Using Include="FluentAssertions" />
     <Using Include="NSubstitute" />

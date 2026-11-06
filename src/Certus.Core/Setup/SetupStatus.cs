@@ -102,6 +102,10 @@ public sealed class SetupStatus
     /// database when a database path is configured, otherwise in the data
     /// directory. Shared by <c>SetupService</c> (which writes it) and
     /// <c>EnabledTemplatesPolicy</c> (which reads it back at issuance time).
+    /// The Windows service refuses a database outside the data directory
+    /// (<see cref="DataFolderPlacement"/>, issue #506), so there the two are the
+    /// same folder. The in memory database has no folder, which leaves a bare
+    /// file name that resolves against the working directory; only tests use it.
     /// </summary>
     public static string GetStatusPath(CertusOptions options)
     {

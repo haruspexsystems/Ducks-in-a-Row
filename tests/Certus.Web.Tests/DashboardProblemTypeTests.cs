@@ -34,6 +34,7 @@ public class DashboardProblemTypeTests
         "certificate-not-revocable",
         "certificate-unavailable",
         "invalid-revocation-reason",
+        "monitor-mode",
         "revocation-blocked-by-guardrail",
         "revocation-out-of-scope",
         "revocation-target-mismatch",

@@ -252,12 +252,39 @@ public sealed class TlsCertificateEnroller
                     _logger.LogWarning(
                         "TLS certificate request denied on template {Template}: {Message}",
                         submitTemplate, refusalForLog ?? "no reason given.");
+
+                    // Two forms of one message (issue #485). The full one names the
+                    // computer account and its domain, which is the fix an administrator
+                    // needs on the wizard, the Settings page and the alert mail. The
+                    // alert webhook POSTs to whatever relay the operator configured, so
+                    // it gets the same reason and remedy without the account, the line
+                    // issue #336 drew for the ACME wire.
+                    var denial = "The CA denied the request: " +
+                        $"{CaStatusCode.EndSentence(refusal ?? "no reason given")} ";
+                    var enrollRemedy = "grant it Enroll on the Security tab of the " +
+                        $"{submitTemplate} template and try again.";
+
+                    // Guarded for the reason OrderService.DescribeDenialRemedy gives:
+                    // the machine name and the domain read can throw, and a throw here
+                    // would reach the renewal loop's general catch, which sends no
+                    // alert, losing the denial over a detail of its wording.
+                    string account;
+                    try
+                    {
+                        account = "the computer account " + DescribeServiceAccount();
+                    }
+                    catch (Exception)
+                    {
+                        account = "its own computer account";
+                    }
+
                     return TlsEnrollmentResult.Denied(
-                        $"The CA denied the request: " +
-                        $"{CaStatusCode.EndSentence(refusal ?? "no reason given")} " +
-                        $"The service enrolls as the computer account {DescribeServiceAccount()}. " +
-                        $"This usually means that account lacks Enroll permission: grant it Enroll " +
-                        $"on the Security tab of the {submitTemplate} template and try again.",
+                        denial +
+                        $"The service enrolls as {account}. " +
+                        "This usually means that account lacks Enroll permission: " + enrollRemedy,
+                        wireMessage: denial +
+                        "This usually means the service's computer account lacks Enroll " +
+                        "permission: " + enrollRemedy,
                         submitTemplate);
 
                 default:
@@ -715,6 +742,13 @@ public enum TlsEnrollmentStatus
 /// records the template should record this rather than what it passed in, so
 /// an install configured with a display name converges on the name ADCS
 /// actually matches (issue #194).
+///
+/// <see cref="WireMessage"/> is <see cref="Message"/> without anything naming this
+/// server's directory identity, for a channel that leaves the operator's trust
+/// boundary: the alert webhook (issue #485). Only the denial names the computer
+/// account and its domain, so it is the one result whose two forms differ, and
+/// the factories below copy the message for the others. A refusal added later
+/// that names the account must pass its own wire form the way the denial does.
 /// </summary>
 public sealed record TlsEnrollmentResult(
     TlsEnrollmentStatus Status,
@@ -724,14 +758,18 @@ public sealed record TlsEnrollmentResult(
     bool ExternalHostCovered = false,
     bool? CurrentHostCovered = null,
     string? Message = null,
-    string? TemplateName = null)
+    string? TemplateName = null,
+    string? WireMessage = null)
 {
     public static TlsEnrollmentResult Pending(int requestId, string message, string? templateName = null) =>
-        new(TlsEnrollmentStatus.Pending, RequestId: requestId, Message: message, TemplateName: templateName);
+        new(TlsEnrollmentStatus.Pending, RequestId: requestId, Message: message, TemplateName: templateName,
+            WireMessage: message);
 
-    public static TlsEnrollmentResult Denied(string message, string? templateName = null) =>
-        new(TlsEnrollmentStatus.Denied, Message: message, TemplateName: templateName);
+    public static TlsEnrollmentResult Denied(string message, string wireMessage, string? templateName = null) =>
+        new(TlsEnrollmentStatus.Denied, Message: message, TemplateName: templateName,
+            WireMessage: wireMessage);
 
     public static TlsEnrollmentResult Failed(string message, string? templateName = null) =>
-        new(TlsEnrollmentStatus.Failed, Message: message, TemplateName: templateName);
+        new(TlsEnrollmentStatus.Failed, Message: message, TemplateName: templateName,
+            WireMessage: message);
 }

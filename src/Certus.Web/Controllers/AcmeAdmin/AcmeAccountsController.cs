@@ -1,5 +1,6 @@
 using Certus.Core.Acme.Services;
 using Certus.Core.Data;
+using Certus.Web.Audit;
 using Certus.Web.Authentication;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -19,10 +20,12 @@ namespace Certus.Web.Controllers.AcmeAdmin;
 public sealed class AcmeAccountsController : ControllerBase
 {
     private readonly AccountService _accountService;
+    private readonly AccountErasureService _erasureService;
 
-    public AcmeAccountsController(AccountService accountService)
+    public AcmeAccountsController(AccountService accountService, AccountErasureService erasureService)
     {
         _accountService = accountService;
+        _erasureService = erasureService;
     }
 
     /// <summary>
@@ -114,10 +117,19 @@ public sealed class AcmeAccountsController : ControllerBase
     /// record.
     /// </summary>
     [HttpPost("{id:int}/deactivate")]
+    [AdminAudit("acme.account.deactivated", Transactional = true)]
     public async Task<IActionResult> Deactivate(int id, CancellationToken ct)
     {
         var result = await _accountService.DeactivateAsync(
             id, AccountDeactivationOrigin.Dashboard, ct);
+        if (result.Outcome == AccountDeactivationOutcome.Deactivated)
+        {
+            this.AdminAudit().Describe(
+                $"account {result.Account!.AccountId}",
+                before: "valid",
+                after: $"deactivated, {result.InvalidatedOrders} open order(s) invalidated");
+        }
+
         return result.Outcome switch
         {
             AccountDeactivationOutcome.NotFound =>
@@ -130,6 +142,60 @@ public sealed class AcmeAccountsController : ControllerBase
                 accountId = result.Account.AccountId,
                 status = result.Account.Status,
                 invalidatedOrders = result.InvalidatedOrders,
+            }),
+        };
+    }
+
+    /// <summary>
+    /// POST /api/acme/accounts/{id}/erase: removes the account's personal data
+    /// (issue #637): its contact addresses, the principal link on its
+    /// credential, and the identifiers its orders carried, keeping the order
+    /// and certificate records the CA audit needs. The account must already be
+    /// deactivated, so a live client's data is never pulled out from under it;
+    /// a valid account answers 409. A second request for an erased account
+    /// answers 200 with the first erasure's instant and changes nothing. The
+    /// action is logged at Warning with the caller's identity, and the audit
+    /// filter writes its row in the same transaction as the erasure (issue
+    /// #634); the repeated request suppresses the row, so the trail never
+    /// shows two erasures of one account.
+    /// </summary>
+    [HttpPost("{id:int}/erase")]
+    [AdminAudit("acme.account.erased", Transactional = true)]
+    public async Task<IActionResult> Erase(int id, CancellationToken ct)
+    {
+        var actor = AdminAuditDescription.ActorOf(User);
+        var result = await _erasureService.EraseAsync(id, actor, ct);
+        if (result.Outcome == AccountErasureOutcome.AlreadyErased)
+            this.AdminAudit().Suppress();
+        else if (result.Outcome == AccountErasureOutcome.Erased)
+        {
+            this.AdminAudit().Describe(
+                $"account {result.Account!.AccountId}",
+                after: $"personal data erased: {result.OrdersRedacted} order(s), " +
+                       $"{result.AuthorizationsRedacted} authorization(s), " +
+                       $"{result.ChallengesRedacted} challenge(s) redacted, " +
+                       $"credential link {(result.CredentialLinkCleared ? "cleared" : "none")}");
+        }
+
+        return result.Outcome switch
+        {
+            AccountErasureOutcome.NotFound =>
+                NotFound(new { error = "No account has this id." }),
+            AccountErasureOutcome.NotDeactivated =>
+                Conflict(new
+                {
+                    error = "Deactivate the account first. Erasure removes data its client is still using.",
+                }),
+            _ => Ok(new
+            {
+                id = result.Account!.Id,
+                accountId = result.Account.AccountId,
+                erasedAt = result.Account.ErasedAt,
+                alreadyErased = result.Outcome == AccountErasureOutcome.AlreadyErased,
+                ordersRedacted = result.OrdersRedacted,
+                authorizationsRedacted = result.AuthorizationsRedacted,
+                challengesRedacted = result.ChallengesRedacted,
+                credentialLinkCleared = result.CredentialLinkCleared,
             }),
         };
     }

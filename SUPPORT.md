@@ -26,7 +26,20 @@ to send:
 - **Feature ideas and discussion** — open a thread in
   [GitHub Discussions](https://github.com/haruspexsystems/Ducks-in-a-Row/discussions).
 
-An opt-in newsletter for release news and the occasional survey is coming.
+## Security notices and the newsletter
+
+Ducks in a Row sends us nothing, so we can only tell you about a security fix
+if you ask. Sign up for security notices at https://ducksinarow.dev/notices:
+an email when a release fixes a vulnerability, saying what is affected and
+which release fixes it, and nothing else. The same form offers the newsletter,
+with release news and the occasional survey, as a separate box that starts
+unticked. The [privacy notice](https://ducksinarow.dev/privacy) explains what
+we keep, and why. The Setup Complete page and the Settings page link the same
+sign up.
+
+If you would rather not give an address, watch the repository's
+[security advisories](https://github.com/haruspexsystems/Ducks-in-a-Row/security/advisories)
+on GitHub.
 
 ## Security issues
 

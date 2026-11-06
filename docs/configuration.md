@@ -23,10 +23,26 @@ changes, and the restart is the apply step.
 > than SYSTEM or Administrators owns it or may write it. See
 > [Troubleshooting](troubleshooting.md#the-service-ignores-a-configuration-file).
 
+> **Keep secrets out of `appsettings.json`.** The installation folder is
+> readable by every local user, so an SMTP password, a webhook signing secret
+> or a webhook header put there is readable by every local user too; a secret
+> belongs in the dashboard, which stores it protected, or in `settings.json`
+> in the data folder, which only SYSTEM and Administrators can read.
+
+> **The service writes to `settings.json` too, and keeps your keys.** The setup
+> wizard, the Settings page, the alert settings card and the HTTPS certificate
+> renewal each change only the keys they manage and write every other key back
+> as it was. One thing they refuse: if you set a key they manage in the colon
+> form at the top level, such as `"Certus:ExternalUrl"`, a save would set
+> that key twice, which stops the service starting. The save is refused
+> instead and the log names the key. Move it into the `"Certus"` section and
+> save again.
+
 > **Not everything lives in these files.** The allowed domain list, the EAB
 > enforcement mode, the revocation scope and the device attestation settings are
 > stored separately and apply immediately, with no restart. Those are called out
-> where they appear below.
+> where they appear below. The instance mode lives in the registry instead; see
+> [Monitor mode](#monitor-mode).
 
 A minimal `settings.json` after setup looks like this:
 
@@ -51,13 +67,14 @@ A minimal `settings.json` after setup looks like this:
 | Setting | Default | Purpose |
 |---|---|---|
 | `Certus:CaConnectionString` | `null`, ships null | The CA, in `CAHOST\CA Name` form. The wizard sets it |
-| `Certus:DatabasePath` | `ducks.db` in the data folder, ships null | The SQLite database file. A blank value opens a private temporary database per connection, which is why it is normalised after binding rather than trusted from the file |
+| `Certus:DatabasePath` | `ducks.db` in the data folder, ships null | The SQLite database file. It must be in the data folder, and the service refuses to start otherwise ([why](troubleshooting.md#the-service-will-not-start-a-file-is-outside-the-data-folder)); to keep the data on another disk, move the whole data folder. A blank value opens a private temporary database per connection, which is why it is normalised after binding rather than trusted from the file |
 | `Certus:ExternalUrl` | `null`, ships null | The base URL you expect clients to use. Recorded and checked at startup. When it is set, every URL the ACME server hands out takes its scheme, host and port from it, whatever host the client connected to; when it is not, ACME URLs follow the host the client connects to |
 | `Certus:SyncIntervalMinutes` | `5` | How often the dashboard syncs certificates from the CA. Values below 1 are raised to 1 |
 | `Certus:RequestHistoryDays` | `30` | How far back the sync reaches for pending, denied and failed requests, so their detail pages can show the CA's own explanation. Issued and revoked certificates are always synced in full. `0` skips those three passes and empties the matching filters |
+| `Certus:FreeSpaceWarningMegabytes` | `1024` | Below this much free space on the volume holding the data folder, the health endpoint reports `Degraded` and the log carries a warning (once when it drops, then daily while it stays low). Nothing is deleted automatically. `0` turns the check off. Absent from `appsettings.json`, so this is the default unless you add it |
 | `Certus:EnableWalMode` | `true` | SQLite write ahead logging. Set `false` on a filesystem that cannot support WAL, or when a backup tool needs a single file with no `-wal` and `-shm` sidecars. Applied in both directions on every start, so changing it converts the existing database |
 | `Certus:UseMockCa` | `false` | Development only. The service refuses to start if this is true while a CA connection string is set |
-| `Certus:SettingsOverlayPath` | `settings.json` in the data folder | Where the overlay above is read from |
+| `Certus:SettingsOverlayPath` | `settings.json` in the data folder | Development and tests only. The service reads the overlay from the data folder and refuses to start when this names any other file ([why](troubleshooting.md#the-service-will-not-start-a-file-is-outside-the-data-folder)) |
 
 ## The server's own HTTPS certificate
 
@@ -66,13 +83,72 @@ connected to. See [quickstart](quickstart.md) for turning it on.
 
 | Setting | Default | Purpose |
 |---|---|---|
-| `Certus:HttpsCertificateThumbprint` | `null` | The certificate currently served. The wizard and the Settings page write it |
-| `Certus:HttpsCertificateAutoRenewalEnabled` | `true` | Renew before expiry without being asked |
+| `Certus:HttpsCertificateThumbprint` | `null` | The certificate currently served, from `LocalMachine\My`. The wizard and the Settings page write it. When the certificate it names has been archived by a renewal, or has expired, the service serves the newest one issued after it to the same subject from the same template, and records that one here; see [following a renewal](monitor-mode.md#the-https-certificate) |
+| `Certus:HttpsCertificateAutoRenewalEnabled` | `true` | Renew before expiry without being asked. Only a certificate the service installed itself is renewed, which is one carrying the friendly name `Ducks in a Row HTTPS`; a certificate someone else installed, such as one chosen in monitor mode, is left to whoever issued it. While it is on, a certificate it renews is left out of the expiry alerts, because renewal owns it; while it is off, or for a certificate it leaves alone, the server's certificate gets the same alerts as every other certificate. Monitor mode turns it off |
 | `Certus:HttpsCertificateRenewalWindowDays` | `30` | How long before expiry to renew |
 | `Certus:HttpsCertificateRenewalCheckIntervalHours` | `24` | How often to check |
 
 The last three are deliberately absent from `appsettings.json`, so they take the
 values above unless you add them.
+
+## Monitor mode
+
+Monitor mode is for a CA you want watched but not written to. The service keeps
+the certificate inventory, the expiry alerts, CRL watching and the alert
+settings, and turns off everything that writes to the CA: ACME, issuance and
+revocation. It is the low risk first step onto a production CA. Turning issuance
+on later is a rights grant, a change to this value and a restart, never a
+reinstall. [Monitor mode](monitor-mode.md) has the whole picture: what it does and
+never does, what it needs from the CA team, choosing it at install, the setup
+wizard, the HTTPS certificate, and switching in both directions.
+
+The installer writes the value, from the **Monitor only** checkbox or
+`MONITOR_ONLY=1`. The mode is not in any configuration file. It is a registry
+value beside the data folder's:
+
+| Key | Value | Type | Contents |
+|---|---|---|---|
+| `HKLM\SOFTWARE\Haruspex Systems\Ducks in a Row` | `Mode` | `REG_SZ` | `monitor` or `full` |
+
+- Absent or empty means full, so an installation that never chose behaves
+  exactly as before.
+- Case and surrounding spaces do not matter.
+- Any other value, or a value of another type such as `REG_DWORD`, stops the
+  service at startup with the reason in the log. It is never guessed at:
+  reading a mistyped `monitr` as full would turn issuance back on for a CA
+  whose team was promised none.
+- Only a local administrator can change it, and a restart applies it. Neither
+  `appsettings.json`, `settings.json`, an environment variable nor the
+  dashboard can set it, by design. The one exception is a host run in the
+  Development environment, which a production service never is: there
+  `Certus:Development:Mode` overrides the value, for testing.
+
+To set it, from an elevated PowerShell session:
+
+```powershell
+New-ItemProperty -Path 'HKLM:\SOFTWARE\Haruspex Systems\Ducks in a Row' -Name Mode -Value monitor -PropertyType String -Force
+Restart-Service DucksInARow
+```
+
+What changes in monitor mode, in configuration terms:
+
+- Every ACME URL answers 404, and so does the ACME administration API under
+  `/api/acme`.
+- The challenge validation worker, the worker that collects certificates the
+  CA held for approval, and the automatic renewal of the server's own HTTPS
+  certificate do not run, whatever
+  `Certus:HttpsCertificateAutoRenewalEnabled` says.
+- The dashboard refuses to revoke a certificate, and to enrol or renew its own
+  HTTPS certificate, with the problem type
+  `https://ducksinarow.dev/problems/monitor-mode`.
+- The server's own HTTPS certificate gets the ordinary expiry alerts, because
+  nothing renews it.
+- `Certus:Acme:ExposeAllTemplates` and a revocation scope of `all` have no
+  effect, and the startup log says so at Information rather than warning.
+
+Monitor mode needs **Read** on the CA, plus the **Request Certificates** that
+Authenticated Users hold on a default CA. See
+[what it needs](monitor-mode.md#what-it-needs).
 
 ## ACME
 
@@ -128,9 +204,22 @@ approves or denies it at the CA, and this sweep is what finishes it.
 | `Certus:RateLimiting:WindowSeconds` | `60` | |
 | `Certus:RateLimiting:SegmentsPerWindow` | `6` | How many steps the window releases permits in |
 | `Certus:RateLimiting:HelpUrl` | none | Documentation URL for a `Link: rel="help"` on a refusal |
+| `Certus:RateLimiting:MaxStoredNonces` | `10000` | The most replay nonces kept at once; the oldest are evicted when it is full. Values below 1 are raised to 1 |
+| `Certus:RateLimiting:MaxIdentifiersPerOrder` | `100` | The most identifiers one new-order request may name. More is refused as `malformed` |
+| `Certus:RateLimiting:MaxPendingOrdersPerAccount` | `1000` | The most orders one account may hold open (pending or ready, not expired). A request from an account at the cap is refused as `rateLimited` |
 
 A non positive value while rate limiting is enabled is logged as a warning at
 startup.
+
+The last three bound what the server stores rather than how often it is asked,
+so they apply whether or not `Enabled` is on. A nonce is stored on every ACME
+protocol response and lives an hour, so without the cap a client could grow the
+store at line rate; evicting the oldest costs a legitimate client at most one
+`badNonce` retry, which RFC 8555 requires every client to handle. No nonce is
+minted on a rate limit refusal or on an unknown ACME URL. The open order cap
+clears when the client finalizes an order, deactivates its authorizations, or
+lets it expire a week after it was placed, so that refusal carries no
+`Retry-After`.
 
 ### Which rate limit refused a request
 
@@ -175,6 +264,13 @@ forwarded headers are ignored entirely and every client counts as the proxy, so
 one fleet shares a single limit. The service says so at startup when
 `TrustedProxies` is empty.
 
+The partition is the full address, for IPv6 as for IPv4. An IPv6 client that
+holds a whole /64 can therefore present a fresh address per request and sit in
+a fresh partition each time; the per address limits do not stop that, and the
+resource caps above (the nonce store, the identifiers per order, the open
+orders per account) are what bound it. Partitioning IPv6 callers by prefix is
+not implemented.
+
 Permits are released in `SegmentsPerWindow` steps across the window rather than
 all at once, so a refused fleet recovers gradually instead of retrying in
 lockstep. `Retry-After` reports one step, `WindowSeconds / SegmentsPerWindow`.
@@ -209,6 +305,27 @@ rather than nesting `Alerts` inside `Certus`. Both forms bind.
 Most of the SMTP block is editable from the Settings page. The webhook block is
 deliberately not, so a dashboard administrator cannot redirect alert traffic.
 
+## Data retention
+
+How long each class of record stays in the database before the daily
+retention pass removes it. The [backup and restore](backup-and-restore.md#what-the-database-keeps-and-for-how-long)
+page says what each class holds and which of it is personal data. Each period
+is a number of days, `0` keeps that class for ever, and none of the keys is in
+`appsettings.json`, so these are the defaults unless you add them to
+`settings.json`. The pass reads them at startup; restart after a change.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `Certus:Retention:FinishedOrderDays` | `90` | How long after an ACME order reached `valid` or `invalid` its authorizations and challenges are kept, and how long an invalid order itself is kept. A valid order's row and its certificate record are kept until this many days after the certificate expired, because renewal information, `replaces` and ACME revocation look a live certificate up through them |
+| `Certus:Retention:DeactivatedAccountDays` | `365` | How long after deactivation an ACME account keeps its contact addresses. The account row itself is deleted once that period has passed and the order rule has removed its last order |
+| `Certus:Retention:AlertHistoryDays` | `730` | How long certificate, CRL and licence alert history rows are kept after the alert was sent |
+| `Certus:Retention:AuditTrailDays` | `730` | How long the administrator audit trail and the refused sign in counts are kept. Never below 90: a lower value is raised to 90 and the service log says so at startup. `0` keeps the trail for ever |
+
+The CA inventory mirror is not subject to retention and has no setting: it
+reflects what the CA holds, and the next sync would recreate anything removed.
+The policy rejection table keeps its newest 1,000 rows, which is not
+configurable.
+
 ## Authentication
 
 The dashboard and the setup API use Windows Integrated Authentication and are
@@ -220,6 +337,7 @@ limited to an administrator group.
 | `Auth:AdminGroup` | `null`, ships null | The group allowed in. Null means the built in Administrators group |
 | `Auth:RequireHttps` | `true` | HSTS and an HTTP to HTTPS redirect outside development |
 | `Auth:TrustedProxies` | `[]` | Reverse proxy addresses whose `X-Forwarded-*` headers are trusted |
+| `Auth:RequireKerberos` | `false` | Refuse a dashboard sign in that used NTLM with a 401 that says why. The package every sign in used is logged whether this is on or off. Register the HTTP service principal name first; see [NTLM and the dashboard](hardening.md#ntlm-and-the-dashboard-sign-in) |
 
 ## Web server and logging
 
@@ -228,7 +346,8 @@ limited to an administrator group.
 | `Kestrel:Endpoints:Http:Url` | `http://0.0.0.0:5000` | |
 | `Kestrel:Endpoints:Https:Url` | `https://0.0.0.0:5001` | |
 | `Kestrel:Endpoints:Https:Certificate:Path` | empty | Empty means the self signed certificate in the data folder is served |
-| `Serilog:MinimumLevel:Default` | `Information` | Logs go to `logs\ducks-<date>.log` in the data folder, 30 daily files retained |
+| `Kestrel:Endpoints:Https:SslProtocols` | not set | Not set means TLS 1.2 and TLS 1.3 only, whatever Windows allows. A list here, such as `["Tls13"]`, replaces that. `Kestrel:EndpointDefaults:SslProtocols` is ignored for this endpoint. Every start logs the protocols the endpoint serves, and logs a warning when this list admits anything older than TLS 1.2 |
+| `Serilog:MinimumLevel:Default` | `Information` | Logs go to `logs\ducks-<date>.log` in the data folder; a file rolls at 100 MB and 30 files are retained |
 
 ## What the service refuses to start with
 
@@ -237,6 +356,9 @@ security control that the presence of a CA says you wanted:
 
 - `Auth:Mode=Disabled` while `Certus:CaConnectionString` is set.
 - `Certus:UseMockCa=true` while `Certus:CaConnectionString` is set.
+
+So is a `Mode` registry value that is neither `monitor` nor `full`, rather
+than guessed at; see [Monitor mode](#monitor-mode).
 
 Everything else that looks wrong is logged as a startup warning and the service
 runs. Read `logs\ducks-<date>.log` after a configuration change; the warnings

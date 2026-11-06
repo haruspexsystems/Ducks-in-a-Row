@@ -67,6 +67,9 @@ public class TlsCertificateTemplateInjectionIntegrationTests : IDisposable
         public bool Remove(string thumbprint) => false;
 
         public int RemoveSuperseded(string keepThumbprint) => 0;
+
+        public IReadOnlyList<X509Certificate2> ListCertificates() =>
+            [X509CertificateLoader.LoadCertificate(_certificate.RawData)];
     }
 
     private sealed class Factory : CertusWebApplicationFactory

@@ -2,6 +2,8 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using Certus.Core.Configuration;
+using Certus.Core.ServiceRights;
+using Certus.Core.Setup;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -35,6 +37,12 @@ public class ServiceRightsIntegrationTests
     private static JsonElement Row(JsonElement body, string id) =>
         body.GetProperty("rows").EnumerateArray().Single(r => r.GetProperty("id").GetString() == id);
 
+    private static List<JsonElement> TemplateRows(JsonElement body) =>
+        body.GetProperty("rows").EnumerateArray().Where(r => r.GetProperty("group").GetString() == "template").ToList();
+
+    private static List<string> TemplateNames(int count) =>
+        Enumerable.Range(0, count).Select(i => $"Template{i:D2}").ToList();
+
     [Fact]
     public async Task TheWizardRoute_ReturnsAReportWithNamedStatuses()
     {
@@ -53,6 +61,12 @@ public class ServiceRightsIntegrationTests
         Row(body, "https-enrolment").GetProperty("status").GetString().Should().Be("skipped");
         Row(body, "ca-read").GetProperty("neededFor").EnumerateArray().Select(e => e.GetString())
             .Should().Equal("inventory");
+        // Full mode marks nothing as not needed (issue #470).
+        body.GetProperty("rows").EnumerateArray()
+            .Should().OnlyContain(r => r.GetProperty("notNeeded").ValueKind == JsonValueKind.Null);
+        // The wizard's route refuses more templates than one check reads, so it
+        // never leaves one out (issue #478).
+        body.GetProperty("templatesNotChecked").GetInt32().Should().Be(0);
     }
 
     [Fact]
@@ -111,6 +125,64 @@ public class ServiceRightsIntegrationTests
         var body = await ParseJsonAsync(fresh);
         // The factory's seeded status file enables WebServer.
         Row(body, "template:WebServer").GetProperty("status").GetString().Should().Be("inferred");
+        body.GetProperty("templatesNotChecked").GetInt32().Should().Be(0);
+    }
+
+    [Fact]
+    public async Task TheSettingsRoutes_SayHowManyEnabledTemplatesWereNotChecked()
+    {
+        using var factory = new EnabledTemplatesFactory();
+        var client = factory.CreateClient();
+        // Four names past the cap, plus one repeated in another case and one
+        // blank, which the route sets aside before counting (issue #478).
+        factory.Enable([.. TemplateNames(ServiceRightsCheck.MaxTemplates + 4), "template00", " "]);
+
+        var kept = await client.GetAsync("/api/settings/service-rights");
+        var fresh = await client.PostAsync("/api/settings/service-rights/check", Json(new { }));
+
+        foreach (var response in new[] { kept, fresh })
+        {
+            response.StatusCode.Should().Be(HttpStatusCode.OK);
+            var body = await ParseJsonAsync(response);
+            TemplateRows(body).Should().HaveCount(ServiceRightsCheck.MaxTemplates);
+            body.GetProperty("templatesNotChecked").GetInt32().Should().Be(4);
+        }
+    }
+
+    [Fact]
+    public async Task TheSettingsRoutes_LeaveNothingOut_AtExactlyTheCap()
+    {
+        using var factory = new EnabledTemplatesFactory();
+        var client = factory.CreateClient();
+        factory.Enable(TemplateNames(ServiceRightsCheck.MaxTemplates));
+
+        var response = await client.GetAsync("/api/settings/service-rights");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body = await ParseJsonAsync(response);
+        TemplateRows(body).Should().HaveCount(ServiceRightsCheck.MaxTemplates);
+        body.GetProperty("templatesNotChecked").GetInt32().Should().Be(0);
+    }
+
+    [Fact]
+    public async Task TheCountLeftOut_FollowsTheStatusFile_WhileTheKeptReportIsServed()
+    {
+        using var factory = new EnabledTemplatesFactory();
+        var client = factory.CreateClient();
+        factory.Enable(TemplateNames(ServiceRightsCheck.MaxTemplates + 4));
+        var first = await ParseJsonAsync(await client.GetAsync("/api/settings/service-rights"));
+
+        // One more name past the cap leaves the checked templates, and so the
+        // kept report's key, as they were. The count must still move, because
+        // it describes the status file as it is now, not as it was when the
+        // kept report ran.
+        factory.Enable(TemplateNames(ServiceRightsCheck.MaxTemplates + 5));
+        var second = await ParseJsonAsync(await client.GetAsync("/api/settings/service-rights"));
+
+        second.GetProperty("checkedAt").GetString().Should().Be(
+            first.GetProperty("checkedAt").GetString(), "the kept report is served, not a fresh one");
+        first.GetProperty("templatesNotChecked").GetInt32().Should().Be(4);
+        second.GetProperty("templatesNotChecked").GetInt32().Should().Be(5);
     }
 
     [Fact]
@@ -122,6 +194,18 @@ public class ServiceRightsIntegrationTests
         var response = await client.GetAsync("/api/settings/service-rights");
 
         response.StatusCode.Should().Be(HttpStatusCode.Conflict);
+    }
+
+    /// <summary>
+    /// A host of its own, so the templates a test enables reach no other test
+    /// and no other test's kept report. The Settings routes read the status
+    /// file on every request, so a test writes it after the host has started.
+    /// </summary>
+    private sealed class EnabledTemplatesFactory : CertusWebApplicationFactory
+    {
+        public void Enable(IEnumerable<string> templates) =>
+            new SetupStatus { EnabledTemplates = [.. templates] }
+                .Save(Path.Combine(TempDataDir, SetupStatus.FileName));
     }
 
     /// <summary>

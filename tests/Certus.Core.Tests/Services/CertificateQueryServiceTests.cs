@@ -71,6 +71,7 @@ public class CertificateQueryServiceTests : IDisposable
                 NullLogger<TemplateService>.Instance),
             new RevocationScopePolicy(
                 Options.Create(options), NullLogger<RevocationScopePolicy>.Instance),
+            CertusInstanceMode.Full,
             NullLogger<RevocationEligibilityService>.Instance);
     }
 
@@ -963,7 +964,10 @@ public class CertificateQueryServiceTests : IDisposable
     /// <summary>
     /// Seeds the ACME side of the value bridge: an account with the given
     /// contact list, an order for it, and an issued ACME certificate whose
-    /// AdcsRequestId matches a seeded SyncedCertificate row.
+    /// AdcsRequestId and serial match a seeded SyncedCertificate row. The
+    /// serial is that row's own, because the bridge matches on both (issue
+    /// #442); a different serial under the same request id is another CA's
+    /// certificate, which AcmeInventoryBridgeTests covers.
     /// </summary>
     private async Task SeedAcmeChainAsync(int adcsRequestId, string? contactJson)
     {
@@ -995,7 +999,7 @@ public class CertificateQueryServiceTests : IDisposable
             Order = order,
             CertificatePem = "-----BEGIN CERTIFICATE-----",
             AdcsRequestId = adcsRequestId,
-            SerialNumber = $"ACMESERIAL{adcsRequestId:D3}"
+            SerialNumber = $"SERIAL{adcsRequestId:D3}"
         });
         await _db.SaveChangesAsync();
     }

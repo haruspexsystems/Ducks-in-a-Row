@@ -1,7 +1,23 @@
 """
 Generate the Ducks in a Row Installation & Configuration Guide as a PDF.
 Uses ReportLab to produce a professional multi-page document.
+
+    python docs/generate_guide.py                 # docs/Ducks-in-a-Row-Installation-Guide.pdf
+    python docs/generate_guide.py --output PATH   # render somewhere else
+    python docs/generate_guide.py --check         # render to a temporary file and discard it
+
+The PDF is not committed (issue #662). A committed copy made every two
+documentation pull requests in flight conflict on a binary git cannot merge,
+and the digest that kept it current conflicted with it. It is rendered by the
+pull request build as a check and an artifact, and by
+release/Publish-Release.ps1 into the public source snapshot at the cut, so the
+released tree still carries it where docs/README.md links it. --check is the
+local gate: the markdown parser is strict by design, so a page it cannot read
+fails here rather than quietly losing a paragraph.
 """
+
+import argparse
+import tempfile
 
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -21,16 +37,16 @@ from reportlab.pdfbase.pdfmetrics import stringWidth
 from xml.sax.saxutils import escape
 import os
 import re
+import sys
 import xml.etree.ElementTree as ET
 
 import guide_markdown as md
 import guide_manifest as manifest
 
-# Product version, stamped on the cover and every page footer. It lives in
-# guide_manifest so the staleness check can read it without importing
-# ReportLab, and it is read from Directory.Build.props rather than written
-# here: the literal this replaced claimed the guide "never drifts from the
-# release it documents" while sitting two releases behind, on all 26 pages.
+# Product version, stamped on the cover and every page footer. It is read from
+# Directory.Build.props rather than written here: the literal this replaced
+# claimed the guide "never drifts from the release it documents" while sitting
+# two releases behind, on all 26 pages.
 VERSION = manifest.read_version()
 
 # Brand colors aligned with the web UI palette
@@ -861,12 +877,12 @@ def render_chapter(chapter, number, styles, anchors, docs_dir):
     return story
 
 
-def build_document():
-    """Build the complete PDF document."""
+def build_document(output_path=OUTPUT_PATH):
+    """Build the complete PDF document at output_path."""
     styles = build_styles()
 
     doc = GuideDocTemplate(
-        OUTPUT_PATH,
+        output_path,
         pagesize=letter,
         leftMargin=60,
         rightMargin=60,
@@ -875,10 +891,9 @@ def build_document():
         title="Ducks in a Row Installation & Configuration Guide",
         author="DucksInARow",
         subject="ACME-to-ADCS Certificate Proxy",
-        # Fixes the creation timestamp and document id, so regenerating
-        # unchanged sources produces byte identical output. That is what
-        # lets CI diff the committed PDF and fail when it has drifted from
-        # the markdown it is built from.
+        # Fixes the creation timestamp and document id, so rendering the
+        # same sources on the same toolchain produces byte identical output:
+        # a release cut twice from one commit ships one guide, not two.
         invariant=1,
     )
 
@@ -950,17 +965,34 @@ def build_document():
     # Build the PDF. multiBuild runs the extra passes the table of contents
     # needs to resolve its page numbers.
     doc.multiBuild(story)
+    print(f"PDF generated: {output_path}")
 
-    # Record the digest of everything the guide was rendered from, so CI can
-    # tell a stale PDF from a current one without rebuilding it. Comparing
-    # the PDF bytes instead would be a stronger claim than the toolchain
-    # supports: ReportLab's output differs between its own versions and
-    # between Python versions, so a guide regenerated on another machine is
-    # byte different while being word for word identical.
-    manifest.write_digest()
-    print(f"PDF generated: {OUTPUT_PATH}")
-    print(f"Inputs digest: {manifest.read_digest()}")
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    parser.add_argument(
+        "--output",
+        default=OUTPUT_PATH,
+        help="where to write the PDF (default: docs/Ducks-in-a-Row-Installation-Guide.pdf)",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="render to a temporary file and delete it; exit 1 if any page fails to render",
+    )
+    args = parser.parse_args(argv)
+
+    if args.check:
+        # The whole render, nothing kept. Any exception the parser raises
+        # propagates as a traceback and a non zero exit, which is the gate.
+        with tempfile.TemporaryDirectory() as scratch:
+            build_document(os.path.join(scratch, "Ducks-in-a-Row-Installation-Guide.pdf"))
+        print("Installation guide builds.")
+        return 0
+
+    build_document(os.path.abspath(args.output))
+    return 0
 
 
 if __name__ == "__main__":
-    build_document()
+    sys.exit(main())

@@ -59,6 +59,25 @@ public sealed class MockAdcsClient : IAdcsClient
     /// </summary>
     public bool LeafIsCa { get; set; }
 
+    /// <summary>
+    /// Microsoft Application Policy OIDs (szOID_APPLICATION_CERT_POLICIES)
+    /// written into issued leaves. Null omits the extension, which is the
+    /// ordinary TLS leaf. Set it to mint a leaf whose Application Policies carry
+    /// a capability its EKU does not, the ESC15 shape the leaf guard must refuse
+    /// (issue #548).
+    /// </summary>
+    public IReadOnlyList<string>? LeafApplicationPolicyOids { get; set; }
+
+    /// <summary>
+    /// When set, the raw GeneralNames DER the mock stamps as the issued leaf's
+    /// subject alternative name, in place of the one the request asked for. It
+    /// stands in for a CA that put a name in the certificate the CSR did not
+    /// carry, which is what the issued name leaf guard exists to catch; the mock
+    /// otherwise copies only the requested SAN and so cannot produce that
+    /// divergence on its own.
+    /// </summary>
+    public byte[]? LeafSanOverrideDer { get; set; }
+
     public MockAdcsClient(string caName = "Example Issuing CA", IEnumerable<TemplateInfo>? templates = null)
     {
         // The name becomes the certificate authority's own common name, which
@@ -784,9 +803,22 @@ public sealed class MockAdcsClient : IAdcsClient
         // mock dropped it, so no certificate it had ever issued carried a
         // SAN and an ACME run against the dev host handed back a leaf every
         // modern TLS client rejects (issue #295).
-        var requestedSan = FindRequestedSan(csrInfo);
-        if (requestedSan != null)
-            generator.AddExtension(X509Extensions.SubjectAlternativeName, requestedSan);
+        if (LeafSanOverrideDer != null)
+        {
+            // A CA that put names in the leaf the request did not carry. Stamped
+            // in place of the requested SAN, because the generator refuses a
+            // second extension under an OID it already holds.
+            generator.AddExtension(
+                X509Extensions.SubjectAlternativeName,
+                false,
+                GeneralNames.GetInstance(Asn1Object.FromByteArray(LeafSanOverrideDer)));
+        }
+        else
+        {
+            var requestedSan = FindRequestedSan(csrInfo);
+            if (requestedSan != null)
+                generator.AddExtension(X509Extensions.SubjectAlternativeName, requestedSan);
+        }
 
         AddLeafExtensions(generator);
 
@@ -895,6 +927,21 @@ public sealed class MockAdcsClient : IAdcsClient
                 X509Extensions.BasicConstraints,
                 true,
                 new BasicConstraints(true));
+        }
+
+        if (LeafApplicationPolicyOids is { Count: > 0 } appPolicies)
+        {
+            // CERT_POLICIES: SEQUENCE OF PolicyInformation, each a SEQUENCE whose
+            // first element is the policy OID. The same encoding as the standard
+            // certificatePolicies extension, which is why a real CA copying
+            // requested Application Policies produces a leaf shaped like this.
+            var policyInfos = appPolicies
+                .Select(o => (Asn1Encodable)new DerSequence(new DerObjectIdentifier(o)))
+                .ToArray();
+            generator.AddExtension(
+                new DerObjectIdentifier("1.3.6.1.4.1.311.21.10"),
+                false,
+                new DerSequence(policyInfos));
         }
     }
 

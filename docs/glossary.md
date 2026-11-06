@@ -56,13 +56,17 @@ components used to talk to the CA. Install it with
 
 The Windows technologies Ducks in a Row uses to call the CA over the network.
 They need TCP port 135 plus a range of dynamic ports (49152 to 65535) open to
-the CA.
+the CA. The CA server also admits an ordinary account only through its
+**Certificate Service DCOM Access** group, which holds Authenticated Users on a
+default CA. See
+[what to ask your AD and CA team](ad-and-ca-team-request.md#what-to-ask-for).
 
 ### Machine account
 
-The Active Directory account of the Windows computer itself, written with a
-trailing `$` (for example `DUCKS-SERVER$`). Ducks in a Row acts as this account,
-so the CA permissions are granted to the machine account, not to a person.
+The Active Directory account of the Windows computer itself, also called its
+computer account, written with a trailing `$` (for example `DUCKS-SERVER$`).
+Ducks in a Row acts as this account, so the CA permissions are granted to the
+machine account, not to a person.
 
 ### Self signed certificate
 

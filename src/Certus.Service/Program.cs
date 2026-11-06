@@ -11,7 +11,9 @@ using Certus.Core.Alerts;
 using Certus.Core.Configuration;
 using Certus.Core.Crl;
 using Certus.Core.Data;
+using Certus.Core.Data.Retention;
 using Certus.Core.Health;
+using Certus.Core.Modules;
 using Certus.Core.Security;
 using Certus.Web.Security;
 using Certus.Core.Services;
@@ -19,13 +21,18 @@ using Certus.Core.Setup;
 using Certus.Core.ServiceRights;
 using Certus.Service;
 using Certus.Web;
+using Certus.Web.Audit;
 using Certus.Web.Authentication;
 using Certus.Web.Routing;
+using Certus.Web.Configuration;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Hosting.WindowsServices;
 using Microsoft.Extensions.Options;
+using Certus.Web.Logging;
 using Serilog;
 
 Log.Logger = new LoggerConfiguration()
@@ -50,12 +57,27 @@ try
     // Windows Service support
     builder.Host.UseWindowsService();
 
+    // The data directory, resolved once and before the settings overlay below
+    // is added, so the overlay it holds can never move it. Outside Development
+    // this is always the installer's choice or the %ProgramData% default; see
+    // CertusDataDirectory for the one Development override and why tests need it.
+    var dataDirectory = CertusDataDirectory.Resolve(builder.Configuration, builder.Environment);
+
+    // The instance mode (issue #470), resolved here for the same reason as the data
+    // directory: before the settings overlay is added, so the overlay can never
+    // supply it. In production it comes from the registry value the installer writes,
+    // which only a local administrator can change. A value that cannot be honoured
+    // registers everything below as monitor mode, the side that never writes to the
+    // CA, and StartupValidator refuses to start once the file logger exists.
+    var instanceMode = CertusInstanceMode.Resolve(builder.Configuration, builder.Environment);
+
     // Lock the data folder down before anything reads or writes it (issue #489).
     // The installer does this too, but on a server first installed by a version
     // before the fix its folder, and the files already in it, carry the old
     // permissive entries; enforcing here re-propagates the protected DACL to every
-    // child. On a fresh install it is a no-op.
-    ProtectedFolder.EnsureProtected(CertusPaths.DataDirectory);
+    // child. On a fresh install it is a no-op. A test host's own folder keeps the
+    // test's access, because the protected DACL names the process identity.
+    ProtectedFolder.EnsureProtected(dataDirectory);
 
     // Runtime settings overlay (settings.json in the data directory), written
     // by the setup wizard: CA connection string and external URL. It lives in
@@ -63,7 +85,7 @@ try
     // after appsettings so environment variables and command line still win.
     // An overlay the service cannot trust is not added; the verdict is logged
     // once the file logger exists, after Build (issue #489).
-    var overlayTrust = builder.Configuration.AddSettingsOverlay(CertusPaths.DataDirectory);
+    var overlayTrust = builder.Configuration.AddSettingsOverlay(dataDirectory);
 
     // HTTPS: resolve the certificate for the Kestrel HTTPS endpoint.
     // Precedence: an explicit Kestrel certificate path, then the CA issued
@@ -84,40 +106,91 @@ try
     (string Source, string? Thumbprint, string Detail) httpsCertSelection =
         ("KestrelConfig", null, certPath ?? "");
 
+    // Anything about the pinned certificate an operator has to act on, carried to
+    // the post Build block so it reaches the field log file (issue #471).
+    string? httpsCertificateNotice = null;
+
     X509Certificate2? storeCertificate = null;
     if (string.IsNullOrEmpty(certPath) && !string.IsNullOrWhiteSpace(configuredThumbprint))
     {
+        // Archived certificates are included because a renewal by Windows
+        // autoenrolment archives the certificate it supersedes, and that archived
+        // certificate is the only record of which subject and template to follow.
+        // A plain open hides archived certificates (measured; see HttpsCertificateFollow,
+        // which also says what about autoenrolment is still a belief).
         using var machineStore = new X509Store(StoreName.My, StoreLocation.LocalMachine);
-        machineStore.Open(OpenFlags.ReadOnly);
-        var matches = machineStore.Certificates.Find(
-            X509FindType.FindByThumbprint, configuredThumbprint.Trim(), validOnly: false);
+        machineStore.Open(OpenFlags.ReadOnly | OpenFlags.IncludeArchived);
+        var storeCertificates = machineStore.Certificates;
 
-        if (matches.Count == 0)
+        var choice = HttpsCertificateFollow.Choose(
+            configuredThumbprint,
+            storeCertificates.Select(HttpsCertificateFollow.Describe).ToList(),
+            DateTimeOffset.UtcNow);
+
+        storeCertificate = choice.ServeThumbprint is null
+            ? null
+            : storeCertificates.First(c => string.Equals(
+                c.Thumbprint, choice.ServeThumbprint, StringComparison.OrdinalIgnoreCase));
+        foreach (var certificate in storeCertificates)
         {
-            Log.Warning(
-                "Certus:HttpsCertificateThumbprint {Thumbprint} is configured but no such " +
-                "certificate exists in LocalMachine\\My; falling back to the self signed certificate",
-                configuredThumbprint);
+            if (!ReferenceEquals(certificate, storeCertificate))
+                certificate.Dispose();
         }
-        else if (!matches[0].HasPrivateKey)
+
+        switch (choice.Outcome)
         {
-            Log.Warning(
-                "The configured HTTPS certificate {Thumbprint} has no private key; " +
-                "falling back to the self signed certificate",
-                configuredThumbprint);
+            case HttpsCertificateChoiceOutcome.Pinned:
+                break;
+
+            case HttpsCertificateChoiceOutcome.Followed:
+            {
+                // Record the successor where the settings page and the automatic
+                // renewal read it, but only in the overlay, and only when the overlay
+                // is what pinned the old one: a thumbprint set in an environment
+                // variable or on the command line outranks the overlay and is left
+                // for whoever set it.
+                var repinNote = "settings.json was not changed, because it does not hold the old " +
+                                "thumbprint; update Certus:HttpsCertificateThumbprint where it is set";
+                const string thumbprintKey = "Certus:HttpsCertificateThumbprint";
+                if (overlayTrust.IsTrusted
+                    && SettingsOverlay.FindOutrankedKeys(builder.Configuration, [thumbprintKey]).Count == 0)
+                {
+                    var overlayPath = Path.Combine(dataDirectory, CertusPaths.SettingsOverlayFileName);
+                    if (HttpsCertificateFollow.TryRepin(
+                            overlayPath, choice.PinnedThumbprint, choice.ServeThumbprint!, out var repinFailure))
+                    {
+                        repinNote = "settings.json now records the new thumbprint";
+                    }
+                    else if (repinFailure is not null)
+                    {
+                        repinNote = $"recording the new thumbprint in settings.json failed: {repinFailure}";
+                    }
+                }
+
+                // This boot serves the successor, so it is what the served thumbprint
+                // reads as for the settings page and the automatic renewal, whatever
+                // the overlay says.
+                builder.Configuration[thumbprintKey] = choice.ServeThumbprint;
+                httpsCertificateNotice =
+                    $"{choice.Reason} {char.ToUpperInvariant(repinNote[0])}{repinNote[1..]}. " +
+                    "A service that runs across a certificate's expiry keeps serving it until it restarts.";
+                break;
+            }
+
+            case HttpsCertificateChoiceOutcome.ArchivedNoSuccessor:
+                httpsCertificateNotice = choice.Reason;
+                break;
+
+            default:
+                httpsCertificateNotice = choice.Reason + " Falling back to the self signed certificate.";
+                break;
         }
-        else if (matches[0].NotAfter.ToUniversalTime() <= DateTime.UtcNow)
+
+        if (httpsCertificateNotice is not null)
+            Log.Warning("{HttpsCertificateNotice}", httpsCertificateNotice);
+
+        if (storeCertificate is not null)
         {
-            Log.Warning(
-                "The configured HTTPS certificate {Thumbprint} expired {NotAfter:u}; " +
-                "falling back to the self signed certificate",
-                configuredThumbprint, matches[0].NotAfter.ToUniversalTime());
-        }
-        else
-        {
-            storeCertificate = matches[0];
-            builder.WebHost.ConfigureKestrel(kestrel =>
-                kestrel.ConfigureHttpsDefaults(https => https.ServerCertificate = storeCertificate));
             httpsCertSelection = ("Store", storeCertificate.Thumbprint, storeCertificate.Subject);
             Log.Information(
                 "HTTPS is using certificate {Thumbprint} ({Subject}, valid until {NotAfter:u}) " +
@@ -127,73 +200,25 @@ try
         }
     }
 
-    if (string.IsNullOrEmpty(certPath) && storeCertificate is null)
+    // The self signed fallback for lab and first boot use (issue #635). It is
+    // loaded, or generated, when the host resolves Kestrel's options rather than
+    // here, because the file is encrypted with the Data Protection keyring and
+    // the keyring is a service of the built container. Measured on 2026-10-21:
+    // that resolution happens inside Build(), after the data folder lock and
+    // the file logger, before the placement refusals run, so the delegate below
+    // checks the refusals itself. SelfSignedHttpsCertificate logs the thumbprint
+    // it serves, and the outcome is kept for the post Build summary line.
+    var usesSelfSignedFallback = string.IsNullOrEmpty(certPath) && storeCertificate is null;
+    SelfSignedHttpsCertificate.Outcome? selfSignedFallback = null;
+    if (usesSelfSignedFallback)
     {
-        // Generate a self-signed certificate for lab/development use
-        var dataDir = CertusPaths.DataDirectory;
-        ProtectedFolder.EnsureExists(dataDir);
-        var selfSignedPath = Path.Combine(dataDir, "ducks-selfsigned.pfx");
-        const string selfSignedPassword = "certus-dev";
-        const int selfSignedRenewalWindowDays = 30;
-
+        var selfSignedPath = Path.Combine(dataDirectory, SelfSignedHttpsCertificate.FileName);
         httpsCertSelection = ("SelfSigned", null, selfSignedPath);
 
-        // Regenerate when the pfx is missing, unreadable, or within the renewal
-        // window of expiry. The earlier code generated only when the file was
-        // missing, so an expired certificate was reused indefinitely.
-        var regenerate = !File.Exists(selfSignedPath);
-        if (!regenerate)
-        {
-            try
-            {
-                using var existing = X509CertificateLoader.LoadPkcs12FromFile(
-                    selfSignedPath, selfSignedPassword, X509KeyStorageFlags.EphemeralKeySet);
-                regenerate = existing.NotAfter.ToUniversalTime()
-                    <= DateTime.UtcNow.AddDays(selfSignedRenewalWindowDays);
-                if (!regenerate)
-                    httpsCertSelection = ("SelfSigned", existing.Thumbprint, selfSignedPath);
-            }
-            catch (CryptographicException)
-            {
-                // Corrupt or unreadable pfx: regenerate it.
-                regenerate = true;
-            }
-        }
-
-        if (regenerate)
-        {
-            using var rsa = RSA.Create(2048);
-            var request = new CertificateRequest(
-                "CN=Ducks in a Row Self-Signed", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-            request.CertificateExtensions.Add(
-                new X509BasicConstraintsExtension(false, false, 0, false));
-            request.CertificateExtensions.Add(
-                new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, false));
-
-            // Add SAN for localhost so browsers and tools accept it
-            var sanBuilder = new SubjectAlternativeNameBuilder();
-            sanBuilder.AddDnsName("localhost");
-            sanBuilder.AddDnsName(Environment.MachineName);
-            request.CertificateExtensions.Add(sanBuilder.Build());
-
-            using var cert = request.CreateSelfSigned(
-                DateTimeOffset.UtcNow, DateTimeOffset.UtcNow.AddYears(2));
-            File.WriteAllBytes(selfSignedPath,
-                cert.Export(X509ContentType.Pfx, selfSignedPassword));
-            httpsCertSelection = ("SelfSigned", cert.Thumbprint, selfSignedPath);
-            Log.Information(
-                "Generated self-signed HTTPS certificate at {Path} (valid until {NotAfter:u})",
-                selfSignedPath, cert.NotAfter.ToUniversalTime());
-        }
-
-        // Point Kestrel at the generated certificate
-        builder.Configuration["Kestrel:Endpoints:Https:Certificate:Path"] = selfSignedPath;
-        builder.Configuration["Kestrel:Endpoints:Https:Certificate:Password"] = selfSignedPassword;
-
         // Surface the fallback on every boot, not just first generation, so an
-        // operator never unknowingly runs production on the self-signed cert.
+        // operator never unknowingly runs production on the self signed certificate.
         Log.Warning(
-            "HTTPS is using the generated self-signed certificate at {Path}. Configure " +
+            "HTTPS is using the generated self signed certificate at {Path}. Configure " +
             "Kestrel:Endpoints:Https:Certificate:Path with a trusted certificate for production use.",
             selfSignedPath);
     }
@@ -203,10 +228,7 @@ try
         .ReadFrom.Configuration(context.Configuration)
         .ReadFrom.Services(services)
         .WriteTo.Console()
-        .WriteTo.File(
-            Path.Combine(CertusPaths.DataDirectory, "logs", "ducks-.log"),
-            rollingInterval: RollingInterval.Day,
-            retainedFileCountLimit: 30));
+        .WriteTo.CertusLogFile(dataDirectory));
 
     // Configuration
     builder.Services.Configure<CertusOptions>(
@@ -216,6 +238,14 @@ try
     // null over the option initializer, so resolve it back to the default for every
     // IOptions<CertusOptions> consumer (StartupValidator, SetupService).
     builder.Services.PostConfigure<CertusOptions>(o => o.NormalizeDatabasePath());
+
+    // Certus:ReleaseAgeWarningDays (issue #623), read by the Settings About
+    // block only. Bound from the same section so the key sits beside the
+    // other flat Certus keys; the binder ignores what each class lacks.
+    builder.Services.Configure<ReleaseAgeOptions>(
+        builder.Configuration.GetSection(CertusOptions.SectionName));
+
+    builder.Services.AddSingleton(instanceMode);
 
     // Database
     var certusOptions = builder.Configuration
@@ -227,8 +257,46 @@ try
     // makes the startup migration fail with "no such table: __EFMigrationsHistory".
     certusOptions.NormalizeDatabasePath();
 
-    builder.Services.AddDbContext<CertusDbContext>(dbOptions =>
-        dbOptions.UseSqlite($"Data Source={certusOptions.DatabasePath}"));
+    // The database and the settings overlay belong in the data folder, the one folder
+    // this host locks (issue #506). Decided here, from the copy every path below is built
+    // from, and refused once the file logger exists, right after Build: nothing touches
+    // the database folder before then.
+    var placementRefusals = new[]
+    {
+        DataFolderPlacement.RefuseDatabase(certusOptions.DatabasePath, dataDirectory),
+        DataFolderPlacement.RefuseSettingsOverlay(certusOptions.SettingsOverlayPath, dataDirectory),
+    }.OfType<string>().ToArray();
+
+    // The HTTPS defaults, once, for whichever certificate was chosen above: TLS
+    // 1.2 and 1.3 only (issue #484), plus the certificate when the host resolved
+    // one in code (the store certificate, or the self signed fallback). Only the
+    // store branch used to configure HTTPS at all, so the self signed and
+    // configured path endpoints never had a floor to inherit. One call, because
+    // ConfigureHttpsDefaults keeps only the last delegate it was given. The
+    // fallback is not loaded when the placement is refused: the host throws right
+    // after Build, and loading it would create a keyring beside a database the
+    // host is about to refuse (issue #506).
+    builder.WebHost.ConfigureKestrel(kestrel =>
+    {
+        var serverCertificate = storeCertificate;
+        if (usesSelfSignedFallback && placementRefusals.Length == 0)
+        {
+            var services = kestrel.ApplicationServices;
+            selfSignedFallback = SelfSignedHttpsCertificate.Load(
+                dataDirectory,
+                services.GetRequiredService<IDataProtectionProvider>(),
+                DateTimeOffset.UtcNow,
+                services.GetRequiredService<ILoggerFactory>().CreateLogger(nameof(SelfSignedHttpsCertificate)));
+            serverCertificate = selfSignedFallback.Certificate;
+        }
+
+        HttpsProtocolPolicy.Apply(kestrel, serverCertificate);
+    });
+
+    // Built rather than formatted, so a path holding a semicolon cannot add a second
+    // connection string keyword and open a database other than the one checked above.
+    var connectionString = new SqliteConnectionStringBuilder { DataSource = certusOptions.DatabasePath }.ToString();
+    builder.Services.AddDbContext<CertusDbContext>(dbOptions => dbOptions.UseSqlite(connectionString));
 
     // Write the write ahead log back into the database when the host stops
     // (issue #215). Registered before the other AddHostedService calls in this
@@ -286,6 +354,12 @@ try
         }
     }
 
+    // Monitor mode's last line (issue #470): wraps whichever CA client and client
+    // factory the branch above registered, so neither can submit or revoke. The
+    // factory matters as much as the client, because the HTTPS enroller and the
+    // wizard build their own clients through it. Full mode changes nothing here.
+    builder.Services.AddMonitorModeCaWriteGuard(instanceMode);
+
     // ACME services
     builder.Services.Configure<AcmeOptions>(
         builder.Configuration.GetSection(AcmeOptions.SectionName));
@@ -327,6 +401,13 @@ try
     builder.Services.AddScoped<ServiceRightsCheck>();
     builder.Services.AddSingleton<ServiceRightsReportCache>();
 
+    // The paid module host (issue #413): after the app has started it loads the one paid
+    // module on its own thread and exposes where the licence stands, never touching the
+    // issuance path. Wired in both hosts; BothHostsWireTheModuleHostOnce checks it. The data
+    // directory is the one resolved above, so the licence store and the module state and
+    // journal live beside the database.
+    builder.Services.AddCertusModuleHost(dataDirectory);
+
     // Automatic renewal of the server's own HTTPS certificate (issue #105).
     // The renewal core is shared with the settings page button. The hosted
     // service is registered as a singleton as well, the CertificateSyncService
@@ -336,8 +417,13 @@ try
     builder.Services.AddScoped<HttpsCertificateRenewalService>();
     builder.Services.AddSingleton<ServerCertificateIdentity>();
     builder.Services.AddSingleton<HttpsCertificateAutoRenewalService>();
-    builder.Services.AddHostedService(sp =>
-        sp.GetRequiredService<HttpsCertificateAutoRenewalService>());
+    // The singleton stays in monitor mode, because SettingsController reads it; only
+    // the loop goes, since every renewal is an enrolment (issue #470).
+    if (!instanceMode.IsMonitor)
+    {
+        builder.Services.AddHostedService(sp =>
+            sp.GetRequiredService<HttpsCertificateAutoRenewalService>());
+    }
 
     // External URL reachability probe (issue #89). Its handler accepts self
     // signed certificates and is deliberately not the challenge egress
@@ -412,12 +498,7 @@ try
     builder.Services.AddSingleton<AlertConfigStore>();
     builder.Services.AddScoped<AlertQueryService>();
     builder.Services.AddScoped<IAlertNotifier, EmailAlertNotifier>();
-    builder.Services.AddHttpClient<WebhookAlertNotifier>(client =>
-    {
-        client.Timeout = TimeSpan.FromSeconds(30);
-    });
-    builder.Services.AddScoped<IAlertNotifier>(sp =>
-        sp.GetRequiredService<WebhookAlertNotifier>());
+    builder.Services.AddWebhookAlertNotifier();
     builder.Services.AddHostedService<ExpiryMonitorService>();
     // The test send (issue #161). The throttle is a singleton because its whole
     // job is to hold the last send time across requests; the service that
@@ -445,6 +526,11 @@ try
             sp.GetService<ILdapCrlFetcher>());
     });
     builder.Services.AddHostedService<CrlMonitorService>();
+
+    // Licence alerts (issue #494). Registered in both modes, because an alert is
+    // not a write to the CA. It reads the module host's verdict and never runs
+    // module code; the host and the status source come from AddCertusModuleHost.
+    builder.Services.AddHostedService<LicenceAlertService>();
 
     // Challenge validators — HTTP-01, DNS-01, TLS-ALPN-01.
     // Egress is screened by AddressGuard so a validator cannot be pointed at loopback,
@@ -497,7 +583,10 @@ try
     builder.Services.AddScoped<DeviceAttestationAdminService>();
 
     // Background challenge validation worker
-    builder.Services.AddHostedService<ChallengeValidationService>();
+    // Not in monitor mode (issue #470): ACME is off there, so there is nothing to
+    // validate, and a validated order is one step from a CA write.
+    if (!instanceMode.IsMonitor)
+        builder.Services.AddHostedService<ChallengeValidationService>();
 
     // Background worker for orders the CA holds for manager approval (issue
     // #319). A template with CT_FLAG_PEND_ALL_REQUESTS answers every finalize
@@ -508,7 +597,11 @@ try
     // appsettings.json so the C# initializer is the default.
     builder.Services.Configure<PendingIssuanceOptions>(
         builder.Configuration.GetSection(PendingIssuanceOptions.SectionName));
-    builder.Services.AddHostedService<PendingIssuanceService>();
+    // Not in monitor mode (issue #470): its leaf guard can revoke. An order the CA
+    // held when the mode was switched waits in processing and is finished by the
+    // first sweep after a switch back to full mode.
+    if (!instanceMode.IsMonitor)
+        builder.Services.AddHostedService<PendingIssuanceService>();
 
     // MVC controllers — discover from both Service and Web assemblies
     builder.Services.AddControllers()
@@ -517,6 +610,10 @@ try
     // Authentication and authorization (issue #27, SEC-F1) — Negotiate plus a
     // deny by default fallback policy; public routes are carved out explicitly
     builder.Services.AddCertusAuth(builder.Configuration);
+
+    // The administrator audit trail (issue #634): every mutating dashboard API
+    // action writes a row and a Warning log line that no setting can turn off.
+    builder.Services.AddAdminAudit();
 
     // Security: startup validator
     builder.Services.AddSingleton<StartupValidator>();
@@ -531,10 +628,25 @@ try
     // cached briefly (CaHealthCache) so the anonymous readiness endpoint cannot drive a
     // fresh CA round trip on every request.
     builder.Services.AddSingleton<CaHealthCache>();
+    // The data folder's volume is watched for free space (issue #632); the check
+    // reports degraded below Certus:FreeSpaceWarningMegabytes and deletes nothing.
+    builder.Services.AddDataFolderFreeSpaceMonitor(dataDirectory);
+    // The daily retention pass and the per account erasure path (issue #637).
+    // Periods come from Certus:Retention; 0 keeps a class for ever.
+    builder.Services.AddDataRetention(builder.Configuration);
     builder.Services.AddHealthChecks()
         .AddCheck<CertusHealthCheck>("certus", tags: new[] { "ready" });
 
     var app = builder.Build();
+
+    // First after Build, so the refusal reaches the log file through the catch below,
+    // and before anything reads, creates or migrates in the database folder.
+    if (placementRefusals.Length > 0)
+        throw new InvalidOperationException(string.Join(" ", placementRefusals));
+
+    // Which mode is in force (issue #470), through the file logger, which did not
+    // exist when the mode was resolved.
+    instanceMode.LogAtStartup(app.Logger);
 
     // The two configuration files a standard user could once take over (issue
     // #489). An untrusted one reads as absent wherever it is read, so the
@@ -544,7 +656,7 @@ try
     var statusPath = SetupStatus.GetStatusPath(certusOptions);
     foreach (var (path, verdict, consequence) in new[]
     {
-        (Path.Combine(CertusPaths.DataDirectory, CertusPaths.SettingsOverlayFileName), overlayTrust,
+        (Path.Combine(dataDirectory, CertusPaths.SettingsOverlayFileName), overlayTrust,
             "none of its settings, the CA connection string among them, are in force"),
         (statusPath, TrustedFile.Check(statusPath),
             "the setup state in it is not in force, so no template is exposed over ACME"),
@@ -589,17 +701,11 @@ try
             revocationScope.CustomTemplates.Count);
     }
 
-    // Ensure the database directory exists and the schema is current. The
-    // initializer migrates, adopts a pre migration database whose schema
+    // Bring the schema up to date. The database is in the data folder, which
+    // EnsureProtected created and locked before anything else ran (issue #506).
+    // The initializer migrates, adopts a pre migration database whose schema
     // matches the model, or fails fast with the documented reset message
     // (issue #77).
-    if (certusOptions.DatabasePath != CertusPaths.InMemoryDatabase)
-    {
-        var dbDir = Path.GetDirectoryName(certusOptions.DatabasePath);
-        if (!string.IsNullOrEmpty(dbDir))
-            ProtectedFolder.EnsureExists(dbDir);
-    }
-
     using (var scope = app.Services.CreateScope())
     {
         var db = scope.ServiceProvider.GetRequiredService<CertusDbContext>();
@@ -625,6 +731,7 @@ try
     _ = Task.Run(() => TemplateNameStartupReport.LogAsync(
         templateNameReportTemplates,
         templateNameReportPolicy,
+        instanceMode,
         app.Logger,
         app.Lifetime.ApplicationStopping));
 
@@ -647,21 +754,37 @@ try
     // HTTPS enforcement (HSTS + redirect) outside Development, gated by Auth:RequireHttps
     app.UseCertusTransportSecurity();
 
-    app.UseSerilogRequestLogging();
+    // One line per request, except a rate limited one (issue #741): see
+    // CertusLogging.UseCertusRequestLogging, and keep it above the monitor mode gate.
+    app.UseCertusRequestLogging();
 
-    // ACME nonce middleware — injects Replay-Nonce on all /acme/ responses
-    app.UseMiddleware<Certus.Web.Middleware.AcmeNonceMiddleware>();
+    // Monitor mode (issue #470): every ACME protocol URL answers 404, here so the
+    // request is still logged and nothing after this point runs for a refused
+    // request, so no nonce is stored for it. Adds nothing in full mode.
+    app.UseMonitorModeAcmeGate();
 
     app.UseRouting();
 
     // Authentication, authorization, and the CSRF header guard (issue #27)
     app.UseCertusAuth();
 
+    // Monitor mode (issue #470): the ACME administration API answers 404, after
+    // authorization so an anonymous caller still gets 401 like any other /api path.
+    // Adds nothing in full mode.
+    app.UseMonitorModeAdminApiGate();
+
     // Rate limiting — must be after routing so policies can match endpoints
     if (rateLimitOptions.Enabled)
     {
         app.UseRateLimiter();
     }
+
+    // ACME nonce middleware: injects Replay-Nonce on /acme/ responses a
+    // controller action produces. After the rate limiter on purpose (issue
+    // #632): a 429 never reaches it, so a throttled flood stores no nonce, and
+    // after routing so it can tell the protocol fallback's 404 apart from an
+    // action's answer. Keep it below UseRateLimiter.
+    app.UseMiddleware<Certus.Web.Middleware.AcmeNonceMiddleware>();
 
     // Serve React dashboard static files from wwwroot
     app.UseDefaultFiles();
@@ -727,8 +850,44 @@ try
     // original selection lines above ran on the console only bootstrap logger.
     Log.Information(
         "HTTPS certificate for this boot: {CertSource} thumbprint {Thumbprint} ({CertDetail})",
-        httpsCertSelection.Source, httpsCertSelection.Thumbprint ?? "unknown",
+        httpsCertSelection.Source,
+        httpsCertSelection.Thumbprint ?? selfSignedFallback?.Certificate.Thumbprint ?? "unknown",
         httpsCertSelection.Detail);
+
+    // The fixed password PFX an earlier release kept goes on every boot, not
+    // only when the fallback is served (issue #635): a server that moved to a
+    // CA issued certificate still has the file, and the file is the key.
+    SelfSignedHttpsCertificate.RemoveLegacyFile(dataDirectory, app.Logger);
+    if (httpsCertificateNotice is not null)
+        Log.Warning("{HttpsCertificateNotice}", httpsCertificateNotice);
+
+    // And the TLS protocols beside it (issue #484). The floor can be replaced in
+    // settings.json, and this line is the only place that shows whether it was.
+    foreach (var endpoint in HttpsProtocolPolicy.Describe(app.Configuration))
+    {
+        if (HttpsProtocolPolicy.AdmitsBelowFloor(endpoint.Protocols))
+        {
+            Log.Warning(
+                "Kestrel:Endpoints:{Endpoint}:SslProtocols lets the HTTPS endpoint negotiate " +
+                "{Protocols}, below the TLS 1.2 floor this service otherwise sets. Remove the " +
+                "setting to restore TLS 1.2 and TLS 1.3 only (issue #484)",
+                endpoint.Name,
+                endpoint.Protocols == System.Security.Authentication.SslProtocols.None
+                    ? "None, which lets Windows choose, and a default install then accepts TLS 1.0 and TLS 1.1"
+                    : endpoint.Protocols.ToString());
+        }
+        else
+        {
+            // As a string: the file sink renders an enum as JSON, in quotes.
+            Log.Information(
+                "HTTPS protocols for endpoint {Endpoint}: {Protocols} ({ProtocolSource})",
+                endpoint.Name, endpoint.Protocols.ToString(),
+                endpoint.NamedOnEndpoint
+                    ? $"named in Kestrel:Endpoints:{endpoint.Name}:SslProtocols"
+                    : "the service's floor");
+        }
+    }
+
     Log.Information("Ducks in a Row service started successfully");
     app.Run();
 }

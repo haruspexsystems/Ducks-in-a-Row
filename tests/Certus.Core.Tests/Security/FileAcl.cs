@@ -24,6 +24,20 @@ internal static class FileAcl
         file.SetAccessControl(security);
     }
 
+    /// <summary>Adds an explicit entry letting Everyone write the folder itself.</summary>
+    public static void GrantEveryoneWriteToFolder(string path)
+    {
+        var folder = new DirectoryInfo(path);
+        var security = folder.GetAccessControl();
+        security.AddAccessRule(new FileSystemAccessRule(
+            new SecurityIdentifier(WellKnownSidType.WorldSid, null),
+            FileSystemRights.Write,
+            InheritanceFlags.None,
+            PropagationFlags.None,
+            AccessControlType.Allow));
+        folder.SetAccessControl(security);
+    }
+
     /// <summary>Whether any entry on the file lets Everyone write it.</summary>
     public static bool EveryoneCanWrite(string path) =>
         new FileInfo(path).GetAccessControl()

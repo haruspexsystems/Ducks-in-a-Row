@@ -75,8 +75,10 @@ public class AcmeRateLimitIntegrationTests
 
         response.Headers.RetryAfter.Should().NotBeNull(
             "RFC 8555 §6.6 asks the server to tell the client when to retry");
-        response.Headers.Contains("Replay-Nonce").Should().BeTrue(
-            "an ACME protocol response carries a nonce even when it is an error");
+        response.Headers.Contains("Replay-Nonce").Should().BeFalse(
+            "a nonce is a stored entry, so a refusal that costs the server nothing must " +
+            "not mint one; RFC 8555 section 6.5 requires a nonce on a successful POST " +
+            "response only, and a client fetches a fresh one from new-nonce (issue #632)");
     }
 
     [Fact]

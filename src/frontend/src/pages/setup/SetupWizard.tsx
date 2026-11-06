@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { useQueryClient } from '@tanstack/react-query';
 import { ChevronRight, ChevronLeft, Check, ExternalLink, Loader2 } from 'lucide-react';
 import { DuckMark } from '@/features/dashboard/components/DuckMark';
@@ -18,15 +18,37 @@ import {
   saveWizardDraft,
   testCaConnection,
 } from '@/api/setup';
+import {
+  initialDomainPosture,
+  initialEabEnforcement,
+  isPastStep,
+  recordedEabEnforcement,
+  recordedTemplates,
+  resumeStepIndex,
+  wizardSteps,
+  type EabModeName,
+  type InstanceModeName,
+} from '@/lib/setupWizard';
 
 export interface WizardState {
+  /**
+   * The instance mode the server reported (issue #471). Monitor mode skips the
+   * Templates and Client Access steps, records no template, and offers a
+   * certificate from the machine store instead of enrolling one.
+   */
+  mode: InstanceModeName;
+  /**
+   * A server that finished setup in monitor mode was switched to full, so the
+   * wizard reopened at the Templates step (issue #471).
+   */
+  reopenedForIssuance: boolean;
   caConnectionString: string;
   caName: string;
   caDnsName: string;
   connectionTested: boolean;
   selectedTemplates: string[];
   /**
-   * The domain restriction choice from the Allowed Domains step. On a
+   * The domain restriction choice from the Client Access step. On a
    * domain joined machine the wizard defaults to restricted with the AD
    * domain prefilled (the secure default for new installs); in a workgroup
    * it defaults to off with an empty list.
@@ -35,6 +57,11 @@ export interface WizardState {
   allowedDomains: string[];
   /** The machine's AD domain, or null in a workgroup. Suggestion only. */
   adDomainSuggestion: string | null;
+  /**
+   * The external account binding choice from the Client Access step (issue
+   * #631): required on a fresh install, whatever the file records otherwise.
+   */
+  eabEnforcement: EabModeName;
   externalUrl: string;
   urlValidated: boolean;
   /**
@@ -95,6 +122,8 @@ export interface WizardState {
 }
 
 const initialState: WizardState = {
+  mode: 'full',
+  reopenedForIssuance: false,
   caConnectionString: '',
   caName: '',
   caDnsName: '',
@@ -103,6 +132,7 @@ const initialState: WizardState = {
   allowedDomainsEnabled: false,
   allowedDomains: [],
   adDomainSuggestion: null,
+  eabEnforcement: 'required',
   externalUrl: '',
   urlValidated: false,
   urlConfirmedDespiteUnreachable: false,
@@ -115,15 +145,6 @@ const initialState: WizardState = {
   continueUnlocked: false,
   reviewBusy: false,
 };
-
-const steps = [
-  { id: 'welcome', label: 'Welcome' },
-  { id: 'connection', label: 'CA Connection' },
-  { id: 'templates', label: 'Templates' },
-  { id: 'domains', label: 'Allowed Domains' },
-  { id: 'url', label: 'External URL' },
-  { id: 'review', label: 'Review' },
-];
 
 /**
  * The host to name on the continue button. The URL is server built and
@@ -145,13 +166,17 @@ export function SetupWizard() {
   const [currentStep, setCurrentStep] = useState(0);
   const [state, setState] = useState<WizardState>(initialState);
   const [checking, setChecking] = useState(true);
+  // The steps for the mode the server reported; monitor mode skips two of them.
+  const steps = wizardSteps(state.mode);
 
   // RequireSetup caches the status; without invalidation its stale
   // "not completed" answer bounces the finished wizard straight back here.
-  const finishToDashboard = async () => {
+  // The Review step can send the administrator straight to the alert
+  // settings instead of the dashboard (issue #471).
+  const finishToDashboard = async (path = '/') => {
     await queryClient.invalidateQueries({ queryKey: ['setup-status'] });
     await queryClient.invalidateQueries({ queryKey: ['setup-config'] });
-    navigate('/');
+    navigate(path);
   };
 
   // Check if setup is already complete and in effect. When it is not but the
@@ -170,39 +195,31 @@ export function SetupWizard() {
         }
         try {
           const config = await fetchSetupConfig();
+          const mode: InstanceModeName = config.mode === 'monitor' ? 'monitor' : 'full';
+          const modeSteps = wizardSteps(mode);
           const caConnectionString = config.caConnectionString ?? '';
-          const selectedTemplates = config.enabledTemplates;
-          // The file's domain choice is authoritative in two cases: the
-          // draft was saved at or past the External URL step (goNext saves
-          // the step being entered, so the admin has been through the
-          // Allowed Domains step, and an explicit off with an emptied list
-          // must survive the mid wizard TLS restart), or the file carries a
-          // positive choice (a stranded install keeping its old policy).
-          // Otherwise apply the default posture: restricted to the AD domain
-          // when the machine is domain joined, unrestricted in a workgroup.
+          // Monitor mode records no template, so a template left in the file
+          // (an install switched from full) is not carried into its drafts.
+          const selectedTemplates = recordedTemplates(mode, config.enabledTemplates);
           const suggestedDomain = config.suggestedAllowedDomain ?? null;
-          const draftPassedDomainsStep =
-            config.wizardStep === 'url' || config.wizardStep === 'review';
-          const fileHasDomainChoice =
-            (config.allowedDomainsEnabled ?? false) ||
-            (config.allowedDomains ?? []).length > 0;
-          const domainPosture =
-            draftPassedDomainsStep || fileHasDomainChoice
-              ? {
-                  enabled: config.allowedDomainsEnabled ?? false,
-                  domains: config.allowedDomains ?? [],
-                }
-              : suggestedDomain !== null
-                ? { enabled: true, domains: [suggestedDomain] }
-                : { enabled: false, domains: [] };
+          const domainPosture = initialDomainPosture({
+            mode,
+            wizardStep: config.wizardStep,
+            allowedDomainsEnabled: config.allowedDomainsEnabled,
+            allowedDomains: config.allowedDomains,
+            suggestedDomain,
+          });
           setState((prev) => ({
             ...prev,
+            mode,
+            reopenedForIssuance: config.reopenReason === 'issuanceEnabled',
             caConnectionString: caConnectionString || prev.caConnectionString,
             selectedTemplates:
               selectedTemplates.length > 0 ? selectedTemplates : prev.selectedTemplates,
             allowedDomainsEnabled: domainPosture.enabled,
             allowedDomains: domainPosture.domains,
             adDomainSuggestion: suggestedDomain,
+            eabEnforcement: initialEabEnforcement(config.eabEnforcement),
             // A previously saved URL (a draft or a stranded install) wins;
             // otherwise seed the field with the suggestion built from the
             // machine's DNS name and the actual listening port. Editable
@@ -215,18 +232,18 @@ export function SetupWizard() {
 
           // Resume at the drafted step, clamped to what the prefilled data
           // actually supports so a hand edited or stale draft cannot land on
-          // a step whose inputs are missing.
-          let target = config.wizardStep
-            ? steps.findIndex((s) => s.id === config.wizardStep)
-            : -1;
-          if (target > 1 && !caConnectionString) target = 1;
-          if (target > 2 && selectedTemplates.length === 0) target = 2;
-          // The domains step (index 3) needs no clamp of its own: its
-          // default state is always valid. The URL clamp lands on index 4,
-          // where the URL step now sits.
-          if (target > 4 && !config.externalUrl) target = 4;
+          // a step whose inputs are missing. By step id, because the same
+          // step sits at a different index in each mode (issue #471). A
+          // reopened wizard has no template, so this is also what lands it
+          // on the Templates step.
+          let target = resumeStepIndex(modeSteps, {
+            wizardStep: config.wizardStep,
+            hasCa: caConnectionString.length > 0,
+            hasTemplates: selectedTemplates.length > 0,
+            hasExternalUrl: !!config.externalUrl,
+          });
 
-          if (target > 2 && selectedTemplates.length > 0) {
+          if (isPastStep(modeSteps, target, 'templates') && selectedTemplates.length > 0) {
             // Resuming past the Templates step means it never mounts, so its
             // effect that reads the selected template's key requirements
             // from AD never runs. Without this, the Review step's certbot
@@ -250,7 +267,8 @@ export function SetupWizard() {
             }
           }
 
-          if (target > 1) {
+          const connectionIndex = modeSteps.findIndex((s) => s.id === 'connection');
+          if (isPastStep(modeSteps, target, 'connection')) {
             // Past the connection step the wizard shows the CA as tested.
             // Rerun the test honestly rather than faking a pass; a CA that
             // stopped answering sends the admin back to the connection step.
@@ -264,10 +282,10 @@ export function SetupWizard() {
                   caDnsName: test.caDnsName ?? '',
                 }));
               } else {
-                target = 1;
+                target = connectionIndex;
               }
             } catch {
-              target = 1;
+              target = connectionIndex;
             }
           }
 
@@ -314,10 +332,11 @@ export function SetupWizard() {
       // forget: drafting must never block navigation.
       saveWizardDraft({
         caConnectionString: state.caConnectionString,
-        enabledTemplates: state.selectedTemplates,
+        enabledTemplates: recordedTemplates(state.mode, state.selectedTemplates),
         externalUrl: state.externalUrl,
         allowedDomainsEnabled: state.allowedDomainsEnabled,
         allowedDomains: state.allowedDomains,
+        eabEnforcement: recordedEabEnforcement(state.mode, state.eabEnforcement),
         wizardStep: steps[currentStep + 1].id,
       }).catch(() => {});
       setCurrentStep((s) => s + 1);
@@ -400,7 +419,7 @@ export function SetupWizard() {
       {/* Step content */}
       <div className="max-w-3xl mx-auto px-6 py-8">
         <div className="bg-surface rounded-2xl border border-hairline shadow-sm p-6 min-h-[400px]">
-          {steps[currentStep].id === 'welcome' && <WelcomeStep />}
+          {steps[currentStep].id === 'welcome' && <WelcomeStep monitorMode={state.mode === 'monitor'} />}
           {steps[currentStep].id === 'connection' && (
             <ConnectionStep state={state} onUpdate={updateState} />
           )}

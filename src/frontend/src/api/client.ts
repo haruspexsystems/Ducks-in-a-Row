@@ -97,6 +97,27 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * The words to show an administrator for a failed call: the server's own
+ * sentence, never an ApiError's message, which also names the status and the
+ * URL (issue #543).
+ *
+ * An ApiError can carry that sentence in either of two places, so both are
+ * asked. fetchJson reads an RFC 7807 body into problemDetail and leaves the
+ * HTTP reason phrase in statusText. The write helpers that use a plain fetch
+ * (in api/settings.ts, api/alerts.ts and api/licence.ts) put the server's
+ * { error } in statusText instead, when it sent one. The fallback is for a
+ * failure that says neither. Over HTTP/2 that is every failure without a
+ * server sentence, because the browser's statusText is then the empty string.
+ *
+ * Any other Error keeps its own message, because a failure after the call
+ * (a refetch, or a network error the browser raised) has nothing better.
+ */
+export function errorText(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) return err.problemDetail || err.statusText || fallback;
+  return (err instanceof Error && err.message) || fallback;
+}
+
 /** Build query string from CertificateQuery params. */
 function buildQueryString(query: CertificateQuery): string {
   const params = new URLSearchParams();

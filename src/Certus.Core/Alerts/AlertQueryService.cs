@@ -75,6 +75,7 @@ public sealed class AlertQueryService
                 ThresholdDays = a.ThresholdDays,
                 SentAt = a.SentAt,
                 Channels = a.Channels,
+                DeliveredChannels = a.DeliveredChannels,
                 Success = a.Success,
                 ErrorMessage = a.ErrorMessage,
             })
@@ -88,7 +89,7 @@ public sealed class AlertQueryService
         // rendering these strings verbatim since issue #160.
         foreach (var item in items)
         {
-            item.ErrorMessage = AlertErrorRedactor.Redact(item.ErrorMessage, _alertOptions);
+            item.ErrorMessage = AlertErrorRedactor.RedactStored(item.ErrorMessage, _alertOptions);
         }
 
         return new AlertHistoryResult(items, totalCount, skip, take);
@@ -150,7 +151,7 @@ public sealed class AlertQueryService
             EnabledChannels: _notifiers.Where(n => n.IsEnabled).Select(n => n.Channel).ToList(),
             CheckIntervalMinutes: _alertOptions.CheckIntervalMinutes,
             ThresholdDays: _alertOptions.ThresholdDays,
-            IsOwnCertificate: _serverCertificate.IsOwnCertificate(certificate.SerialNumber));
+            IsOwnCertificate: _serverCertificate.IsSuppressedFromAlerts(certificate.SerialNumber));
 
         var ladder = CertificateAlertLadder.Build(certificate, rows, context, DateTime.UtcNow);
 
@@ -158,7 +159,7 @@ public sealed class AlertQueryService
         // notifier reported, and the detail page renders it verbatim.
         foreach (var threshold in ladder.Thresholds)
         {
-            threshold.ErrorMessage = AlertErrorRedactor.Redact(threshold.ErrorMessage, _alertOptions);
+            threshold.ErrorMessage = AlertErrorRedactor.RedactStored(threshold.ErrorMessage, _alertOptions);
         }
 
         return ladder;
@@ -197,8 +198,17 @@ public sealed class AlertHistoryItem
     [JsonPropertyName("sentAt")]
     public DateTime SentAt { get; set; }
 
+    /// <summary>The channels that were attempted, not the ones that delivered.</summary>
     [JsonPropertyName("channels")]
     public string Channels { get; set; } = string.Empty;
+
+    /// <summary>
+    /// The attempted channels that delivered (issue #206). Null on a failed row
+    /// written before the outcome was kept per channel.
+    /// </summary>
+    [JsonPropertyName("deliveredChannels")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? DeliveredChannels { get; set; }
 
     [JsonPropertyName("success")]
     public bool Success { get; set; }

@@ -170,6 +170,54 @@ public class TlsCertificateEnrollerTests
         _store.DidNotReceiveWithAnyArgs().Install(default!);
     }
 
+    [Fact]
+    public async Task EnrollAsync_Denied_WireMessageKeepsTheReasonAndTheRemedyButNotTheAccount()
+    {
+        // Issue #485. The alert webhook sends this form to whatever relay the
+        // operator configured, so the account and domain DescribeServiceAccount
+        // reads stay in Message, and everything else an administrator acts on stays
+        // in both.
+        _client.SubmitCertificateRequestAsync(
+                Arg.Any<string>(), Arg.Any<byte[]>(), Arg.Any<CancellationToken>())
+            .Returns(new SubmitResult(
+                43, SubmitStatus.Denied, "Denied by Policy Module", CaStatusCode.TemplateDenied));
+
+        var result = await _sut.EnrollAsync(TestCa, "Web Server", ExternalUrl, null);
+
+        result.Status.Should().Be(TlsEnrollmentStatus.Denied);
+        result.Message.Should().Contain(TlsCertificateEnroller.DescribeServiceAccount());
+        result.WireMessage.Should()
+            .NotContain(Environment.MachineName + "$")
+            .And.NotContain(TlsCertificateEnroller.DescribeServiceAccount())
+            .And.NotContain(" in domain ")
+            .And.StartWith("The CA denied the request: Denied by Policy Module.")
+            .And.Contain("0x80094012", "the CA's status description names no account")
+            .And.Contain("the service's computer account lacks Enroll permission")
+            .And.EndWith("grant it Enroll on the Security tab of the WebServer template and try again.",
+                "the remedy names the CA's own template name, as the full message does");
+    }
+
+    [Fact]
+    public async Task EnrollAsync_PendingAndFailed_WireMessageIsTheMessage()
+    {
+        // Neither names an account, so the webhook carries them whole. Pending is
+        // the template and the request id; the CA error arm is DescribeRefusal's
+        // text, which issue #336 already lets onto the ACME wire.
+        _client.SubmitCertificateRequestAsync(
+                Arg.Any<string>(), Arg.Any<byte[]>(), Arg.Any<CancellationToken>())
+            .Returns(
+                new SubmitResult(42, SubmitStatus.Pending, "Taken under submission"),
+                new SubmitResult(44, SubmitStatus.Error, "The request failed", CaStatusCode.TemplateDenied));
+
+        var pending = await _sut.EnrollAsync(TestCa, "WebServer", ExternalUrl, null);
+        var failed = await _sut.EnrollAsync(TestCa, "WebServer", ExternalUrl, null);
+
+        pending.Status.Should().Be(TlsEnrollmentStatus.Pending);
+        pending.WireMessage.Should().NotBeNull().And.Be(pending.Message);
+        failed.Status.Should().Be(TlsEnrollmentStatus.Failed);
+        failed.WireMessage.Should().NotBeNull().And.Be(failed.Message);
+    }
+
     #region Issue #362: the CA's message is sanitized before it is rendered
 
     [Fact]
@@ -492,10 +540,10 @@ public class TlsCertificateEnrollerTests
     {
         RespondWithIssuedCertificate();
 
-        var result = await _sut.EnrollAsync(TestCa, "WebServer", "https://192.168.2.132:5001", null);
+        var result = await _sut.EnrollAsync(TestCa, "WebServer", "https://203.0.113.10:5001", null);
 
         result.Status.Should().Be(TlsEnrollmentStatus.Installed);
-        result.IssuedNames.Should().Contain("192.168.2.132");
+        result.IssuedNames.Should().Contain("203.0.113.10");
         result.ExternalHostCovered.Should().BeTrue();
     }
 
@@ -506,8 +554,8 @@ public class TlsCertificateEnrollerTests
     [InlineData("*.home.local", "a.b.home.local", false)] // single label only
     [InlineData("*.home.local", "home.local", false)]
     [InlineData("other.home.local", "certus.home.local", false)]
-    [InlineData("192.168.2.132", "192.168.2.132", true)]
-    [InlineData("192.168.2.132", "192.168.2.133", false)]
+    [InlineData("203.0.113.10", "203.0.113.10", true)]
+    [InlineData("203.0.113.10", "203.0.113.11", false)]
     public void CoversHost_MatchesLikeATlsVerifier(string name, string host, bool expected)
     {
         TlsCertificateEnroller.CoversHost(new[] { name }, host).Should().Be(expected);

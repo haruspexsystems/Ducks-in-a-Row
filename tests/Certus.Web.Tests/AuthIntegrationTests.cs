@@ -13,20 +13,30 @@ namespace Certus.Web.Tests;
 /// routes never fall back to index.html.
 /// </summary>
 [Trait("Category", "Integration")]
-public class AuthIntegrationTests : IClassFixture<AuthWebApplicationFactory>
+public class AuthIntegrationTests :
+    IClassFixture<AuthWebApplicationFactory>,
+    IClassFixture<KerberosOnlyWebApplicationFactory>
 {
     private readonly AuthWebApplicationFactory _factory;
+    private readonly KerberosOnlyWebApplicationFactory _kerberosOnly;
 
-    public AuthIntegrationTests(AuthWebApplicationFactory factory)
+    public AuthIntegrationTests(AuthWebApplicationFactory factory, KerberosOnlyWebApplicationFactory kerberosOnly)
     {
         _factory = factory;
+        _kerberosOnly = kerberosOnly;
     }
 
-    private HttpClient CreateClient(string? user = null, bool csrf = false)
+    private HttpClient CreateClient(string? user = null, bool csrf = false, string? authType = null) =>
+        CreateClient(_factory, user, csrf, authType);
+
+    private static HttpClient CreateClient(
+        AuthWebApplicationFactory factory, string? user, bool csrf, string? authType)
     {
-        var client = _factory.CreateClient();
+        var client = factory.CreateClient();
         if (user != null)
             client.DefaultRequestHeaders.Add(TestAuthHandler.UserHeader, user);
+        if (authType != null)
+            client.DefaultRequestHeaders.Add(TestAuthHandler.AuthTypeHeader, authType);
         if (csrf)
             client.DefaultRequestHeaders.Add(CertusPolicies.CsrfHeaderName, "1");
         return client;
@@ -339,6 +349,114 @@ public class AuthIntegrationTests : IClassFixture<AuthWebApplicationFactory>
         var response = await CreateClient(TestAuthHandler.AdminUser).PostAsync("/api/alerts/test", null);
 
         response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+    }
+
+    // ── Kerberos only (issue #633, CRA risk R06) ────────────────────────
+    // The package a Windows identity reports is what the middleware reads;
+    // the test scheme names it through X-Test-Auth-Type.
+
+    [Fact]
+    public async Task NtlmAdmin_WithRequireKerberosOff_Returns200()
+    {
+        // The default for this release: NTLM is accepted, and only logged.
+        var response = await CreateClient(TestAuthHandler.AdminUser, authType: "NTLM")
+            .GetAsync("/api/certificates");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+    }
+
+    [Fact]
+    public async Task NtlmAdmin_WithRequireKerberos_Returns401WithAProblemDocumentAndNoChallenge()
+    {
+        var response = await CreateClient(_kerberosOnly, TestAuthHandler.AdminUser, csrf: false, authType: "NTLM")
+            .GetAsync("/api/certificates");
+
+        response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
+        response.Content.Headers.ContentType?.MediaType.Should().Be("application/problem+json");
+        response.Headers.WwwAuthenticate.Should().BeEmpty(
+            "a challenge would only make the browser repeat the same NTLM exchange");
+
+        var body = await ParseJsonAsync(response);
+        body.GetProperty("title").GetString().Should().Be(KerberosOnlyMiddleware.RefusalTitle);
+        body.GetProperty("detail").GetString().Should().Contain("Auth:RequireKerberos");
+        body.GetProperty("package").GetString().Should().Be("NTLM");
+    }
+
+    [Fact]
+    public async Task KerberosAdmin_WithRequireKerberos_Returns200()
+    {
+        var response = await CreateClient(_kerberosOnly, TestAuthHandler.AdminUser, csrf: false, authType: "Kerberos")
+            .GetAsync("/api/certificates");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+    }
+
+    [Fact]
+    public async Task NtlmNonAdmin_WithRequireKerberos_Returns401NotForbidden()
+    {
+        // Refused before the policy runs, so an NTLM caller never learns
+        // whether the account would have been an administrator.
+        var response = await CreateClient(_kerberosOnly, "alice", csrf: false, authType: "NTLM")
+            .GetAsync("/api/certificates");
+
+        response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
+        response.Content.Headers.ContentType?.MediaType.Should().Be("application/problem+json");
+    }
+
+    [Fact]
+    public async Task Anonymous_WithRequireKerberos_StillGets401FromThePolicy()
+    {
+        // No identity, nothing for the middleware to judge: the deny by
+        // default policy answers as before.
+        var response = await CreateClient(_kerberosOnly, user: null, csrf: false, authType: null)
+            .GetAsync("/api/certificates");
+
+        response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
+        response.Content.Headers.ContentType?.MediaType.Should().NotBe("application/problem+json");
+    }
+
+    [Fact]
+    public async Task NtlmRefusal_IsCountedAsARefusedSignIn()
+    {
+        // The counter from #634 reads a 401 with credentials offered and no
+        // challenge as a refusal, which is what the middleware answers; the
+        // header stands in for the browser's Negotiate token, which the test
+        // scheme ignores.
+        var ntlm = CreateClient(_kerberosOnly, TestAuthHandler.AdminUser, csrf: false, authType: "NTLM");
+        ntlm.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", "Negotiate dGVzdA==");
+        var refused = await ntlm.GetAsync("/api/certificates");
+        refused.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
+
+        var response = await CreateClient(_kerberosOnly, TestAuthHandler.AdminUser, csrf: false, authType: "Kerberos")
+            .GetAsync("/api/audit/sign-in-failures?days=1");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body = await ParseJsonAsync(response);
+        body.GetProperty("total").GetInt32().Should().BeGreaterThanOrEqualTo(1);
+        body.GetProperty("sources").EnumerateArray()
+            .Should().Contain(s => s.GetProperty("unauthorized").GetInt32() >= 1,
+                "the refusal is a 401 after credentials were offered");
+    }
+
+    [Fact]
+    public async Task NtlmIdentity_WithRequireKerberos_StillLoadsTheAnonymousShellAndHealth()
+    {
+        // Kestrel keeps NTLM credentials for the connection, so after one
+        // refused API call the shell and its assets arrive authenticated too;
+        // they must keep answering, or the browser cannot show the reason.
+        var response = await CreateClient(_kerberosOnly, TestAuthHandler.AdminUser, csrf: false, authType: "NTLM")
+            .GetAsync("/health");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+    }
+
+    [Fact]
+    public async Task AcmeDirectory_WithRequireKerberos_StaysAnonymous()
+    {
+        var response = await CreateClient(_kerberosOnly, user: null, csrf: false, authType: null)
+            .GetAsync("/acme/WebServer/directory");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
     }
 
     // ── SPA fallback must not mask API responses ────────────────────────

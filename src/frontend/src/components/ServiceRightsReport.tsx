@@ -17,7 +17,7 @@ import {
   type ServiceRightsReport,
   type ServiceRightsRow,
 } from '@/api/serviceRights';
-import { neededForText, rowsIn, statusLabel, statusPresentation } from '@/lib/serviceRights';
+import { isNotNeeded, neededForText, rowPresentation, rowsIn, statusLabel } from '@/lib/serviceRights';
 
 /**
  * The service rights check (issue #440): what this server's own account may do
@@ -29,7 +29,7 @@ import { neededForText, rowsIn, statusLabel, statusPresentation } from '@/lib/se
  * as a pass.
  */
 export function StatusIcon({ row }: { row: ServiceRightsRow }) {
-  switch (statusPresentation(row.status).tone) {
+  switch (rowPresentation(row).tone) {
     case 'pass':
       return <CheckCircle2 className="h-4 w-4 text-emerald-500 mt-0.5 shrink-0" aria-hidden="true" />;
     case 'reading':
@@ -48,7 +48,7 @@ export function StatusIcon({ row }: { row: ServiceRightsRow }) {
 }
 
 function StatusWord({ row }: { row: ServiceRightsRow }) {
-  const tone = statusPresentation(row.status).tone;
+  const tone = rowPresentation(row).tone;
   const colours: Record<string, string> = {
     pass: 'text-emerald-700 dark:text-emerald-300',
     reading: 'text-sky-700 dark:text-sky-300',
@@ -103,7 +103,9 @@ export function ServiceRightsReportView({
                 <StatusWord row={row} />
               </div>
               <p className="text-xs text-muted">{row.detail}</p>
-              {row.remedy && (
+              {/* No remedy for a right this server never uses (issue #470):
+                  asking the CA team for it is exactly what monitor mode avoids. */}
+              {row.remedy && !isNotNeeded(row) && (
                 <p className="text-xs text-ink-soft">
                   <span className="font-semibold">What to ask for: </span>
                   {row.remedy}

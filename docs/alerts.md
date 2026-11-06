@@ -88,6 +88,70 @@ watched, each place it is published, and what was last read from each.
 The warning thresholds are the ones above, shared with certificate expiry: a
 site that wants sixty days of notice wants it for both.
 
+## Licence
+
+With the paid module installed and a licence stored, Ducks in a Row also tells
+you before the licence runs out, through the same email and webhook channels. A
+lapse never touches a certificate: it switches paid features off, and every
+licence alert ends by saying so. See [licence and paid module](licence.md).
+
+### When it warns
+
+The paid module decides which warning is due, and Ducks in a Row sends it.
+
+| Warning | When | Paid features |
+|---|---|---|
+| Expiring | 30, 14, 7 and 1 days before the licence ends, counting only those inside the licence's warning period | On |
+| Grace | When the licence ends, if it has a grace period | On until the grace period ends |
+| Lapsed | When the grace period ends, or when the licence ends if it has none, as a trial does | Off |
+
+- **Each warning is sent once per licence.** A renewed licence carries a new
+  licence id, so its warnings start again from the top. Restoring the previous
+  licence repeats nothing.
+- **Only the warning due now is sent.** A server that was switched off at 30
+  days and starts again with 10 left receives the 14 day warning, not a backlog.
+- **Every configured channel receives it, in full mode and in monitor mode.**
+  `Certus:Alerts:Enabled` switches the certificate checks only, and there is no
+  setting that turns licence alerts off.
+- **With no channel configured nothing is recorded**, so a channel you add later
+  still receives the warning that is due.
+- **Some licences send nothing.** A licence bound to another forest switches
+  nothing on here, so it sends no warnings, and the banner says why. Neither does
+  a licence the paid module cannot use, or one that has not started yet.
+- **The paid module has to be running.** If it has failed or stopped responding,
+  nothing is sent until it runs again, and the Licence card says so.
+
+The check runs every 5 minutes, and the paid module looks at the licence at least
+once an hour, so a warning arrives within about an hour of its moment.
+
+An email is marked NOTICE at 30 and 14 days and WARNING after that. It is never
+CRITICAL, which is kept for alerts about certificates.
+
+A webhook payload looks like this:
+
+```json
+{
+  "event": "licence.expiring",
+  "timestamp": "2026-12-24T09:00:00Z",
+  "licenceId": "0192a3b4-c5d6-7e8f-9a0b-1c2d3e4f5a6b",
+  "tier": "standard",
+  "stage": "days7",
+  "validUntil": "2027-01-01T00:00:00Z",
+  "graceUntil": "2027-01-31T00:00:00Z",
+  "daysRemaining": 6
+}
+```
+
+- `stage` is one of `days30`, `days14`, `days7`, `days1`, `expired` and
+  `grace_ended`.
+- `daysRemaining` counts whole days to the end of the licence, or during grace to
+  the end of grace. It is left out once the licence has lapsed.
+- `tier` is left out when the paid module reports something that is not a tier
+  name.
+
+The licensee's name is never part of a licence alert, in the email or in the
+payload. The licence id is the reference to quote when you ask about a renewal.
+
 ## Email
 
 The whole SMTP transport can be set from the **Alerts** card on the Settings
@@ -170,12 +234,22 @@ Every alert carries an `event` name, so a receiver can route on it:
 | `crl.overdue` | A CA did not replace its own revocation list on schedule |
 | `crl.expired` | A revocation list is past its next update |
 | `server.certificate.renewal_failed` | Automatic renewal of this server's own certificate failed |
+| `licence.expiring` | The licence reached its 30, 14, 7 or 1 day warning |
+| `licence.grace` | The licence ended and its grace period began |
+| `licence.lapsed` | The licence lapsed: its grace period ended, or it had none |
 | `test.alert` | The test button on the Alerts card |
 
 A CRL payload names the issuing CA, whether it is a base or a delta CRL, its
 number, when it expires, and every location it is served from. When a newer CRL
 is published somewhere else it carries that number too, which is what tells a
 receiver that a renewal reached one location and not another.
+
+A server certificate payload carries the outcome, the template, the days left
+on the certificate the server is still serving, and the reason in `detail`.
+Ducks in a Row never adds the service's computer account or its domain to that
+reason, which otherwise repeats the certificate authority's own words. The alert
+email does name them, because it goes to your own recipients and that is the account to
+grant Enroll to; a webhook often goes to a service outside your network.
 
 **The webhook block is deliberately not editable from the dashboard.** It is
 always read from the file and never written by the Settings page. An alert
@@ -196,9 +270,16 @@ thresholds in force, who is on the recipient list, whether a webhook is
 configured, and the most recent alerts including any that failed to send. A
 failed send is worth looking at: an alert that could not be delivered is
 indistinguishable, from the outside, from a certificate that never needed one.
+Each alert says which channels delivered it and which failed, with each failed
+channel's error, so a webhook failure beside a delivered email reads as
+"Partly sent". A failed alert recorded by an earlier version says only that at
+least one channel failed.
 
 The same data is available from the API at `GET /api/alerts/history` and `GET
 /api/alerts/summary`.
+
+Licence alerts are not listed on the Alerts card. The service log records each
+one, with the licence id and the channels it went to.
 
 ## Testing it
 

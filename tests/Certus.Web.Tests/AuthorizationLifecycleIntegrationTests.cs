@@ -322,6 +322,160 @@ public class AuthorizationLifecycleIntegrationTests : IDisposable
             "pending", "it must never reach processing, which is what the validator sweeps");
     }
 
+    // ---- The challenge resource: an empty payload reads (issue #482) ----
+    //
+    // RFC 8555 §6.3 makes an empty payload a fetch, and §7.5.1 makes {} the answer.
+    // Until #482 only device-attest-01 told the two apart, so reading a pending
+    // network challenge started its validation, possibly before the client had
+    // provisioned the response, and a premature validation fails the challenge.
+    // The background worker does run under TestServer and sweeps every few seconds,
+    // so a challenge that has moved reads processing or, once swept, invalid (no
+    // network validation can pass here). Only "pending" is deterministic, so these
+    // tests assert it where nothing should have moved and "not pending" after an
+    // answer, never "processing" read back from the row.
+
+    [Theory]
+    [InlineData("http-01")]
+    [InlineData("dns-01")]
+    [InlineData("tls-alpn-01")]
+    public async Task PostAsGet_OnAPendingChallenge_ReadsItAndStartsNothing(string type)
+    {
+        var order = await CreateOrderAsync($"chall-read-{type}.example.com");
+        var challengePath = await ChallengePathAsync(order, type);
+
+        var response = await PostAsGetAsync(order, challengePath);
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body = await ReadJsonAsync(response);
+        body.GetProperty("type").GetString().Should().Be(type);
+        body.GetProperty("status").GetString().Should().Be(
+            "pending", "a read reports the challenge as it is");
+        UpLink(response).Should().Be(
+            ToAbsoluteUrl(order.AuthorizationPath),
+            "every challenge response names its authorization (RFC 8555 §7.1)");
+
+        (await ReadChallengeStatusAsync(order.AuthorizationId, type)).Should().Be(
+            "pending", "a read must not start validation, which the background worker would run");
+    }
+
+    [Fact]
+    public async Task PostAsGet_ThenAnAnswer_StillStartsValidation()
+    {
+        // The read must spend nothing: the {} that follows it is still the answer.
+        // The second read lands on a challenge that is no longer pending, which is
+        // the arm the polling clients (dehydrated, uacme, win-acme, HAProxy, step)
+        // hit after answering, so it must carry the same header as the others.
+        var order = await CreateOrderAsync("chall-read-then-answer.example.com");
+        var challengePath = await ChallengePathAsync(order, "http-01");
+        (await PostAsGetAsync(order, challengePath)).StatusCode.Should().Be(HttpStatusCode.OK);
+        (await ReadChallengeStatusAsync(order.AuthorizationId, "http-01")).Should().Be(
+            "pending", "so the answer below is what moves it, not the read");
+
+        var answer = await PostToPathAsync(order, challengePath, "{}");
+
+        answer.StatusCode.Should().Be(HttpStatusCode.OK);
+        (await ReadJsonAsync(answer)).GetProperty("status").GetString().Should().Be("processing");
+        UpLink(answer).Should().Be(ToAbsoluteUrl(order.AuthorizationPath));
+        (await ReadChallengeStatusAsync(order.AuthorizationId, "http-01")).Should().NotBe(
+            "pending", "the answer starts validation");
+
+        var poll = await PostAsGetAsync(order, challengePath);
+
+        poll.StatusCode.Should().Be(HttpStatusCode.OK);
+        (await ReadJsonAsync(poll)).GetProperty("status").GetString().Should().NotBe("pending");
+        UpLink(poll).Should().Be(ToAbsoluteUrl(order.AuthorizationPath));
+    }
+
+    [Fact]
+    public async Task PostAsGet_OnAChallengeUnderADeactivatedAuthorization_StillReads()
+    {
+        // The deactivated authorization refusal is for the state change only, as its
+        // comment in ChallengeController says. RespondToChallenge_OnADeactivated...
+        // above pins that {} there is still a 403.
+        var order = await CreateOrderAsync("chall-read-deactivated.example.com");
+        var challengePath = await ChallengePathAsync(order, "http-01");
+        await PostToAuthzAsync(order, order.AuthorizationPath, Deactivate);
+
+        var response = await PostAsGetAsync(order, challengePath);
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        (await ReadJsonAsync(response)).GetProperty("status").GetString().Should().Be("pending");
+        (await ReadChallengeStatusAsync(order.AuthorizationId, "http-01")).Should().Be("pending");
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("{}")]
+    public async Task AnotherAccountsChallenge_IsRefused_WhetherReadOrAnswered(string payload)
+    {
+        // Ownership comes strictly before the payload test, so a caller who does not
+        // own the challenge learns nothing about it and cannot start it either.
+        var victim = await CreateOrderAsync($"chall-tenant-victim-{payload.Length}.example.com");
+        var attacker = await CreateOrderAsync($"chall-tenant-attacker-{payload.Length}.example.com");
+        var challengePath = await ChallengePathAsync(victim, "http-01");
+
+        var response = await PostToPathAsync(attacker, challengePath, payload);
+
+        response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+        (await ReadErrorAsync(response)).Type.Should().Be(AcmeErrorType.Unauthorized);
+        (await ReadChallengeStatusAsync(victim.AuthorizationId, "http-01")).Should().Be("pending");
+    }
+
+    [Fact]
+    public async Task RespondToChallenge_OnAnInvalidAuthorization_IsRefused()
+    {
+        // Issue #481. Once one challenge has failed, RFC 8555 section 7.1.6 makes the
+        // authorization invalid, and a sibling answered afterwards can no longer make
+        // it valid. Refusing the answer tells the client so at once. The state is
+        // minted because network validation does not run under TestServer; it is the
+        // state the worker now leaves after a failed http-01.
+        var order = await CreateOrderAsync("authz-invalid-sibling.example.com");
+        var (siblingPath, siblingId) = await ChallengeAsync(order, "dns-01");
+        await SetAuthorizationStatusAsync(order.AuthorizationId, "invalid");
+
+        var response = await PostToPathAsync(order, siblingPath, "{}");
+
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        (await ReadErrorAsync(response)).Type.Should().Be(AcmeErrorType.Malformed);
+        (await ReadChallengeStatusAsync(siblingId)).Should().Be(
+            "pending", "a refused answer must not reach processing, which the validator sweeps");
+    }
+
+    [Fact]
+    public async Task RespondToChallenge_OnAValidAuthorization_IsStillAccepted()
+    {
+        // The control for the refusal above. The check is an allow list, and "valid"
+        // is on it: a client may answer a second challenge on an authorization a
+        // sibling already proved, which changes nothing either way.
+        var order = await CreateOrderAsync("authz-valid-sibling.example.com");
+        var (siblingPath, siblingId) = await ChallengeAsync(order, "dns-01");
+        await SetAuthorizationStatusAsync(order.AuthorizationId, "valid");
+
+        var response = await PostToPathAsync(order, siblingPath, "{}");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        (await ReadChallengeStatusAsync(siblingId)).Should().Be("processing");
+    }
+
+    [Fact]
+    public async Task PostAsGet_OnAPendingChallengeUnderAnInvalidAuthorization_StillReads()
+    {
+        // Issues #481 and #482 together. The refusal of an answer under an invalid
+        // authorization is for the state change only, like the deactivated one: an
+        // empty payload is a read, and the read sits above both refusals in
+        // ChallengeController. Before #482 this read was a 400 (see #601).
+        var order = await CreateOrderAsync("chall-read-invalid-authz.example.com");
+        var (siblingPath, siblingId) = await ChallengeAsync(order, "dns-01");
+        await SetAuthorizationStatusAsync(order.AuthorizationId, "invalid");
+
+        var response = await PostAsGetAsync(order, siblingPath);
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        (await ReadJsonAsync(response)).GetProperty("status").GetString().Should().Be("pending");
+        (await ReadChallengeStatusAsync(siblingId)).Should().Be(
+            "pending", "a read must not start validation");
+    }
+
     // ---- Read path branches that had no coverage ----
 
     [Fact]
@@ -474,6 +628,39 @@ public class AuthorizationLifecycleIntegrationTests : IDisposable
         return new Uri(challenge.GetProperty("url").GetString()!).AbsolutePath;
     }
 
+    /// <summary>The path of the order's first authorization's challenge of one type.</summary>
+    private async Task<string> ChallengePathAsync(OrderInfo order, string type)
+    {
+        var response = await PostAsGetAsync(order, order.AuthorizationPath);
+        var challenge = (await ReadJsonAsync(response))
+            .GetProperty("challenges").EnumerateArray()
+            .Single(c => c.GetProperty("type").GetString() == type);
+        return new Uri(challenge.GetProperty("url").GetString()!).AbsolutePath;
+    }
+
+    /// <summary>The target of the response's Link rel="up" header, or null when it has none.</summary>
+    private static string? UpLink(HttpResponseMessage response)
+    {
+        if (!response.Headers.TryGetValues("Link", out var links))
+            return null;
+
+        return links
+            .Where(l => l.EndsWith(";rel=\"up\"", StringComparison.Ordinal))
+            .Select(l => l[(l.IndexOf('<') + 1)..l.IndexOf('>')])
+            .SingleOrDefault();
+    }
+
+    /// <summary>The path and public id of the order's challenge of one type.</summary>
+    private async Task<(string Path, string ChallengeId)> ChallengeAsync(OrderInfo order, string type)
+    {
+        var response = await PostAsGetAsync(order, order.AuthorizationPath);
+        var challenge = (await ReadJsonAsync(response))
+            .GetProperty("challenges").EnumerateArray()
+            .Single(c => c.GetProperty("type").GetString() == type);
+        var path = new Uri(challenge.GetProperty("url").GetString()!).AbsolutePath;
+        return (path, path.Split('/').Last());
+    }
+
     // ---- Direct database access ----
     //
     // Network challenge validation does not run under TestServer, so a "valid"
@@ -526,6 +713,23 @@ public class AuthorizationLifecycleIntegrationTests : IDisposable
             .Where(c => c.Authorization.AuthorizationId == authorizationId)
             .OrderBy(c => c.Id)
             .FirstAsync()).Status;
+    }
+
+    private async Task<string> ReadChallengeStatusAsync(string authorizationId, string type)
+    {
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<CertusDbContext>();
+        return (await db.AcmeChallenges.AsNoTracking()
+            .SingleAsync(c => c.Authorization.AuthorizationId == authorizationId
+                && c.Type == type)).Status;
+    }
+
+    private async Task<string> ReadChallengeStatusAsync(string challengeId)
+    {
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<CertusDbContext>();
+        return (await db.AcmeChallenges.AsNoTracking()
+            .FirstAsync(c => c.ChallengeId == challengeId)).Status;
     }
 
     // ---- JWS plumbing ----

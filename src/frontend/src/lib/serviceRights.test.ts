@@ -2,12 +2,15 @@ import { describe, it, expect } from 'vitest';
 import type { ServiceRightsReport, ServiceRightsRow } from '@/api/serviceRights';
 import {
   hasEnrolmentEvidence,
+  isNotNeeded,
   neededForText,
   needsAcknowledgement,
+  rowPresentation,
   rowsIn,
   rowsNotProven,
   statusLabel,
   statusPresentation,
+  templatesNotCheckedText,
 } from './serviceRights';
 
 /**
@@ -46,6 +49,7 @@ function report(rows: ServiceRightsRow[]): ServiceRightsReport {
     rows,
     simulated: false,
     checkedAt: '2026-09-26T09:00:00Z',
+    templatesNotChecked: 0,
   };
 }
 
@@ -124,5 +128,75 @@ describe('rowsIn', () => {
 
     expect(rowsIn(report(rows), ['host', 'ca']).map((r) => r.id)).toEqual(['h', 'c']);
     expect(rowsIn(report(rows)).map((r) => r.id)).toEqual(['h', 'c', 't']);
+  });
+});
+
+describe('rows monitor mode never uses (issue #470)', () => {
+  const template = row({
+    id: 'template:WebServer',
+    group: 'template',
+    status: 'failed',
+    neededFor: ['issuance'],
+    remedy: 'Grant Enroll',
+    notNeeded: 'monitorMode',
+  });
+
+  it('reads as not needed, never as a failure', () => {
+    expect(isNotNeeded(template)).toBe(true);
+    expect(statusLabel(template)).toBe('Not needed in monitor mode');
+    expect(rowPresentation(template).tone).not.toBe('fail');
+  });
+
+  it('is left out of the acknowledgement', () => {
+    const r = report([template, row({ id: 'ca-read', status: 'proven' })]);
+
+    expect(rowsNotProven(r)).toEqual([]);
+    expect(needsAcknowledgement(r)).toBe(false);
+  });
+
+  it('leaves a needed row exactly as it was', () => {
+    const needed = row({ id: 'ca-read', status: 'failed', notNeeded: null });
+
+    expect(isNotNeeded(needed)).toBe(false);
+    expect(statusLabel(needed)).toBe('Failed');
+    expect(needsAcknowledgement(report([needed]))).toBe(true);
+  });
+});
+
+describe('templates the Settings check left out (issue #478)', () => {
+  const withNotChecked = (templatesNotChecked: number) => ({ ...report([]), templatesNotChecked });
+
+  it('says nothing when every enabled template was checked', () => {
+    expect(templatesNotCheckedText(withNotChecked(0))).toBeNull();
+  });
+
+  it('says how many were left out, and that the rows above say nothing of them', () => {
+    expect(templatesNotCheckedText(withNotChecked(4))).toBe(
+      '4 more templates enabled for ACME were not checked, because one check reads a limited number of templates. Nothing above says whether this server holds Enroll on them.',
+    );
+  });
+
+  it('reads as one template when one was left out', () => {
+    expect(templatesNotCheckedText(withNotChecked(1))).toBe(
+      '1 more template enabled for ACME was not checked, because one check reads a limited number of templates. Nothing above says whether this server holds Enroll on it.',
+    );
+  });
+
+  it('says the left out templates need no Enroll in monitor mode', () => {
+    // A server switched from full to monitor mode keeps its enabled templates, and the
+    // rows above already read as not needed, so the line must not ask a question.
+    const monitor = {
+      ...report([row({ id: 'template-enroll', group: 'template', status: 'unproven', notNeeded: 'monitorMode' })]),
+      templatesNotChecked: 4,
+    };
+    expect(templatesNotCheckedText(monitor)).toBe(
+      '4 more templates enabled for ACME were not checked, because one check reads a limited number of templates. Monitor mode needs no Enroll on them, so this matters only after a switch to full mode.',
+    );
+  });
+
+  it('shows nothing for a payload that does not carry the count', () => {
+    const older: Partial<ServiceRightsReport> = { ...report([]) };
+    delete older.templatesNotChecked;
+    expect(templatesNotCheckedText(older as ServiceRightsReport)).toBeNull();
   });
 });

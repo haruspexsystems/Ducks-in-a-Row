@@ -37,6 +37,9 @@ namespace Certus.Core.Data.Migrations
                     b.Property<string>("EabJwsJson")
                         .HasColumnType("TEXT");
 
+                    b.Property<DateTime?>("ErasedAt")
+                        .HasColumnType("TEXT");
+
                     b.Property<int?>("ExternalAccountCredentialId")
                         .HasColumnType("INTEGER");
 
@@ -317,6 +320,82 @@ namespace Certus.Core.Data.Migrations
                     b.ToTable("AcmeOrders");
                 });
 
+            modelBuilder.Entity("Certus.Core.Data.Entities.AdminAuditEntry", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Action")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Actor")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("AfterValue")
+                        .HasMaxLength(4000)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("BeforeValue")
+                        .HasMaxLength(4000)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("OccurredAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Target")
+                        .HasMaxLength(500)
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Actor");
+
+                    b.HasIndex("OccurredAt");
+
+                    b.ToTable("AdminAuditEntries");
+                });
+
+            modelBuilder.Entity("Certus.Core.Data.Entities.AdminSignInFailure", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("BucketStart")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("Count")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("FirstAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("LastAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("SourceAddress")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("StatusCode")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("BucketStart");
+
+                    b.HasIndex("SourceAddress", "StatusCode", "BucketStart")
+                        .IsUnique();
+
+                    b.ToTable("AdminSignInFailures");
+                });
+
             modelBuilder.Entity("Certus.Core.Data.Entities.AlertSent", b =>
                 {
                     b.Property<int>("Id")
@@ -328,6 +407,10 @@ namespace Certus.Core.Data.Migrations
 
                     b.Property<string>("Channels")
                         .IsRequired()
+                        .HasMaxLength(50)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("DeliveredChannels")
                         .HasMaxLength(50)
                         .HasColumnType("TEXT");
 
@@ -634,6 +717,43 @@ namespace Certus.Core.Data.Migrations
                         .IsUnique();
 
                     b.ToTable("EabCredentials");
+                });
+
+            modelBuilder.Entity("Certus.Core.Data.Entities.LicenceAlertSent", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Channels")
+                        .IsRequired()
+                        .HasMaxLength(50)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("LicenceId")
+                        .IsRequired()
+                        .HasMaxLength(36)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("SentAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Stage")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("TEXT");
+
+                    b.Property<bool>("Success")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("SentAt");
+
+                    b.HasIndex("LicenceId", "Stage")
+                        .IsUnique();
+
+                    b.ToTable("LicenceAlertsSent");
                 });
 
             modelBuilder.Entity("Certus.Core.Data.Entities.MonitoredCrl", b =>

@@ -88,8 +88,10 @@ public class AcmeTabRoutingIntegrationTests : IDisposable
             (await response.Content.ReadAsStringAsync())
                 .Should().NotContain(SentinelWebRootFactory.Sentinel,
                     $"{path} must not be masked by the SPA shell");
-            response.Headers.Contains("Replay-Nonce").Should().BeTrue(
-                $"{path} is an ACME protocol response (RFC 8555 §7.2)");
+            // Still answered by the protocol fallback, which stores no nonce
+            // since issue #632; the test is that it is not the SPA shell.
+            response.Headers.Contains("Replay-Nonce").Should().BeFalse(
+                $"{path} is a fallback answer and mints nothing");
         }
     }
 }

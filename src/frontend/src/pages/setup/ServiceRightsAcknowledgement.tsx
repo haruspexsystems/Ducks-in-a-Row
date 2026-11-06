@@ -17,10 +17,13 @@ import { needsAcknowledgement, rowsNotProven, statusLabel } from '@/lib/serviceR
 export function ServiceRightsAcknowledgement({
   caConnectionString,
   templates,
+  monitorMode = false,
   onReadyChange,
 }: {
   caConnectionString: string;
   templates: string[];
+  /** Monitor mode issues nothing, so nothing on the wizard can prove a right by issuing. */
+  monitorMode?: boolean;
   /** True once the check has answered and anything it could not prove is acknowledged. */
   onReadyChange: (ready: boolean) => void;
 }) {
@@ -77,9 +80,12 @@ export function ServiceRightsAcknowledgement({
               </ul>
             )}
             <span className="block text-xs text-amber-700 dark:text-amber-300">
-              The HTTPS certificate on the External URL step would prove Enroll on the template it
-              uses; otherwise the first ACME order from each template is the proof. Setup can finish
-              either way.
+              {monitorMode
+                ? 'In monitor mode the first certificate sync proves Read, and the dashboard shows ' +
+                  'its result. Setup can finish either way.'
+                : 'The HTTPS certificate on the External URL step would prove Enroll on the template ' +
+                  'it uses; otherwise the first ACME order from each template is the proof. Setup can ' +
+                  'finish either way.'}
             </span>
           </span>
         </label>

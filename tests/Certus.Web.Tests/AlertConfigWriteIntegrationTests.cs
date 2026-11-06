@@ -141,6 +141,45 @@ public class AlertConfigWriteIntegrationTests : IClassFixture<CertusWebApplicati
         overlay.Alerts.Should().NotBeNull();
     }
 
+    [Fact]
+    public async Task Put_KeepsTheKeysAnAdministratorAddedByHand()
+    {
+        // Issue #550. The docs send an administrator to settings.json for the admin
+        // group, the private range block and the webhook, and every save used to
+        // drop them. The webhook is the sharpest case: it sits inside the very block
+        // this endpoint saves, and the endpoint refuses to write one itself, so the
+        // file is the only place it can live.
+        string overlayPath;
+        using (var scope = _factory.Services.CreateScope())
+        {
+            overlayPath = scope.ServiceProvider.GetRequiredService<AlertConfigStore>().OverlayPath;
+        }
+
+        File.WriteAllText(overlayPath, """
+            {
+              "Certus": {
+                "CaConnectionString": "ca.example.com\\Example-CA",
+                "Alerts": { "Webhook": { "Url": "https://hooks.example.com/ducks" } }
+              },
+              "Certus:Acme:ChallengeValidation": { "BlockPrivateRanges": true },
+              "Auth": { "AdminGroup": "CORP\\Ducks Admins" }
+            }
+            """);
+
+        var response = await _client.PutAsJsonAsync("/api/alerts/config", ValidBody(interval: 90));
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        using var file = JsonDocument.Parse(File.ReadAllText(overlayPath));
+        var root = file.RootElement;
+        root.GetProperty("Auth").GetProperty("AdminGroup").GetString().Should().Be("CORP\\Ducks Admins");
+        root.GetProperty("Certus:Acme:ChallengeValidation").GetProperty("BlockPrivateRanges").GetBoolean()
+            .Should().BeTrue();
+        var alerts = root.GetProperty("Certus").GetProperty("Alerts");
+        alerts.GetProperty("Webhook").GetProperty("Url").GetString().Should().Be("https://hooks.example.com/ducks");
+        alerts.GetProperty("CheckIntervalMinutes").GetInt32().Should().Be(90);
+        SettingsOverlay.Load(overlayPath).CaConnectionString.Should().Be("ca.example.com\\Example-CA");
+    }
+
     // ── The password: writable, write only, protected at rest ──
 
     [Fact]

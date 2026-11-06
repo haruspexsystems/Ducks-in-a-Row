@@ -1,3 +1,4 @@
+using System.Security.Cryptography.X509Certificates;
 using Certus.Core.Acme.Services;
 using Microsoft.Extensions.Options;
 
@@ -107,5 +108,23 @@ public class TlsAlpn01ChallengeValidatorTests
     {
         // RFC 8737 §3 defines this OID
         TlsAlpn01ChallengeValidator.AcmeIdentifierOid.Should().Be("1.3.6.1.5.5.7.1.31");
+    }
+
+    [Fact]
+    public async Task SslOptions_NeverDownloadAnIssuerTheChallengeCertificateNames()
+    {
+        // SslStream builds the challenge server's chain with these options' policy before the
+        // accept-all callback runs, so the policy alone decides whether a download address in
+        // the presented certificate is followed (#642).
+        await using var listener = new AiaDownloadListener();
+        using var leaf = listener.CreateOrphanLeaf();
+        var policy = TlsAlpn01ChallengeValidator.CreateSslOptions("acme.example").CertificateChainPolicy;
+        policy.Should().NotBeNull("without a policy SslStream builds the chain with downloads on");
+
+        using var chain = new X509Chain { ChainPolicy = policy! };
+        chain.Build(leaf).Should().BeFalse();
+
+        chain.ChainStatus.Select(s => s.Status).Should().Contain(X509ChainStatusFlags.PartialChain);
+        listener.Connections.Should().Be(0, "the chain must not download the issuer the certificate names");
     }
 }

@@ -248,6 +248,69 @@ public class CertusDbContextTests : IDisposable
             "one profile listing the same device twice is a data error the schema must refuse");
     }
 
+    /// <summary>
+    /// Every licence alert stage fits the column that records it (issue #494).
+    /// Reflects over the constants, the AcmeAuthorization pattern above, so a stage
+    /// added later is covered without coming back here. The width is never in the
+    /// SQLite DDL (CLAUDE.md, declared column widths), so this test is what holds it.
+    /// </summary>
+    [Fact]
+    public void LicenceAlertSent_StageFitsEveryLicenceAlertStage()
+    {
+        var maxLength = _context.Model
+            .FindEntityType(typeof(LicenceAlertSent))!
+            .FindProperty(nameof(LicenceAlertSent.Stage))!
+            .GetMaxLength();
+
+        maxLength.Should().NotBeNull();
+
+        var stages = typeof(Certus.Core.Alerts.LicenceAlertStages)
+            .GetFields(BindingFlags.Public | BindingFlags.Static)
+            .Where(f => f.IsLiteral && f.FieldType == typeof(string))
+            .Select(f => (string)f.GetRawConstantValue()!)
+            .ToList();
+
+        stages.Should().NotBeEmpty("the loop below asserts nothing if the reflection stops finding the constants");
+
+        foreach (var stage in stages)
+            stage.Length.Should().BeLessThanOrEqualTo(maxLength!.Value,
+                $"the column has to hold \"{stage}\", which is {stage.Length} characters");
+    }
+
+    /// <summary>
+    /// The licence id column is exactly as wide as the only id the alert check
+    /// lets through, a canonical GUID, so the declared width and the check agree.
+    /// </summary>
+    [Fact]
+    public void LicenceAlertSent_LicenceIdFitsACanonicalLicenceId()
+    {
+        var maxLength = _context.Model
+            .FindEntityType(typeof(LicenceAlertSent))!
+            .FindProperty(nameof(LicenceAlertSent.LicenceId))!
+            .GetMaxLength();
+
+        maxLength.Should().Be(Certus.Core.Modules.LicenceAlertRules.LicenceIdLength);
+        Guid.NewGuid().ToString("D").Length.Should().Be(maxLength);
+    }
+
+    [Fact]
+    public void LicenceAlertSent_TheSameLicenceAndStageTwice_IsRejected()
+    {
+        _context.LicenceAlertsSent.Add(new LicenceAlertSent
+        {
+            LicenceId = "0192a3b4-c5d6-7e8f-9a0b-1c2d3e4f5a6b", Stage = "days7", Channels = "email",
+        });
+        _context.SaveChanges();
+
+        _context.LicenceAlertsSent.Add(new LicenceAlertSent
+        {
+            LicenceId = "0192a3b4-c5d6-7e8f-9a0b-1c2d3e4f5a6b", Stage = "days7", Channels = "webhook",
+        });
+        var act = () => _context.SaveChanges();
+
+        act.Should().Throw<DbUpdateException>("one stage of one licence is sent once");
+    }
+
     public void Dispose()
     {
         _context.Database.CloseConnection();

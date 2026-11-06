@@ -563,10 +563,14 @@ public sealed class CertificateSyncService : BackgroundService
     /// later must not start clearing revocations on its own.
     /// </description></item>
     /// <item><description>
-    /// <c>AdcsRequestId &gt; 0</c> is the same identity guard
-    /// <c>OrderService.StampInventoryRowAsync</c> applies to the same bridge in
-    /// the other direction: an unset key selects by an unset value rather than by
-    /// identity, and un-revoking on a guess is not something to do.
+    /// The pair must be one certificate by <see cref="AcmeInventoryBridge"/>'s
+    /// rule: a real request id (an unset key selects by an unset value rather
+    /// than by identity, the guard <c>OrderService.StampInventoryRowAsync</c>
+    /// applies to the same bridge in the other direction) and a serial that
+    /// agrees once normalized. The serial is what keeps an install pointed at
+    /// another CA from clearing a stamp because the new CA's request of the same
+    /// number reads issued (issue #442). Un-revoking on a guess is not something
+    /// to do.
     /// </description></item>
     /// </list>
     ///
@@ -584,7 +588,8 @@ public sealed class CertificateSyncService : BackgroundService
     /// <see cref="AcmeCertificate.RevokedAt"/> and does not want one: the table
     /// holds a row per ACME issued certificate, the scan runs once every sync
     /// interval, and the revoked rows it keeps are a small fraction of it. Only
-    /// those reach the subquery, which is a point lookup on the unique index over
+    /// those reach the subquery, which finds the row again by its primary key and
+    /// then its twin through the unique index over
     /// <see cref="SyncedCertificate.RequestId"/>.
     /// </para>
     /// </summary>
@@ -594,6 +599,7 @@ public sealed class CertificateSyncService : BackgroundService
     {
         // Hoisted so the comparison is a constant in the expression tree.
         var issued = nameof(CertificateStatus.Issued);
+        var bridged = AcmeInventoryBridge.Pairs(db.AcmeCertificates, db.SyncedCertificates);
 
         // ExecuteUpdate goes round the change tracker, which normally leaves the
         // caller owing a ReloadAsync. Nothing here re-reads these rows: the sync
@@ -602,12 +608,11 @@ public sealed class CertificateSyncService : BackgroundService
         return await db.AcmeCertificates
             .Where(a => a.RevokedAt != null
                      && a.RevokedAt < passesStartedAt
-                     && a.AdcsRequestId > 0
-                     && db.SyncedCertificates.Any(s =>
-                            s.RequestId == a.AdcsRequestId
-                            && s.Status == issued
-                            && s.RevokedAt == null
-                            && s.LastSyncedAt >= passesStartedAt))
+                     && bridged.Any(p =>
+                            p.Acme.Id == a.Id
+                            && p.Inventory.Status == issued
+                            && p.Inventory.RevokedAt == null
+                            && p.Inventory.LastSyncedAt >= passesStartedAt))
             .ExecuteUpdateAsync(setters => setters
                 .SetProperty(a => a.RevokedAt, (DateTime?)null)
                 .SetProperty(a => a.RevokedReason, (int?)null),
@@ -686,7 +691,10 @@ public sealed class CertificateSyncService : BackgroundService
             NotBefore = cert.NotBefore,
             NotAfter = cert.NotAfter,
             Status = cert.Status.ToString(),
-            Requestor = cert.Requestor,
+            // The same guard at the writer for the same reason (issue #429), with
+            // no coalesce: the column is nullable, so a requester that sanitizes
+            // away stays null rather than becoming the empty string.
+            Requestor = CertificateTextSanitizer.SanitizeRequestor(cert.Requestor),
             RequestDate = cert.RequestDate,
             RevokedAt = cert.RevokedWhen,
             RevokedReason = cert.RevokedReason,
@@ -729,7 +737,15 @@ public sealed class CertificateSyncService : BackgroundService
         entity.NotBefore = cert.NotBefore;
         entity.NotAfter = cert.NotAfter;
         entity.Status = cert.Status.ToString();
-        entity.Requestor = cert.Requestor;
+        // A pass that read the requester column is taken at its word, like the
+        // template above: there is no fallback chain to protect, so a requester the
+        // CA records as empty clears what was stored. A pass whose CA view did not
+        // expose the column has nothing to say, and writing its null would erase
+        // every requester an earlier healthy pass captured, for good on a row the
+        // sync never revisits (issue #547). The client says which case this is,
+        // because the null alone cannot.
+        if (!cert.RequestorColumnMissing)
+            entity.Requestor = CertificateTextSanitizer.SanitizeRequestor(cert.Requestor);
         entity.RequestDate = cert.RequestDate;
         // Straight overwrite on purpose: a certificate released from
         // CertificateHold reappears in the Issued pass with null revocation
@@ -837,17 +853,27 @@ public sealed class CertificateSyncService : BackgroundService
             state.SubjectAlternativeNames != cert.SubjectAlternativeNames)
             return false;
 
-        // Compared sanitized against sanitized, the way the subject above is.
-        // The stored value went through the strip on its way in, so comparing it
-        // against a raw incoming one would call every row changed on every cycle
-        // and rewrite the whole inventory each time, which is exactly the cost
-        // issue #184 removed.
+        // The template and the requester are compared sanitized against
+        // sanitized, the way the subject above is. The stored value went through
+        // the strip on its way in, so comparing it against a raw incoming one
+        // would call every row changed on every cycle and rewrite the whole
+        // inventory each time, which is exactly the cost issue #184 removed.
         if (state.TemplateName != (CertificateTextSanitizer.SanitizeTemplateName(cert.TemplateName) ?? "") ||
             state.NotBefore != cert.NotBefore ||
             state.NotAfter != cert.NotAfter ||
-            state.Status != cert.Status.ToString() ||
-            state.Requestor != cert.Requestor ||
-            state.RequestDate != cert.RequestDate ||
+            state.Status != cert.Status.ToString())
+            return false;
+
+        // The requester carries its own guard, so it sits on its own here.
+        // UpdateEntity refuses the write for a pass with no requester column, so
+        // such a pass leaves the stored value as it is. Comparing anyway would
+        // call every row changed on every cycle for as long as the column stays
+        // missing, and load each one only to write nothing new into it.
+        if (!cert.RequestorColumnMissing &&
+            state.Requestor != CertificateTextSanitizer.SanitizeRequestor(cert.Requestor))
+            return false;
+
+        if (state.RequestDate != cert.RequestDate ||
             state.RevokedAt != cert.RevokedWhen ||
             state.RevokedReason != cert.RevokedReason)
             return false;
@@ -994,6 +1020,18 @@ public sealed class CertificateSyncService : BackgroundService
     /// shown. A device attestation order is covered by the same lookup:
     /// its first identifier is the permanent-identifier value, which is the
     /// device serial and the right thing to show.
+    ///
+    /// <para>
+    /// The request id is only unique within one CA, so an install pointed at
+    /// another CA holds orders whose ids name the old CA's requests while these
+    /// rows are the new CA's (issue #442). The serial that settles every other
+    /// crossing of this bridge does not exist here, on either side, so two facts
+    /// the order itself proves stand in for it, and both fail toward leaving the
+    /// row unnamed. An order holding a certificate is never a source: its
+    /// request issued, and an issued request carries a serial, so it cannot be
+    /// one of these rows. And the CA must date the request inside the order's own
+    /// life, by <see cref="AcmeInventoryBridge.MayBeTheOrdersRequest"/>.
+    /// </para>
     /// </summary>
     private static async Task<int> BackfillFromPendingOrdersAsync(
         CertusDbContext db, List<SyncedCertificate> emptyRows, CancellationToken ct)
@@ -1007,11 +1045,23 @@ public sealed class CertificateSyncService : BackgroundService
 
         // One query for the whole batch. AdcsRequestId is nullable because an
         // order only acquires one once it reaches ADCS, and an order that never
-        // got that far has no request row to name.
+        // got that far has no request row to name. Both certificate signals are
+        // read, the mirror on the order and the authoritative foreign key on the
+        // certificate, because nothing keeps the two in step and either one is
+        // enough to rule the order out.
         var requestIds = wanted.Keys.ToList();
         var orders = await db.AcmeOrders
-            .Where(o => o.AdcsRequestId != null && requestIds.Contains(o.AdcsRequestId.Value))
-            .Select(o => new { RequestId = o.AdcsRequestId!.Value, o.IdentifiersJson })
+            .Where(o => o.AdcsRequestId != null
+                     && requestIds.Contains(o.AdcsRequestId.Value)
+                     && o.CertificateId == null
+                     && !db.AcmeCertificates.Any(a => a.OrderId == o.Id))
+            .Select(o => new
+            {
+                RequestId = o.AdcsRequestId!.Value,
+                o.IdentifiersJson,
+                o.CreatedAt,
+                o.ExpiresAt,
+            })
             .ToListAsync(ct);
 
         var filled = 0;
@@ -1032,6 +1082,10 @@ public sealed class CertificateSyncService : BackgroundService
                 continue;
             foreach (var target in targets)
             {
+                if (!AcmeInventoryBridge.MayBeTheOrdersRequest(
+                        target.RequestDate, order.CreatedAt, order.ExpiresAt))
+                    continue;
+
                 // Anything the CA itself supplied wins over this local fallback,
                 // which is why the emptiness is re-checked per row rather than
                 // trusted from when the list was built.

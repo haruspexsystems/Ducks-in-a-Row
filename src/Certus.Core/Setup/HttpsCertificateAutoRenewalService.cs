@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Certus.Core.Adcs;
 using Certus.Core.Alerts;
 using Certus.Core.Configuration;
@@ -14,6 +15,14 @@ namespace Certus.Core.Setup;
 /// out at the end of its template validity, the host would fall back to the
 /// self signed certificate with a startup warning, and trust would break for
 /// every ACME client and browser at once.
+///
+/// It renews only a certificate this service installed, which carries the
+/// friendly name <see cref="HttpsCertificateOwnership.FriendlyName"/> (issue
+/// #535). The overlay can name one somebody else installed, picked in monitor
+/// mode and typically renewed by Windows autoenrolment; that one is left to
+/// whoever issued it, and a pass records why. A recorded certificate missing
+/// from the store is still replaced, because there is nothing left to take
+/// over. See <see cref="HttpsCertificateOwnership"/>.
 ///
 /// The renewal deliberately does not restart the host. A production service
 /// must not bounce itself unannounced, so a successful renewal installs the
@@ -43,10 +52,22 @@ public sealed class HttpsCertificateAutoRenewalService : BackgroundService
     /// <summary>The smallest check interval honored, whatever is configured.</summary>
     private const int MinCheckIntervalHours = 1;
 
+    /// <summary>
+    /// What a pass records for a certificate this service did not install (issue #535).
+    /// It names the friendly name, because that is what an administrator can check in
+    /// certlm.msc, and change, to hand the certificate to the service.
+    /// </summary>
+    internal const string NotInstalledByServiceMessage =
+        "The certificate does not carry the friendly name \"" + HttpsCertificateOwnership.FriendlyName +
+        "\", so this service did not install it and leaves its renewal to whoever issued it. " +
+        "When the renewed certificate comes from the same template, the service serves it from " +
+        "its next start.";
+
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IHttpsCertificateStore _certificateStore;
     private readonly ServerCertificateIdentity _identity;
     private readonly CertusOptions _options;
+    private readonly CertusInstanceMode _instanceMode;
     private readonly ILogger<HttpsCertificateAutoRenewalService> _logger;
 
     private volatile HttpsCertificateRenewalAttempt? _lastAttempt;
@@ -56,17 +77,36 @@ public sealed class HttpsCertificateAutoRenewalService : BackgroundService
         IHttpsCertificateStore certificateStore,
         ServerCertificateIdentity identity,
         IOptions<CertusOptions> options,
+        CertusInstanceMode instanceMode,
         ILogger<HttpsCertificateAutoRenewalService> logger)
     {
         _scopeFactory = scopeFactory;
         _certificateStore = certificateStore;
         _identity = identity;
         _options = options.Value;
+        _instanceMode = instanceMode;
         _logger = logger;
     }
 
-    /// <summary>Whether automatic renewal is turned on for this install.</summary>
-    public bool Enabled => _options.HttpsCertificateAutoRenewalEnabled;
+    /// <summary>
+    /// Whether automatic renewal is turned on for this install: the setting, and full
+    /// mode. In monitor mode the hosted loop is not even registered (issue #470), but
+    /// this instance still is, because the settings API reads it, and it has to report
+    /// itself off there.
+    /// </summary>
+    public bool Enabled => IsActive(_options, _instanceMode);
+
+    /// <summary>
+    /// The one rule for "something renews the server's own certificate", shared with
+    /// <see cref="ServerCertificateIdentity"/>, which stops keeping that certificate out
+    /// of the expiry alerts the moment nothing does.
+    /// </summary>
+    public static bool IsActive(CertusOptions options, CertusInstanceMode instanceMode)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(instanceMode);
+        return options.HttpsCertificateAutoRenewalEnabled && !instanceMode.IsMonitor;
+    }
 
     /// <summary>The configured renewal window, before the short lifetime cap.</summary>
     public int RenewalWindowDays => Math.Max(1, _options.HttpsCertificateRenewalWindowDays);
@@ -85,9 +125,18 @@ public sealed class HttpsCertificateAutoRenewalService : BackgroundService
     {
         if (!Enabled)
         {
-            _logger.LogInformation(
-                "Automatic HTTPS certificate renewal is disabled " +
-                "(Certus:HttpsCertificateAutoRenewalEnabled=false)");
+            if (_instanceMode.IsMonitor)
+            {
+                _logger.LogInformation(
+                    "Automatic HTTPS certificate renewal is off, because this server runs in monitor mode");
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "Automatic HTTPS certificate renewal is disabled " +
+                    "(Certus:HttpsCertificateAutoRenewalEnabled=false)");
+            }
+
             return;
         }
 
@@ -147,7 +196,9 @@ public sealed class HttpsCertificateAutoRenewalService : BackgroundService
     {
         if (!Enabled)
         {
-            Record(HttpsCertificateRenewalOutcome.NotApplicable, "Automatic renewal is disabled.");
+            Record(HttpsCertificateRenewalOutcome.NotApplicable, _instanceMode.IsMonitor
+                ? "Automatic renewal is off in monitor mode."
+                : "Automatic renewal is disabled.");
             return;
         }
 
@@ -196,10 +247,29 @@ public sealed class HttpsCertificateAutoRenewalService : BackgroundService
         if (certificate is null)
         {
             // The store no longer holds it, so the host is already on the self
-            // signed fallback. Renewing is the fix, not a wait.
+            // signed fallback. Renewing is the fix, not a wait. Who installed it
+            // (below) is a question only a certificate in the store can answer,
+            // and a missing one leaves nothing to take over: the follower has no
+            // reference to follow from either, so in full mode this enrolment is
+            // the only automatic way off the fallback (issue #535).
             _logger.LogWarning(
                 "The recorded HTTPS certificate {Thumbprint} is not in the machine store; " +
                 "enrolling a replacement", recordedThumbprint);
+        }
+        else if (!HttpsCertificateOwnership.InstalledByService(certificate))
+        {
+            // Somebody else installed it, typically a certificate picked in monitor
+            // mode that Windows autoenrolment renews (issue #535). Renewing it here
+            // would enrol a replacement from an ACME template, serve that instead,
+            // and leave autoenrolment renewing a certificate nothing uses. Whoever
+            // issued it renews it, and the service follows that renewal at its next
+            // start (HttpsCertificateFollow), so there is nothing to do here.
+            _logger.LogDebug(
+                "The HTTPS certificate {Thumbprint} does not carry the friendly name {FriendlyName}, " +
+                "so this service did not install it and leaves its renewal to whoever issued it",
+                recordedThumbprint, HttpsCertificateOwnership.FriendlyName);
+            Record(HttpsCertificateRenewalOutcome.NotApplicable, NotInstalledByServiceMessage);
+            return;
         }
         else
         {
@@ -238,7 +308,8 @@ public sealed class HttpsCertificateAutoRenewalService : BackgroundService
             var attempt = Record(HttpsCertificateRenewalOutcome.Failed,
                 $"The certificate authority is unavailable: {ex.Message}",
                 template: context.Template);
-            await SendFailureAlertAsync(scope, attempt, daysRemaining, cancellationToken);
+            await SendFailureAlertAsync(
+                scope, attempt, attempt.Message, daysRemaining, cancellationToken);
             return;
         }
         catch (CaAccessDeniedException ex)
@@ -255,7 +326,33 @@ public sealed class HttpsCertificateAutoRenewalService : BackgroundService
             var attempt = Record(HttpsCertificateRenewalOutcome.Failed,
                 $"The certificate authority denied access: {ex.Message}",
                 template: context.Template);
-            await SendFailureAlertAsync(scope, attempt, daysRemaining, cancellationToken);
+            await SendFailureAlertAsync(
+                scope, attempt, attempt.Message, daysRemaining, cancellationToken);
+            return;
+        }
+        catch (JsonException ex)
+        {
+            // The settings overlay could not be read, or refused the record (issue
+            // #553). The usual refusal, a managed key also written in the colon form
+            // at the top level, is asked before the enrolment and comes back as a
+            // Failed outcome below, alert included. What still lands here is a hand
+            // edit made while the renewal ran, after that question was answered.
+            // Made before the enrolment it is a file that no longer reads; made
+            // after, the replacement may already be installed with nothing naming
+            // it, and the superseded sweep removes it from the store once a pass
+            // finds served and recorded agreeing. The exception cannot say which, so
+            // the log does not claim either. The loop's general catch would record
+            // this with no alert, and a renewal that keeps failing quietly is how the
+            // certificate expires, so this arm alerts like the CA arms above.
+            _logger.LogError(ex,
+                "Automatic HTTPS certificate renewal stopped, because the settings overlay could " +
+                "not be read or refused the record; the current certificate stays in place, and " +
+                "a replacement may be in LocalMachine\\My unrecorded until the next pass removes it");
+            var attempt = Record(HttpsCertificateRenewalOutcome.Failed,
+                $"The settings overlay could not be read or saved: {ex.Message}",
+                template: context.Template);
+            await SendFailureAlertAsync(
+                scope, attempt, attempt.Message, daysRemaining, cancellationToken);
             return;
         }
 
@@ -283,7 +380,8 @@ public sealed class HttpsCertificateAutoRenewalService : BackgroundService
             result.Outcome, result.Message ?? "no detail available");
 
         var failure = Record(result.Outcome, result.Message, template: result.Template);
-        await SendFailureAlertAsync(scope, failure, daysRemaining, cancellationToken);
+        await SendFailureAlertAsync(
+            scope, failure, result.WireMessage, daysRemaining, cancellationToken);
     }
 
     /// <summary>
@@ -338,10 +436,18 @@ public sealed class HttpsCertificateAutoRenewalService : BackgroundService
     /// precisely so this is the only thing they ever hear about it, and it
     /// carries the CA's own reason, which names the exact fix for a pended or
     /// denied request.
+    ///
+    /// <paramref name="wireDetail"/> is what the webhook may carry instead of the
+    /// attempt's message (issue #485). Every caller passes it explicitly: a denial
+    /// names the computer account, so its result supplies an account free form,
+    /// and the three exception arms pass their own message, because what they
+    /// wrap is the CA exceptions' fixed text or the overlay's, none of which names
+    /// an account or a host.
     /// </summary>
     private async Task SendFailureAlertAsync(
         IServiceScope scope,
         HttpsCertificateRenewalAttempt attempt,
+        string? wireDetail,
         int? daysRemaining,
         CancellationToken cancellationToken)
     {
@@ -355,7 +461,8 @@ public sealed class HttpsCertificateAutoRenewalService : BackgroundService
             Outcome: attempt.Outcome.ToString(),
             Detail: attempt.Message,
             Template: attempt.Template,
-            DaysRemaining: daysRemaining);
+            DaysRemaining: daysRemaining,
+            WireDetail: wireDetail);
 
         foreach (var notifier in notifiers)
         {

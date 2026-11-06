@@ -8,18 +8,23 @@ using Certus.Core.Alerts;
 using Certus.Core.Configuration;
 using Certus.Core.Crl;
 using Certus.Core.Data;
+using Certus.Core.Data.Retention;
 using Certus.Core.Health;
+using Certus.Core.Modules;
 using Certus.Core.Security;
 using Certus.Web.Security;
 using Certus.Core.Services;
 using Certus.Core.Setup;
 using Certus.Core.ServiceRights;
 using Certus.Web;
+using Certus.Web.Audit;
 using Certus.Web.Authentication;
 using Certus.Web.Middleware;
 using Certus.Web.Routing;
+using Certus.Web.Configuration;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.EntityFrameworkCore;
+using Certus.Web.Logging;
 using Serilog;
 
 Log.Logger = new LoggerConfiguration()
@@ -32,15 +37,25 @@ try
 
     var builder = WebApplication.CreateBuilder(args);
 
+    // The data directory: the service's, unless Development configuration names
+    // another one (CertusDataDirectory).
+    var dataDirectory = CertusDataDirectory.Resolve(builder.Configuration, builder.Environment);
+
+    // The instance mode (issue #470), resolved the way the service resolves it. The
+    // dev host normally runs in Development, so this is Certus:Development:Mode,
+    // which is what lets the dashboard be checked in monitor mode on the mock CA.
+    var instanceMode = CertusInstanceMode.Resolve(builder.Configuration, builder.Environment);
+
+    // The same TLS floor the service pins (issue #484), so a handshake against the
+    // dev host behaves the way one against an installation does.
+    builder.WebHost.ConfigureKestrel(kestrel => HttpsProtocolPolicy.Apply(kestrel));
+
     // Serilog
     builder.Host.UseSerilog((context, services, configuration) => configuration
         .ReadFrom.Configuration(context.Configuration)
         .ReadFrom.Services(services)
         .WriteTo.Console()
-        .WriteTo.File(
-            Path.Combine(CertusPaths.DataDirectory, "logs", "ducks-.log"),
-            rollingInterval: RollingInterval.Day,
-            retainedFileCountLimit: 30));
+        .WriteTo.CertusLogFile(dataDirectory));
 
     // Configuration
     builder.Services.Configure<CertusOptions>(
@@ -50,6 +65,14 @@ try
     // null over the option initializer, so resolve it back to the default for every
     // IOptions<CertusOptions> consumer (StartupValidator, SetupService).
     builder.Services.PostConfigure<CertusOptions>(o => o.NormalizeDatabasePath());
+
+    // Certus:ReleaseAgeWarningDays (issue #623), read by the Settings About
+    // block only. Bound from the same section so the key sits beside the
+    // other flat Certus keys; the binder ignores what each class lacks.
+    builder.Services.Configure<ReleaseAgeOptions>(
+        builder.Configuration.GetSection(CertusOptions.SectionName));
+
+    builder.Services.AddSingleton(instanceMode);
 
     // Database
     var certusOptions = builder.Configuration
@@ -127,6 +150,10 @@ try
     builder.Services.AddScoped<TlsCertificateEnroller>();
     builder.Services.AddScoped<SetupService>();
 
+    // Monitor mode's last line (issue #470), after both CA registrations above;
+    // the service host explains it.
+    builder.Services.AddMonitorModeCaWriteGuard(instanceMode);
+
     // The service rights check (issue #440), against the simulated probe: the
     // dev host answers for an example estate, never for the developer's account.
     builder.Services.AddSingleton<IServiceRightsProbe, MockServiceRightsProbe>();
@@ -141,8 +168,13 @@ try
     builder.Services.AddScoped<HttpsCertificateRenewalService>();
     builder.Services.AddSingleton<ServerCertificateIdentity>();
     builder.Services.AddSingleton<HttpsCertificateAutoRenewalService>();
-    builder.Services.AddHostedService(sp =>
-        sp.GetRequiredService<HttpsCertificateAutoRenewalService>());
+    // The singleton stays in monitor mode, because SettingsController reads it; only
+    // the loop goes, since every renewal is an enrolment (issue #470).
+    if (!instanceMode.IsMonitor)
+    {
+        builder.Services.AddHostedService(sp =>
+            sp.GetRequiredService<HttpsCertificateAutoRenewalService>());
+    }
 
     // External URL reachability probe (issue #89). Its handler accepts self
     // signed certificates and is deliberately not the challenge egress
@@ -215,12 +247,7 @@ try
     builder.Services.AddSingleton<AlertConfigStore>();
     builder.Services.AddScoped<AlertQueryService>();
     builder.Services.AddScoped<IAlertNotifier, EmailAlertNotifier>();
-    builder.Services.AddHttpClient<WebhookAlertNotifier>(client =>
-    {
-        client.Timeout = TimeSpan.FromSeconds(30);
-    });
-    builder.Services.AddScoped<IAlertNotifier>(sp =>
-        sp.GetRequiredService<WebhookAlertNotifier>());
+    builder.Services.AddWebhookAlertNotifier();
     builder.Services.AddHostedService<ExpiryMonitorService>();
     // The test send (issue #161). The throttle is a singleton because its whole
     // job is to hold the last send time across requests; the service that
@@ -246,6 +273,11 @@ try
             sp.GetService<ILdapCrlFetcher>());
     });
     builder.Services.AddHostedService<CrlMonitorService>();
+
+    // Licence alerts (issue #494). Registered in both modes, because an alert is
+    // not a write to the CA. It reads the module host's verdict and never runs
+    // module code; the host and the status source come from AddCertusModuleHost.
+    builder.Services.AddHostedService<LicenceAlertService>();
 
     // Challenge validators — HTTP-01, DNS-01, TLS-ALPN-01.
     // Egress is screened by AddressGuard so a validator cannot be pointed at loopback,
@@ -297,7 +329,10 @@ try
     builder.Services.AddScoped<DeviceAttestationAdminService>();
 
     // Background challenge validation worker
-    builder.Services.AddHostedService<ChallengeValidationService>();
+    // Not in monitor mode (issue #470): ACME is off there, so there is nothing to
+    // validate, and a validated order is one step from a CA write.
+    if (!instanceMode.IsMonitor)
+        builder.Services.AddHostedService<ChallengeValidationService>();
 
     // Background worker for orders the CA holds for manager approval (issue
     // #319). A template with CT_FLAG_PEND_ALL_REQUESTS answers every finalize
@@ -308,7 +343,11 @@ try
     // appsettings.json so the C# initializer is the default.
     builder.Services.Configure<PendingIssuanceOptions>(
         builder.Configuration.GetSection(PendingIssuanceOptions.SectionName));
-    builder.Services.AddHostedService<PendingIssuanceService>();
+    // Not in monitor mode (issue #470): its leaf guard can revoke. An order the CA
+    // held when the mode was switched waits in processing and is finished by the
+    // first sweep after a switch back to full mode.
+    if (!instanceMode.IsMonitor)
+        builder.Services.AddHostedService<PendingIssuanceService>();
 
     // MVC controllers
     builder.Services.AddControllers();
@@ -316,6 +355,10 @@ try
     // Authentication and authorization (issue #27, SEC-F1) — Negotiate plus a
     // deny by default fallback policy; public routes are carved out explicitly
     builder.Services.AddCertusAuth(builder.Configuration);
+
+    // The administrator audit trail (issue #634): every mutating dashboard API
+    // action writes a row and a Warning log line that no setting can turn off.
+    builder.Services.AddAdminAudit();
 
     // Security: startup validator
     builder.Services.AddSingleton<StartupValidator>();
@@ -330,10 +373,24 @@ try
     // cached briefly (CaHealthCache) so the anonymous readiness endpoint cannot drive a
     // fresh CA round trip on every request.
     builder.Services.AddSingleton<CaHealthCache>();
+    // The data folder's volume is watched for free space (issue #632); the check
+    // reports degraded below Certus:FreeSpaceWarningMegabytes and deletes nothing.
+    builder.Services.AddDataFolderFreeSpaceMonitor(dataDirectory);
+    // The daily retention pass and the per account erasure path (issue #637).
+    // Periods come from Certus:Retention; 0 keeps a class for ever.
+    builder.Services.AddDataRetention(builder.Configuration);
     builder.Services.AddHealthChecks()
         .AddCheck<CertusHealthCheck>("certus", tags: new[] { "ready" });
 
+    // The paid module host (issue #413), wired in both hosts; see the service host's
+    // Program.cs for the shape. The data directory is the one resolved above.
+    builder.Services.AddCertusModuleHost(dataDirectory);
+
     var app = builder.Build();
+
+    // Which mode is in force (issue #470), through the file logger, which did not
+    // exist when the mode was resolved.
+    instanceMode.LogAtStartup(app.Logger);
 
     // Startup validation — reject fatal misconfigurations (including the SEC-F1
     // refusal) before any database I/O happens.
@@ -400,6 +457,7 @@ try
     _ = Task.Run(() => TemplateNameStartupReport.LogAsync(
         templateNameReportTemplates,
         templateNameReportPolicy,
+        instanceMode,
         app.Logger,
         app.Lifetime.ApplicationStopping));
 
@@ -422,21 +480,37 @@ try
     // HTTPS enforcement (HSTS + redirect) outside Development, gated by Auth:RequireHttps
     app.UseCertusTransportSecurity();
 
-    app.UseSerilogRequestLogging();
+    // One line per request, except a rate limited one (issue #741): see
+    // CertusLogging.UseCertusRequestLogging, and keep it above the monitor mode gate.
+    app.UseCertusRequestLogging();
 
-    // ACME nonce middleware — injects Replay-Nonce on all /acme/ responses
-    app.UseMiddleware<AcmeNonceMiddleware>();
+    // Monitor mode (issue #470): every ACME protocol URL answers 404, here so the
+    // request is still logged and nothing after this point runs for a refused
+    // request, so no nonce is stored for it. Adds nothing in full mode.
+    app.UseMonitorModeAcmeGate();
 
     app.UseRouting();
 
     // Authentication, authorization, and the CSRF header guard (issue #27)
     app.UseCertusAuth();
 
+    // Monitor mode (issue #470): the ACME administration API answers 404, after
+    // authorization so an anonymous caller still gets 401 like any other /api path.
+    // Adds nothing in full mode.
+    app.UseMonitorModeAdminApiGate();
+
     // Rate limiting — must be after routing so policies can match endpoints
     if (rateLimitOptions.Enabled)
     {
         app.UseRateLimiter();
     }
+
+    // ACME nonce middleware: injects Replay-Nonce on /acme/ responses a
+    // controller action produces. After the rate limiter on purpose (issue
+    // #632): a 429 never reaches it, so a throttled flood stores no nonce, and
+    // after routing so it can tell the protocol fallback's 404 apart from an
+    // action's answer. Keep it below UseRateLimiter.
+    app.UseMiddleware<AcmeNonceMiddleware>();
 
     // Serve React dashboard static files from wwwroot
     app.UseDefaultFiles();

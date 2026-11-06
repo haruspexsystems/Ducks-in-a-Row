@@ -76,20 +76,8 @@ public sealed class TlsAlpn01ChallengeValidator : IChallengeValidator
             using var tcpClient = new TcpClient();
             await tcpClient.ConnectAsync(address, 443, cts.Token);
 
-            var sslOptions = new SslClientAuthenticationOptions
-            {
-                TargetHost = domain,
-                ApplicationProtocols = new List<SslApplicationProtocol>
-                {
-                    new("acme-tls/1")
-                },
-                // We accept self signed certs — the validation is done by checking
-                // the acmeIdentifier extension, not the certificate chain
-                RemoteCertificateValidationCallback = (_, _, _, _) => true
-            };
-
             using var sslStream = new SslStream(tcpClient.GetStream());
-            await sslStream.AuthenticateAsClientAsync(sslOptions, cts.Token);
+            await sslStream.AuthenticateAsClientAsync(CreateSslOptions(domain), cts.Token);
 
             // 1. Check ALPN was negotiated
             if (sslStream.NegotiatedApplicationProtocol !=
@@ -194,6 +182,20 @@ public sealed class TlsAlpn01ChallengeValidator : IChallengeValidator
             return ChallengeValidationResult.TransientFailure(
                 $"TLS handshake failed with {domain}: {ex.Message}");
         }
+        catch (IOException ex)
+        {
+            // SslStream reports a peer that closes the connection part way through
+            // the handshake, or resets it, as an IOException rather than a
+            // SocketException or an AuthenticationException. It is a transport
+            // failure like the other two, so it retries like them. Before issue
+            // #632 it escaped the validator altogether; the sweep now survives
+            // that as well, but a validator that knows the answer should give it.
+            _logger.LogWarning(ex,
+                "TLS-ALPN-01 connection to {Domain} dropped during the handshake (transient)",
+                domain);
+            return ChallengeValidationResult.TransientFailure(
+                $"The connection to {domain}:443 dropped during the TLS-ALPN-01 handshake: {ex.Message}");
+        }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             _logger.LogWarning("TLS-ALPN-01 validation timed out for {Domain} (transient)", domain);
@@ -201,6 +203,28 @@ public sealed class TlsAlpn01ChallengeValidator : IChallengeValidator
                 $"TLS-ALPN-01 validation timed out connecting to {domain}.");
         }
     }
+
+    /// <summary>
+    /// The client options for the challenge handshake. Every certificate is accepted, because
+    /// the check is the acmeIdentifier extension, not the chain.
+    /// </summary>
+    internal static SslClientAuthenticationOptions CreateSslOptions(string domain) => new()
+    {
+        TargetHost = domain,
+        ApplicationProtocols = new List<SslApplicationProtocol>
+        {
+            new("acme-tls/1")
+        },
+        RemoteCertificateValidationCallback = (_, _, _, _) => true,
+        // SslStream still builds the challenge server's chain before the callback runs. Never
+        // let it download an issuer that chain names: the service calls only systems the
+        // operator configures (#642).
+        CertificateChainPolicy = new X509ChainPolicy
+        {
+            DisableCertificateDownloads = true,
+            RevocationMode = X509RevocationMode.NoCheck,
+        },
+    };
 
     /// <summary>
     /// Extracts the SHA-256 digest from the acmeIdentifier extension raw data.

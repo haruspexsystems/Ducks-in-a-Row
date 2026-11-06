@@ -1,0 +1,74 @@
+interface Certus.Modules.ICertusModule
+  method Certus.Modules.ILicenceEvaluator Start(Certus.Modules.IModuleContext context)
+  method Certus.Modules.ModuleDescription Describe()
+interface Certus.Modules.ILicenceEvaluator
+  method Certus.Modules.LicenceEvaluation Evaluate(System.ReadOnlyMemory<System.Byte>? licence)
+  method Certus.Modules.LicenceEvaluation Inspect(System.ReadOnlyMemory<System.Byte> candidate)
+interface Certus.Modules.IModuleContext
+  property Certus.Modules.IModuleLog Log { get; }
+  property System.String StateDirectory { get; }
+interface Certus.Modules.IModuleLog
+  method System.Void Write(Certus.Modules.ModuleLogLevel level, System.String code, System.String message)
+sealed class Certus.Modules.LicenceEvaluation : System.IEquatable<Certus.Modules.LicenceEvaluation>
+  ctor(Certus.Modules.LicenceStatus Status, System.String ReasonCode, System.String? LicenceId, System.String? Tier, System.String[] Features, System.Int32? MaxCas, System.String? LicenseeName, System.String? LicenseeRef, System.DateTimeOffset? ValidFrom, System.DateTimeOffset? ValidUntil, System.DateTimeOffset? WarnFrom, System.DateTimeOffset? GraceUntil, System.Int32? DaysRemaining, System.String[] BoundForests, System.String? ObservedForest, System.Boolean ClockAnomaly, System.Boolean UnknownTier, Certus.Modules.NoticeStage Notice, System.Boolean WorseThanInstalled)
+  method Certus.Modules.LicenceEvaluation <Clone>$()
+  method System.Boolean Equals(Certus.Modules.LicenceEvaluation? other)
+  method System.Boolean Equals(System.Object? obj)
+  method System.Int32 GetHashCode()
+  method System.String ToString()
+  method System.Void Deconstruct(out Certus.Modules.LicenceStatus Status, out System.String ReasonCode, out System.String? LicenceId, out System.String? Tier, out System.String[] Features, out System.Int32? MaxCas, out System.String? LicenseeName, out System.String? LicenseeRef, out System.DateTimeOffset? ValidFrom, out System.DateTimeOffset? ValidUntil, out System.DateTimeOffset? WarnFrom, out System.DateTimeOffset? GraceUntil, out System.Int32? DaysRemaining, out System.String[] BoundForests, out System.String? ObservedForest, out System.Boolean ClockAnomaly, out System.Boolean UnknownTier, out Certus.Modules.NoticeStage Notice, out System.Boolean WorseThanInstalled)
+  method static System.Boolean op_Equality(Certus.Modules.LicenceEvaluation? left, Certus.Modules.LicenceEvaluation? right)
+  method static System.Boolean op_Inequality(Certus.Modules.LicenceEvaluation? left, Certus.Modules.LicenceEvaluation? right)
+  property Certus.Modules.LicenceStatus Status { get; init; }
+  property Certus.Modules.NoticeStage Notice { get; init; }
+  property System.Boolean ClockAnomaly { get; init; }
+  property System.Boolean UnknownTier { get; init; }
+  property System.Boolean WorseThanInstalled { get; init; }
+  property System.DateTimeOffset? GraceUntil { get; init; }
+  property System.DateTimeOffset? ValidFrom { get; init; }
+  property System.DateTimeOffset? ValidUntil { get; init; }
+  property System.DateTimeOffset? WarnFrom { get; init; }
+  property System.Int32? DaysRemaining { get; init; }
+  property System.Int32? MaxCas { get; init; }
+  property System.String ReasonCode { get; init; }
+  property System.String? LicenceId { get; init; }
+  property System.String? LicenseeName { get; init; }
+  property System.String? LicenseeRef { get; init; }
+  property System.String? ObservedForest { get; init; }
+  property System.String? Tier { get; init; }
+  property System.String[] BoundForests { get; init; }
+  property System.String[] Features { get; init; }
+enum Certus.Modules.LicenceStatus : System.Int32
+  None = 0
+  NotYetValid = 1
+  Valid = 2
+  Expiring = 3
+  Grace = 4
+  Lapsed = 5
+  BindingMismatch = 6
+  Invalid = 7
+sealed class Certus.Modules.ModuleDescription : System.IEquatable<Certus.Modules.ModuleDescription>
+  ctor(System.String Id, System.String DisplayName, System.String Version)
+  method Certus.Modules.ModuleDescription <Clone>$()
+  method System.Boolean Equals(Certus.Modules.ModuleDescription? other)
+  method System.Boolean Equals(System.Object? obj)
+  method System.Int32 GetHashCode()
+  method System.String ToString()
+  method System.Void Deconstruct(out System.String Id, out System.String DisplayName, out System.String Version)
+  method static System.Boolean op_Equality(Certus.Modules.ModuleDescription? left, Certus.Modules.ModuleDescription? right)
+  method static System.Boolean op_Inequality(Certus.Modules.ModuleDescription? left, Certus.Modules.ModuleDescription? right)
+  property System.String DisplayName { get; init; }
+  property System.String Id { get; init; }
+  property System.String Version { get; init; }
+enum Certus.Modules.ModuleLogLevel : System.Int32
+  Information = 0
+  Warning = 1
+  Error = 2
+enum Certus.Modules.NoticeStage : System.Int32
+  None = 0
+  Days30 = 1
+  Days14 = 2
+  Days7 = 3
+  Days1 = 4
+  Expired = 5
+  GraceEnded = 6

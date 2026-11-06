@@ -22,6 +22,21 @@ namespace Certus.Core.Setup;
 /// certificate and the process is still serving the old one, and neither
 /// should alert.
 ///
+/// Identity and suppression are separate questions (issue #470). The
+/// certificate is kept out of the alerts only while something renews it:
+/// full mode with automatic renewal on. Until that issue the exclusion held
+/// whatever the renewal setting said, so an install that turned renewal off,
+/// and every monitor mode install, would let its own certificate expire with
+/// nothing warning. <see cref="IsSuppressedFromAlerts"/> is the alerting
+/// question; <see cref="IsOwnCertificate"/> stays the identity one.
+///
+/// Since issue #535 the alerting question also asks who installed the
+/// certificate. The automatic renewal renews only one carrying this service's
+/// friendly name (<see cref="HttpsCertificateOwnership"/>), so a certificate
+/// somebody else installed, typically one picked in monitor mode and renewed by
+/// Windows autoenrolment, alerts in full mode too: if its own renewal stops,
+/// nothing in this product would replace it.
+///
 /// Best effort throughout, like the directory lookups: this backs alert
 /// suppression, never an issuance decision, so an unreadable overlay or an
 /// inaccessible store yields an empty list (nothing suppressed) rather than an
@@ -39,21 +54,34 @@ public sealed class ServerCertificateIdentity
 
     private readonly IHttpsCertificateStore _certificateStore;
     private readonly CertusOptions _certusOptions;
+    private readonly CertusInstanceMode _instanceMode;
     private readonly ILogger<ServerCertificateIdentity> _logger;
     private readonly object _gate = new();
 
-    private IReadOnlyList<string> _cached = [];
+    private Resolved _cached = Resolved.Empty;
     private DateTime _cachedAtUtc = DateTime.MinValue;
 
     public ServerCertificateIdentity(
         IHttpsCertificateStore certificateStore,
         IOptions<CertusOptions> certusOptions,
+        CertusInstanceMode instanceMode,
         ILogger<ServerCertificateIdentity> logger)
     {
         _certificateStore = certificateStore;
         _certusOptions = certusOptions.Value;
+        _instanceMode = instanceMode;
         _logger = logger;
     }
+
+    /// <summary>
+    /// Whether the expiry alerts should stay silent about this certificate: it is
+    /// one of ours, this service installed it, and automatic renewal will replace
+    /// it. The renewal half is checked first, because it costs nothing and, when it
+    /// is false, spares the store read.
+    /// </summary>
+    public bool IsSuppressedFromAlerts(string? serialNumber) =>
+        HttpsCertificateAutoRenewalService.IsActive(_certusOptions, _instanceMode)
+        && Contains(GetResolved().InstalledByService, serialNumber);
 
     /// <summary>
     /// The serial numbers of the server's own HTTPS certificates, in whatever
@@ -61,7 +89,25 @@ public sealed class ServerCertificateIdentity
     /// configured, on hosts that cannot read a certificate store, and on any
     /// failure.
     /// </summary>
-    public IReadOnlyList<string> GetOwnSerialNumbers()
+    public IReadOnlyList<string> GetOwnSerialNumbers() => GetResolved().Own;
+
+    /// <summary>
+    /// Whether <paramref name="serialNumber"/> is one of ours. Normalizes both
+    /// sides, so the CA database form and the X509 form match.
+    /// </summary>
+    public bool IsOwnCertificate(string? serialNumber) =>
+        Contains(GetResolved().Own, serialNumber);
+
+    /// <summary>Drop the cached answer, so the next read resolves again.</summary>
+    public void Invalidate()
+    {
+        lock (_gate)
+        {
+            _cachedAtUtc = DateTime.MinValue;
+        }
+    }
+
+    private Resolved GetResolved()
     {
         lock (_gate)
         {
@@ -74,35 +120,21 @@ public sealed class ServerCertificateIdentity
         }
     }
 
-    /// <summary>
-    /// Whether <paramref name="serialNumber"/> is one of ours. Normalizes both
-    /// sides, so the CA database form and the X509 form match.
-    /// </summary>
-    public bool IsOwnCertificate(string? serialNumber)
+    private static bool Contains(IReadOnlyList<string> serials, string? serialNumber)
     {
         if (string.IsNullOrWhiteSpace(serialNumber))
             return false;
 
-        var own = GetOwnSerialNumbers();
-        for (var i = 0; i < own.Count; i++)
+        for (var i = 0; i < serials.Count; i++)
         {
-            if (Adcs.SerialNumbers.NormalizedEquals(own[i], serialNumber))
+            if (Adcs.SerialNumbers.NormalizedEquals(serials[i], serialNumber))
                 return true;
         }
 
         return false;
     }
 
-    /// <summary>Drop the cached answer, so the next read resolves again.</summary>
-    public void Invalidate()
-    {
-        lock (_gate)
-        {
-            _cachedAtUtc = DateTime.MinValue;
-        }
-    }
-
-    private IReadOnlyList<string> Resolve()
+    private Resolved Resolve()
     {
         var thumbprints = new List<string>(2);
 
@@ -131,13 +163,18 @@ public sealed class ServerCertificateIdentity
         }
 
         var serials = new List<string>(thumbprints.Count);
+        var installedByService = new List<string>(thumbprints.Count);
         foreach (var thumbprint in thumbprints)
         {
             try
             {
                 using var certificate = _certificateStore.Find(thumbprint);
                 if (certificate is not null && !string.IsNullOrWhiteSpace(certificate.SerialNumber))
+                {
                     serials.Add(certificate.SerialNumber);
+                    if (HttpsCertificateOwnership.InstalledByService(certificate))
+                        installedByService.Add(certificate.SerialNumber);
+                }
             }
             catch (Exception ex)
             {
@@ -147,6 +184,15 @@ public sealed class ServerCertificateIdentity
             }
         }
 
-        return serials;
+        return new Resolved(serials, installedByService);
+    }
+
+    /// <summary>
+    /// The serial numbers of the server's own certificates, and the ones among them
+    /// this service installed. Resolved together so a single store read answers both.
+    /// </summary>
+    private sealed record Resolved(IReadOnlyList<string> Own, IReadOnlyList<string> InstalledByService)
+    {
+        public static readonly Resolved Empty = new([], []);
     }
 }
