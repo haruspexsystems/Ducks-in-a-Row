@@ -13,6 +13,19 @@ what is served.
 - **No trackers and no scripts.** The product promises that nothing phones home,
   and its website keeps the same promise. The sign-up form needs no exception: it
   is a plain HTML form that posts to our own list server, `lists.ducksinarow.dev`.
+- **Every request stays on this domain.** Fonts and images are served from
+  `/assets`, never from a font service or a CDN. The two fonts are the dashboard's
+  own, Hanken Grotesk and JetBrains Mono, latin subset, under the SIL Open Font
+  License; their licence files sit beside them and must stay there.
+- **One header and one footer.** Every page carries the same header and footer,
+  copied from `index.html`. Change them on every page together.
+- **The look follows the dashboard.** The colours in `site.css` are the product's
+  (slate chrome, duck yellow for the one highlight, teal for links). Yellow is a
+  fill behind slate text or a highlight on the dark band, never text on white,
+  so every pairing passes WCAG AA.
+- **No lab names in pictures either.** `assets/dashboard.webp` and `.png` are a
+  dashboard capture with the CA name removed. A new screenshot shows RFC 2606 names
+  only and no host, CA or domain from a lab.
 - **The sign-up forms are a contract with the list server.** `download.html` and
   `notices.html` carry the same two `l` values, the UUIDs of the Security notices
   and Newsletter lists. The list server redirects to `next` only when it matches a
@@ -46,7 +59,10 @@ what is served.
 | `problems/<slug>.html` | One page per problem type, served at `/problems/<slug>` |
 | `404.html` | Served by GitHub Pages for any address with no page |
 | `assets/site.css` | The only stylesheet |
-| `assets/duck-128.png`, `assets/duck-256.png` | The mascot on the home page, at 1x and 2x |
+| `assets/fonts/` | The two self-hosted fonts and their OFL licence files |
+| `assets/dashboard.webp`, `assets/dashboard.png` | The dashboard screenshot in the home page's hero, WebP with a PNG fallback |
+| `assets/duck-128.png` | The mascot in the header and footer of every page |
+| `assets/duck-256.png` | The mascot at 2x; no page uses it since the redesign, kept for links from elsewhere |
 | `assets/og-image.png` | The 1200 by 630 picture link previews show, named by the home page's `og:image` |
 | `favicon.ico`, `apple-touch-icon.png` | The site icons; browsers fetch both from the root on every page, so no page links them |
 | `.nojekyll` | Tells GitHub Pages to serve the files as they are |
