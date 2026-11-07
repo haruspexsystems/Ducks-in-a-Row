@@ -191,8 +191,9 @@ header.site nav a {
 header.site nav a:hover { color: var(--band-ink); }
 header.site nav a.btn { color: var(--band); }
 
-/* On a phone the bar keeps the brand, the docs and the download; the footer has the rest. */
-@media (max-width: 48rem) {
+/* Below about 900px the section links no longer fit beside the brand, so the bar keeps the
+   brand, the docs and the download; the footer and the page itself have the rest. */
+@media (max-width: 56rem) {
   header.site nav .wide { display: none; }
   header.site nav ul { gap: 1rem; }
 }
@@ -363,6 +364,13 @@ header.site nav a.btn { color: var(--band); }
   padding: 0;
   list-style: none;
 }
+
+/* Two up from tablet width: the security and sovereignty cards carry longer text. */
+.cards.pair { grid-template-columns: 1fr; }
+@media (min-width: 48rem) {
+  .cards.pair { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+.callout + .cards { margin-top: 1rem; }
 
 .card {
   background: var(--surface);
