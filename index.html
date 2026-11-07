@@ -27,7 +27,10 @@
     <nav aria-label="Main">
       <ul>
         <li class="wide"><a href="/#features">Features</a></li>
-        <li class="wide"><a href="/#crl">CRL monitoring</a></li>
+        <li class="wide"><a href="/#acme">ACME</a></li>
+        <li class="wide"><a href="/#certificates">Certificates</a></li>
+        <li class="wide"><a href="/#crl">CRL</a></li>
+        <li class="wide"><a href="/#security">Security</a></li>
         <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/README.md">Docs</a></li>
         <li class="wide"><a href="https://github.com/haruspexsystems/Ducks-in-a-Row">GitHub</a></li>
         <li><a class="btn btn-primary btn-small" href="/download">Download</a></li>
@@ -40,9 +43,9 @@
 <section class="hero">
   <div class="wrap">
     <p class="pill"><span>Source available</span><span>Free core</span><span>No telemetry</span></p>
-    <h1>ACME, expiry alerts and CRL monitoring. <span class="hl">For the ADCS you already run.</span></h1>
-    <p class="lead">If you run Active Directory Certificate Services (ADCS) with a small team,
-    certificate renewals tend to live in scripts and calendar reminders.
+    <h1>No quack remedies. <span class="hl">Certificate management for ADCS that just goes with the flow.</span></h1>
+    <p class="lead">Are you running Active Directory Certificate Services (ADCS) and still managing
+    certificate renewals with improvised scripts and calendar reminders?
     <strong>Ducks in a Row is one Windows service in front of the ADCS certificate authority you
     already run.</strong> Your machines, domain joined or not, request and renew their own
     certificates from it with a standard ACME client.</p>
@@ -68,14 +71,14 @@
 
 <div class="wrap">
   <ul class="trust">
-    <li><strong>Code signed</strong><span>Both installers and every binary the MSI installs, by
-    Haruspex Systems B.V., timestamped.</span></li>
-    <li><strong>A bill of materials</strong><span>Every release carries a software bill of
-    materials.</span></li>
-    <li><strong>Security fixes until 2031</strong><span>Free to everyone, with or without a
-    subscription.</span></li>
-    <li><strong>Apache 2.0 after four years</strong><span>Each version of the core, under the
-    Business Source License 1.1 until then.</span></li>
+    <li><strong>ACME server</strong><span>A COM native, RFC 8555 compliant ACME server with modern
+    challenge types supported.</span></li>
+    <li><strong>Certificate management</strong><span>An intuitive dashboard for managing the ADCS
+    certificate inventory.</span></li>
+    <li><strong>Expiry alerts</strong><span>Expiry monitoring and alerting with mail and
+    webhooks.</span></li>
+    <li><strong>Quick installation</strong><span>Get up and running quickly with our streamlined,
+    code-signed installer.</span></li>
   </ul>
 </div>
 
@@ -120,40 +123,14 @@
   </div>
 </section>
 
-<section class="section" id="crl">
-  <div class="wrap split">
-    <div class="prose">
-      <span class="kicker">CRL monitoring</span>
-      <h2>The CRL nobody has in a calendar</h2>
-      <p>A certificate that expires breaks one service. A certificate revocation list that
-      expires breaks revocation checking for everything its CA ever signed, all at once, and for
-      an offline root nothing automatic replaces it.</p>
-      <p>Ducks in a Row watches every CRL in the chain of the CA you connect it to, the offline
-      root's included. It reads them from the CA itself and from the distribution points over
-      LDAP and HTTP, and it watches each copy separately: a root CRL renewed into the directory
-      but never copied to the web server is reported, with the location named.</p>
-    </div>
-    <div class="card schedule">
-      <h3>Warnings for a CRL published by hand</h3>
-      <ol class="steps-line" aria-label="Days before the CRL expires">
-        <li><b>30</b>days</li>
-        <li><b>14</b>days</li>
-        <li><b>7</b>days</li>
-        <li><b>1</b>day</li>
-      </ol>
-      <p>A CRL published by hand gets warnings 30, 14, 7 and 1 days before it expires, by
-      default. A CRL your CA replaces on a timer stays quiet unless the CA misses its own
-      schedule, and warns again if it expires. The warnings go out by email and webhook, like
-      certificate expiry, and they are part of the free core.</p>
-    </div>
-  </div>
-</section>
-
-<section class="section" id="how">
+<section class="section" id="acme">
   <div class="wrap">
     <div class="section-head">
-      <span class="kicker">How it works</span>
+      <span class="kicker">ACME server</span>
       <h2>Three steps to the first certificate</h2>
+      <p>Ducks in a Row is an RFC 8555 ACME server that talks to your CA through the CA's own COM
+      interface. Clients prove control of a name with http-01, dns-01 or tls-alpn-01, and managed
+      devices with device-attest-01. External account binding keeps each team to its own names.</p>
     </div>
     <ol class="how">
       <li>
@@ -180,16 +157,141 @@
   </div>
 </section>
 
-<section class="section">
+<section class="section" id="certificates">
+  <div class="wrap">
+    <div class="section-head">
+      <span class="kicker">Certificate management</span>
+      <h2>Your whole ADCS inventory in one place</h2>
+      <p>The dashboard reads every certificate your CA has issued, not only the ones it issued
+      over ACME, and keeps that inventory in step with the CA.</p>
+    </div>
+    <ul class="cards pair">
+      <li class="card">
+        <h3>Totals and trends</h3>
+        <p>Certificates by status, certificates issued per day over the last 30 days, and the
+        health of the fleet at a glance.</p>
+      </li>
+      <li class="card">
+        <h3>Search and filter</h3>
+        <p>Find a certificate in the inventory and narrow the list by status, from valid to
+        expiring, expired and revoked.</p>
+      </li>
+      <li class="card">
+        <h3>Revoke within a scope you set</h3>
+        <p>Revoke a TLS certificate from the dashboard. By default only the certificates Ducks in
+        a Row manages can be revoked, and you decide whether to widen that.</p>
+      </li>
+      <li class="card">
+        <h3>An audit trail</h3>
+        <p>Every change an administrator makes in the dashboard is recorded, with who made it and
+        when.</p>
+      </li>
+    </ul>
+  </div>
+</section>
+
+<section class="section" id="crl">
+  <div class="wrap split">
+    <div class="prose">
+      <span class="kicker">CRL monitoring</span>
+      <h2>The CRL nobody is paying attention to</h2>
+      <p>A certificate that expires breaks one service. A certificate revocation list that
+      expires breaks revocation checking for everything its CA ever signed, all at once, and for
+      an offline root nothing automatic replaces it.</p>
+      <p>Ducks in a Row watches every CRL in the chain of the CA you connect it to, the offline
+      root's included. It reads them from the CA itself and from the distribution points over
+      LDAP and HTTP, and it watches each copy separately: a root CRL renewed into the directory
+      but never copied to the web server is reported, with the location named.</p>
+    </div>
+    <div class="card schedule">
+      <h3>Warnings for a CRL published by hand</h3>
+      <ol class="steps-line" aria-label="Days before the CRL expires">
+        <li><b>30</b>days</li>
+        <li><b>14</b>days</li>
+        <li><b>7</b>days</li>
+        <li><b>1</b>day</li>
+      </ol>
+      <p>A CRL published by hand gets warnings 30, 14, 7 and 1 days before it expires, by
+      default. A CRL your CA replaces on a timer stays quiet unless the CA misses its own
+      schedule, and warns again if it expires. The warnings go out by email and webhook, like
+      certificate expiry, and they are part of the free core.</p>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="security">
+  <div class="wrap">
+    <div class="section-head">
+      <span class="kicker">Security</span>
+      <h2>Built to be checked</h2>
+      <p>A tool that sits in front of your certificate authority has to earn its place. Here is
+      what you can verify for yourself.</p>
+    </div>
+    <ul class="cards pair">
+      <li class="card">
+        <h3>Code signed</h3>
+        <p>Both installers and every binary the MSI installs are signed by Haruspex Systems B.V.,
+        and timestamped.</p>
+      </li>
+      <li class="card">
+        <h3>A bill of materials</h3>
+        <p>Every release carries a software bill of materials in CycloneDX format, so you can
+        check what is inside before you install it.</p>
+      </li>
+      <li class="card">
+        <h3>Security fixes</h3>
+        <p>Ducks in a Row receives security fixes until 31 December 2031, at least five years after
+        1.0.0 became generally available, delivered through upgrades to the latest release, with no
+        backports.</p>
+        <p>Security fixes are free to everyone, with or without a subscription. To hear about each
+        one, <a href="/notices">sign up for security notices</a>. Report a vulnerability to
+        <a href="mailto:security@haruspex.systems">security@haruspex.systems</a>, as the
+        <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/SECURITY.md">security
+        policy</a> describes.</p>
+      </li>
+      <li class="card">
+        <h3>License</h3>
+        <p>Ducks in a Row is published under the Business Source License 1.1. It is source available
+        and free in production on infrastructure you own or operate, or administer for customers as
+        part of a managed IT service. Each version of the core becomes Apache License 2.0 four years
+        after its release. Reselling it, or hosting it as a competing product, needs a commercial
+        license. <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/LICENSING.md">Licensing
+        in plain language</a>.</p>
+      </li>
+    </ul>
+  </div>
+</section>
+
+<section class="section" id="privacy">
   <div class="wrap">
     <div class="callout">
-      <span class="kicker">Privacy</span>
+      <span class="kicker">Privacy and sovereignty</span>
       <h2>No telemetry. Ever.</h2>
       <p>Ducks in a Row runs entirely on your own servers and never sends data back to us or to
       anyone else. Fonts and other assets are bundled with the app, so the dashboard makes no
       third party requests. A tool that sits in front of your certificate authority should not be
       watching you, and this one does not.</p>
     </div>
+    <ul class="cards pair">
+      <li class="card">
+        <h3>Sovereign by design</h3>
+        <p>Ducks in a Row is published by Haruspex Systems B.V., a company based in the
+        Netherlands. It runs entirely on Windows servers you control, beside the CA you already
+        run: no cloud service, no tenant and no account with us. The free core needs no licence key
+        or activation, and the installer carries its own runtime, so it installs and runs on a
+        network with no route to the internet. The source of the core is available, so you can
+        read every line of it before it goes in front of your CA.</p>
+      </li>
+      <li class="card">
+        <h3>The Cyber Resilience Act</h3>
+        <p>The EU Cyber Resilience Act classes certificate issuance software as an important
+        product, Class I. Its main obligations apply from 11 December 2027, and we are working to
+        meet them before then. In place today: we report actively exploited vulnerabilities and
+        severe incidents to ENISA as Article 14 requires, every release carries a software bill of
+        materials, security fixes are promised until 31 December 2031, and vulnerabilities reach
+        us through a published coordinated disclosure policy.</p>
+      </li>
+    </ul>
   </div>
 </section>
 
@@ -230,38 +332,16 @@
 </section>
 
 <section class="section">
-  <div class="wrap trio">
-    <div>
-      <h3>Support</h3>
-      <p>Community help is free in
-      <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/discussions">GitHub Discussions</a>.
-      A support subscription gives your organisation a first reply from a person by the end of
-      the next business day, as a response target with no penalties. It is available on Free and
-      Standard, and included in Compliance; ask
-      <a href="mailto:licensing@haruspex.systems">licensing@haruspex.systems</a>. The
-      <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/SUPPORT.md">support
-      page</a> has the details.</p>
-    </div>
-    <div>
-      <h3>Security fixes</h3>
-      <p>Ducks in a Row receives security fixes until 31 December 2031, at least five years after
-      1.0.0 became generally available, delivered through upgrades to the latest release, with no
-      backports.</p>
-      <p>Security fixes are free to everyone, with or without a subscription. To hear about each
-      one, <a href="/notices">sign up for security notices</a>. Report a vulnerability to
-      <a href="mailto:security@haruspex.systems">security@haruspex.systems</a>, as the
-      <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/SECURITY.md">security
-      policy</a> describes.</p>
-    </div>
-    <div>
-      <h3>License</h3>
-      <p>Ducks in a Row is published under the Business Source License 1.1. It is source available
-      and free in production on infrastructure you own or operate, or administer for customers as
-      part of a managed IT service. Each version of the core becomes Apache License 2.0 four years
-      after its release. Reselling it, or hosting it as a competing product, needs a commercial
-      license. <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/LICENSING.md">Licensing
-      in plain language</a>.</p>
-    </div>
+  <div class="wrap prose">
+    <h3>Support</h3>
+    <p>Community help is free in
+    <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/discussions">GitHub Discussions</a>.
+    A support subscription gives your organisation a first reply from a person by the end of
+    the next business day, as a response target with no penalties. It is available on Free and
+    Standard, and included in Compliance; ask
+    <a href="mailto:licensing@haruspex.systems">licensing@haruspex.systems</a>. The
+    <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/SUPPORT.md">support
+    page</a> has the details.</p>
   </div>
 </section>
 
