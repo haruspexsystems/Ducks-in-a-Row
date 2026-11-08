@@ -150,8 +150,8 @@ $NeverInstalledFiles = @(
 # cached in installer/redist (gitignored) so later builds reuse it. Always
 # bump the version and the hash together; the published hash for each release
 # is in https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json
-$HostingBundleVersion = "10.0.10"
-$HostingBundleSha512 = "11e66d71e01a32794051437124df4f63585d40ff80b837a9520e4a0bf9ce18b750765e25398b42455745183b972fa0541426fdf4f9ea253d61e129302f21460e"
+$HostingBundleVersion = "10.0.14"
+$HostingBundleSha512 = "cc61e2a043319e2a8a4105cb6eb242855375ee5c165ed94478cb01330940139f5c100429317b31fa85d6a7d579df61cd929697371db78333b482474ceb9fd32f"
 $HostingBundleUrl = "https://builds.dotnet.microsoft.com/dotnet/aspnetcore/Runtime/$HostingBundleVersion/dotnet-hosting-$HostingBundleVersion-win.exe"
 $RedistDir = Join-Path $InstallerDir "redist"
 $HostingBundleExe = Join-Path $RedistDir "dotnet-hosting-$HostingBundleVersion-win.exe"

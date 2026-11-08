@@ -6,13 +6,56 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-07
+
+1.1.1 is a security patch with no new features: the setup bundle now brings
+the ASP.NET Core 10 runtime up to 10.0.14. Upgrade soon any server whose runtime
+is older than 10.0.13, which includes a 1.0.0 or 1.1.0 server that kept the
+runtime its setup installed; updating .NET 10 yourself fixes the runtime as
+well. No database migrations run. The setup never restarts the server for the
+runtime, but ASP.NET Core sites in IIS on the same server restart.
+
+### Security
+
+- The setup bundle now brings the ASP.NET Core 10 runtime up to 10.0.14, on an
+  upgrade as well as a new install. Before 10.0.13 the runtime has
+  CVE-2026-88092: anyone who can reach the server could disrupt requests to it,
+  and behind a reverse proxy could also get requests past the proxy's checks.
+  Affects 1.0.0 and 1.1.0 on that runtime. This fixes the 1.1.0 Known Issue.
+
+### Changed
+
+- When the setup updates the runtime, ASP.NET Core sites in IIS on the server
+  restart. The setup never restarts the server for the runtime; if the runtime
+  asks for a restart, the setup log says so, as
+  [Installation](docs/installation.md) describes.
+
+### Known Issues
+
+- **An expiry alert that fails to send is not sent again.** If the mail server
+  or webhook is down when a certificate crosses a threshold, that warning is
+  lost; the next threshold still fires, but an outage at the last one leaves
+  none. Check the Alerts card for failed sends, and use its test send after any
+  change to the mail server or webhook.
+- **A flood of requests can push the oldest log files out.** Anyone able to
+  reach the server can make it write enough log to roll older files away, so
+  history is lost; the log is no longer silenced. Forward the log to a separate
+  system as it is written if you need it. Advisory: GHSA-6c3m-7m5r-3xqc.
+
+### Verify the download
+
+`SHA256SUMS` lists the SHA-256 of each file, and `Ducks-in-a-Row-1.1.1.cdx.json`
+is the software bill of materials. `Get-AuthenticodeSignature` should name
+Haruspex Systems B.V. as the signer; see
+[Check the download](docs/installation.md#check-the-download).
+
 ## [1.1.0] - 2026-11-05
 
 1.1.0 fixes vulnerabilities in 1.0.0, three rated High, so upgrade every server
 soon. It also adds features: with the time and people we have, separating them
 would have delayed the fixes, so this once they ship together; the next
 security fix comes as a 1.1.x patch with no new features. Back up the data
-folder and read [Upgrading](docs/installation.md#upgrading) first: three
+folder and read [Upgrading](docs/installation.md#upgrading) first: four
 database migrations run, finished orders are deleted after 90 days, a
 `Certus:DatabasePath` outside the data folder stops the service, and the
 fallback HTTPS certificate is replaced.
@@ -167,6 +210,9 @@ fallback HTTPS certificate is replaced.
   reach the server can make it write enough log to roll older files away, so
   history is lost; the log is no longer silenced. Forward the log to a separate
   system as it is written if you need it. Advisory: GHSA-6c3m-7m5r-3xqc.
+- **ASP.NET Core 10 before 10.0.13 has CVE-2026-88092**, and the setup bundle
+  installs 10.0.10: Medium 5.3 for Ducks, higher behind a reverse proxy. Update
+  .NET 10.
 
 ### Verify the download
 

@@ -744,7 +744,7 @@ There are two ways forward:
 
   ```powershell
   msiexec /i Ducks-in-a-Row.msi /qn ALLOW_INCOMPATIBLE_MODULE=1
-  Ducks-in-a-Row-Setup.exe /quiet ALLOW_INCOMPATIBLE_MODULE=1
+  Ducks-in-a-Row-Setup.exe /quiet /norestart ALLOW_INCOMPATIBLE_MODULE=1
   ```
 
 The interactive wizard asks instead, on its first page. The setup bundle's

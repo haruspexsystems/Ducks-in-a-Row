@@ -18,9 +18,9 @@
   the pinned Hosting Bundle exe into installer/redist first):
     wix build installer/Bundle.wxs
       -d ProductVersion=1.0.0.0
-      -d HostingBundleVersion=10.0.10
+      -d HostingBundleVersion=<HostingBundleVersion from build.ps1>
       -d HostingBundleMajor=10
-      -d HostingBundleExe=installer/redist/dotnet-hosting-10.0.10-win.exe
+      -d HostingBundleExe=installer/redist/dotnet-hosting-<that version>-win.exe
       -d MsiPath=artifacts/Ducks-in-a-Row.msi
       -o artifacts/Ducks-in-a-Row-Setup.exe
       -ext WixToolset.Bal.wixext -ext WixToolset.Netfx.wixext -arch x64
@@ -87,9 +87,11 @@
       runtime with the pinned major version, or leaves it undefined when none
       exists. This checks the runtime itself (Microsoft.AspNetCore.App), which
       is the right check for a Kestrel service; IIS and ANCM are not involved.
-      HostingBundleMajor comes from build.ps1, derived from the same pin as
-      the payload, so the search, the detect floor below, and the embedded exe
-      can never drift apart when the runtime major moves.
+      The search keeps the highest version of the major it finds (WiX
+      netcoresearch), so one older patch beside a current one does not count.
+      HostingBundleMajor and HostingBundleVersion come from build.ps1, derived
+      from the same pin as the payload, so the search, the detect floor below,
+      and the embedded exe can never drift apart.
     -->
     <netfx:DotNetCoreSearch Id="AspNetCoreRuntimeSearch"
                             RuntimeType="aspnet"
@@ -102,11 +104,40 @@
         The shared runtime. Permanent: uninstalling Ducks in a Row must never
         rip the runtime out from under other applications, and Windows Update
         services it from here on (so no UninstallArguments either).
-        DetectCondition skips the install when any 10.0.x runtime at or above
-        the floor is already present; an undefined search variable makes the
-        condition false, so a clean box installs. Exit codes: 3010 means
-        success but a reboot is wanted (offer it at the end of the chain);
-        1641 means the installer already started a reboot.
+        DetectCondition skips the install only when the installed runtime is
+        at or above the pinned version itself, so an upgrade also brings an
+        older 10.0.x up to the patch this release embeds (issue #760). Until
+        then the floor was the major alone, and a server set up by an earlier
+        release kept its old runtime. An undefined search variable makes the
+        condition false, so a clean box installs. Measured on Server 2019 on
+        2026-11-07 (1.1.0 on 10.0.10 upgraded by a 10.0.14 bundle): the newer
+        Hosting Bundle uninstalls the older one, so 10.0.10 is gone afterwards,
+        and it replaces ANCM without restarting IIS, but Restart Manager stops
+        any w3wp that has ANCM loaded, which starts again on its next request.
+
+        Exit codes 3010 (a restart is wanted) and 1641 (a restart was started)
+        both count as plain success, so this package never tells Burn that a
+        restart is due and the runtime update never makes the setup restart
+        the server (decided 2026-11-07). WixStdBA takes its restart policy
+        from the command line alone: under /quiet or /passive with no
+        /norestart it restarts the
+        server on its own as soon as any package reports one (balinfo.cpp
+        106-109, WixStandardBootstrapperApplication.cpp 1318-1321 in v4.0.6),
+        and no bundle setting changes that. Mapping the codes here is the one
+        lever authoring has; the price is that a restart this runtime asks for
+        is not reported: the setup exits 0 and the full UI shows no restart
+        message, and only the Burn log line for this package names the code.
+        1641 is mapped too because forceReboot stops the chain (apply.cpp 776),
+        so the Ducks in a Row MSI would not install before a restart. We pass
+        /norestart, so the runtime installer should never return 1641; if it
+        did, it started that restart itself and nothing here could stop it.
+        Leaving the ExitCode elements out is not the same: Burn treats an
+        unmapped 3010 or 1641 as a restart (exeengine.cpp 975-993).
+        Not covered: neither an MsiPackage nor the removal of the previous
+        Ducks in a Row bundle (a related bundle Burn uninstalls on upgrade)
+        takes an ExitCode, so if the MSI or that removal reports 3010 (a file
+        stays in use) WixStdBA's policy applies again. That is why the docs
+        keep /norestart on unattended runs.
       -->
       <ExePackage Id="AspNetCoreHostingBundle"
                   DisplayName="ASP.NET Core $(var.HostingBundleVersion) Hosting Bundle (x64)"
@@ -114,10 +145,10 @@
                   Compressed="yes"
                   Permanent="yes"
                   Vital="yes"
-                  DetectCondition="AspNetCoreRuntimeVersion &gt;= v$(var.HostingBundleMajor).0.0"
+                  DetectCondition="AspNetCoreRuntimeVersion &gt;= v$(var.HostingBundleVersion)"
                   InstallArguments="/install /quiet /norestart">
-        <ExitCode Value="3010" Behavior="scheduleReboot" />
-        <ExitCode Value="1641" Behavior="forceReboot" />
+        <ExitCode Value="3010" Behavior="success" />
+        <ExitCode Value="1641" Behavior="success" />
       </ExePackage>
 
       <!--

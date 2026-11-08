@@ -4,13 +4,30 @@ Two ways to install. Use the setup bundle unless you have a reason not to.
 
 | Installer | What it does | When to use it |
 |---|---|---|
-| `Ducks-in-a-Row-Setup.exe` | Installs the ASP.NET Core 10 runtime if it is missing, then runs the MSI | Almost always, including on servers with no internet access |
+| `Ducks-in-a-Row-Setup.exe` | Installs or updates the ASP.NET Core 10 runtime when the server's is missing or older, then runs the MSI | Almost always, including on servers with no internet access |
 | `Ducks-in-a-Row.msi` | The application only. Fails to start if the runtime is absent | Deployment systems that manage the runtime themselves |
 
 The setup bundle carries the runtime inside it, so an offline server installs
-from the one file. It detects an existing ASP.NET Core 10 runtime and skips the
-install when one is present, and it never removes the runtime on uninstall,
-because other applications on the server may be using it.
+from the one file. It installs that runtime, as the full ASP.NET Core Hosting
+Bundle with the ASP.NET Core Module for IIS, when the server has no ASP.NET Core
+10 runtime or only an older update of it, which it replaces, and skips it when
+the server already has the same update or a later one. It never
+removes the runtime on uninstall, because other applications on the server may
+be using it.
+
+Two things to know when the bundle installs or updates the runtime:
+
+- **ASP.NET Core sites in IIS restart.** On a server that already has the
+  runtime, IIS itself keeps running, but the worker processes that host ASP.NET
+  Core sites are stopped while the ASP.NET Core Module is replaced, and start
+  again on their next request. Run the setup in a quiet period on such a server.
+- **The setup never restarts the server for the runtime.** The runtime
+  installer can ask for a restart, for example when a file it replaces is in
+  use. The setup then carries on, installs Ducks in a Row, and finishes as a
+  success (exit code 0) with no restart prompt. The only sign is in the setup
+  log: the line for the `AspNetCoreHostingBundle` package says
+  `exited with code: 0xbc2` (3010). If you find it, restart the server when it
+  suits you, so the runtime update is complete.
 
 The bare MSI does not install the runtime. Without it the service fails before
 any managed code runs, and the installer reports **Error 1920**, which almost
@@ -132,8 +149,14 @@ The setup bundle passes the same five properties to the MSI. Give them on its ow
 command line:
 
 ```powershell
-Ducks-in-a-Row-Setup.exe /quiet MONITOR_ONLY=1 START_SERVICE=0 /log "C:\temp\ducks-bundle.log"
+Ducks-in-a-Row-Setup.exe /quiet /norestart MONITOR_ONLY=1 START_SERVICE=0 /log "C:\temp\ducks-bundle.log"
 ```
+
+Keep `/norestart` on unattended runs of the setup bundle. The runtime update
+never restarts the server, but the Ducks in a Row installer itself can still ask
+for a restart if a file it replaces stays in use. With `/norestart` the setup
+then exits with code 3010 and you restart when it suits you; without it,
+`/quiet` and `/passive` restart the server for that. Exit code 0 means done.
 
 ## If the service stops
 
@@ -215,8 +238,9 @@ To upgrade:
    the checksum, exactly as for a first install.
 3. Run the new `Ducks-in-a-Row-Setup.exe` on the server, over the existing
    installation, interactively or unattended with the same command as a fresh
-   install. The bundle installs the ASP.NET Core runtime first when the server
-   has none of the major version the release needs; the bare MSI never does,
+   install. The bundle first brings the ASP.NET Core runtime up to the update
+   it carries when the server's is missing or older; the start of this page
+   says what that means for IIS sites and a restart. The bare MSI never does,
    so with the MSI, install the runtime the release notes name before you run
    it. The wizard shows the
    folders chosen before and the monitor mode box as the server has it, so

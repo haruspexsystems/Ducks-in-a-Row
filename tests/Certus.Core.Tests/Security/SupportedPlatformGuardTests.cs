@@ -33,8 +33,9 @@ namespace Certus.Core.Tests.Security;
 /// by <c>build.ps1</c>, derived from the same pin as the payload, so what this
 /// test reads there is the documented build invocation in the file's header,
 /// the one place in the file that states the major, plus the two uses of the
-/// define (the runtime search and the detect floor), which must stay references
-/// to it rather than become literals.</para>
+/// defines (the runtime search, which takes the major, and the detect floor,
+/// which takes the whole pinned version), which must stay references to them
+/// rather than become literals.</para>
 ///
 /// <para>Every file read here ships in the public source snapshot, so the test
 /// runs there too and needs no git.</para>
@@ -113,15 +114,22 @@ public class SupportedPlatformGuardTests
             $"the Hosting Bundle major documented in {BundleSource} is pinned, because {Rule}");
 
         // What holds the bundle to the build script's pin is that the runtime
-        // search and the detect floor take the major from the define rather than
-        // authoring one. A literal there would let the embedded payload and the
-        // floor drift apart with no pin reading it, so both uses are checked.
+        // search and the detect floor take their values from the defines rather
+        // than authoring them. A literal there would let the embedded payload and
+        // the floor drift apart with no pin reading it, so both uses are checked.
+        // The floor is the whole pinned version, not the major alone, so an
+        // upgrade brings an older patch of the runtime up to the one embedded
+        // (#760); a floor of the major would skip any 10.0.x already present.
         text.Should().Contain("MajorVersion=\"$(var.HostingBundleMajor)\"",
             $"the runtime search in {BundleSource} must take its major from the HostingBundleMajor " +
             $"define build.ps1 passes, never a literal, because {Rule}");
-        text.Should().Contain("v$(var.HostingBundleMajor).0.0",
-            $"the detect floor in {BundleSource} must take its major from the HostingBundleMajor " +
-            $"define build.ps1 passes, never a literal, because {Rule}");
+        text.Should().Contain("DetectCondition=\"AspNetCoreRuntimeVersion &gt;= v$(var.HostingBundleVersion)\"",
+            $"the detect floor in {BundleSource} must be the whole pinned version from the " +
+            $"HostingBundleVersion define build.ps1 passes, never a literal and never the major " +
+            $"alone, so an upgrade brings an older runtime patch up to the one embedded (#760)");
+        text.Should().NotContain("v$(var.HostingBundleMajor).0.0",
+            $"a detect floor of the major alone in {BundleSource} skips the embedded runtime on any " +
+            $"server that already has an older patch, so an upgrade never patches it (#760)");
     }
 
     [Fact]

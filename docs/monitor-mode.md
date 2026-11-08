@@ -71,7 +71,7 @@ Unattended, set `MONITOR_ONLY=1`, on the MSI or on the setup bundle:
 
 ```powershell
 msiexec /i Ducks-in-a-Row.msi /qn MONITOR_ONLY=1 /l*v "C:\temp\ducks-install.log"
-Ducks-in-a-Row-Setup.exe /quiet MONITOR_ONLY=1 /log "C:\temp\ducks-bundle.log"
+Ducks-in-a-Row-Setup.exe /quiet /norestart MONITOR_ONLY=1 /log "C:\temp\ducks-bundle.log"
 ```
 
 The installer records the choice as the registry value `Mode`, a `REG_SZ` of
