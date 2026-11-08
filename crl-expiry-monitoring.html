@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0c1322">
+<title>ADCS CRL expiry monitoring | Ducks in a Row</title>
+<meta name="description" content="Warnings by email or webhook before an ADCS certificate revocation list expires, the offline root's included, with every LDAP and HTTP copy watched.">
+<link rel="canonical" href="https://ducksinarow.dev/crl-expiry-monitoring">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Ducks in a Row">
+<meta property="og:title" content="ADCS CRL expiry monitoring | Ducks in a Row">
+<meta property="og:description" content="Warnings by email or webhook before an ADCS certificate revocation list expires, the offline root's included, with every LDAP and HTTP copy watched.">
+<meta property="og:url" content="https://ducksinarow.dev/crl-expiry-monitoring">
+<meta property="og:image" content="https://ducksinarow.dev/assets/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="The Ducks in a Row mascot, a winking yellow duck in a knight's helmet.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="/"><img src="/assets/duck-128.png" width="30" height="30" alt=""><span>Ducks in a Row</span></a>
+    <nav aria-label="Main">
+      <ul>
+        <li class="wide"><a href="/#features">Features</a></li>
+        <li class="wide"><a href="/#acme">ACME</a></li>
+        <li class="wide"><a href="/#certificates">Certificates</a></li>
+        <li class="wide"><a href="/#crl">CRL</a></li>
+        <li class="wide"><a href="/#security">Security</a></li>
+        <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/README.md">Docs</a></li>
+        <li class="wide"><a href="https://github.com/haruspexsystems/Ducks-in-a-Row">GitHub</a></li>
+        <li><a class="btn btn-primary btn-small" href="/download">Download</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<main id="main" class="page">
+<div class="wrap prose">
+<p class="pill light"><span>CRL monitoring</span></p>
+<h1>Know before a CRL expires, the offline root's included</h1>
+<p class="lead">A certificate that expires breaks one service. A certificate revocation list
+that expires breaks revocation checking for everything its CA ever signed, all at once:
+domain controllers, VPN and wireless authentication, and the CA's own service. Ducks in a Row
+watches every CRL in your CA's chain and warns you by email or webhook before one goes
+stale.</p>
+<div class="cta">
+  <a class="btn btn-primary" href="/download">Download</a>
+  <a class="btn btn-quiet" href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/alerts.md#revocation-lists">Read how it works</a>
+</div>
+
+<h2>Why the offline root is the dangerous one</h2>
+<p>An issuing CA replaces its own CRL on a timer. An offline root's CRL is published by hand,
+expires on a schedule of its own, and nothing automatic replaces it. The root is switched off
+and easy to forget, so its CRL is the one nobody has in a calendar.</p>
+
+<h2>Every copy, watched separately</h2>
+<p>Ducks in a Row reads the connected CA's own CRLs from the CA itself and from the locations
+the CA tells its clients to read. It reads the CRL above it, on a two tier estate the offline
+root's, from the distribution points on the CA's certificate, over both LDAP and HTTP. Every
+copy is checked against the certificate of the CA that should have signed it, and one that
+does not verify is ignored.</p>
+<p>Each copy is watched on its own. A root CRL renewed into the directory but never copied to
+the web server leaves every client that reads the HTTP location failing while the domain
+looks healthy. Ducks in a Row warns about the stale copy, names the location, and says that a
+newer CRL already exists elsewhere.</p>
+
+<h2>When it warns</h2>
+<table class="plain">
+  <thead>
+    <tr><th scope="col">The CRL is</th><th scope="col">What you get</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Replaced by a CA on a timer</td><td>One warning when the CA misses its own scheduled
+    publication, and one when the CRL actually expires</td></tr>
+    <tr><td>Published by hand, such as an offline root's</td><td>Warnings 30, 14, 7 and 1 days
+    before it expires by default, then one when it expires</td></tr>
+  </tbody>
+</table>
+<p>A CRL on a timer gets no countdown, because a Windows CA's weekly CRL would trip it several
+times a week while the CA does exactly what it should. Publishing a new CRL resets the
+warnings. A distribution point that cannot be reached silences nothing: the warnings continue
+against the last copy read, and say when that was.</p>
+
+<h2>Where the warnings go</h2>
+<p>By email through your own SMTP relay, set up from the Settings page, and by webhook: an
+HTTP POST signed with HMAC-SHA256, with the events <code>crl.expiring</code>,
+<code>crl.overdue</code> and <code>crl.expired</code>. A CRL payload names the issuing CA, the
+CRL number, when it expires and every location it is served from. The Revocation lists card
+on the Settings page shows every CRL being watched and what was last read from each
+location.</p>
+
+<h2>Watch a production CA without writing to it</h2>
+<p>In <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/monitor-mode.md">monitor
+mode</a> Ducks in a Row never writes to the CA: no ACME, no issuance, no revocation. The CA
+team grants a read right, and you get the certificate inventory, expiry alerts and CRL
+watching. Turning issuance on later is a rights grant, a registry value and a restart, never a
+reinstall.</p>
+<p>CRL monitoring and monitor mode are part of the free core, on a production CA too. An
+installation connects to one CA and watches the CRLs in that CA's chain. Ducks in a Row is source
+available under the Business Source License 1.1, and it collects no telemetry.</p>
+<p class="meta"><a href="/">What else Ducks in a Row does</a></p>
+</div>
+</main>
+<footer class="site">
+  <div class="wrap">
+    <div class="footer-grid">
+      <div>
+        <a class="brand" href="/"><img src="/assets/duck-128.png" width="30" height="30" alt=""><span>Ducks in a Row</span></a>
+        <p>Certificate management and automation for Microsoft ADCS.</p>
+      </div>
+      <div>
+        <h2>Product</h2>
+        <ul>
+          <li><a href="/download">Download</a></li>
+          <li><a href="/notices">Security notices</a></li>
+          <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/releases">Releases</a></li>
+          <li><a href="/problems/">Problem types</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Use cases</h2>
+        <ul>
+          <li><a href="/acme-for-adcs">ACME for ADCS</a></li>
+          <li><a href="/crl-expiry-monitoring">CRL expiry monitoring</a></li>
+          <li><a href="/cert-manager-adcs">cert-manager and ADCS</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Documentation</h2>
+        <ul>
+          <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/README.md">All documentation</a></li>
+          <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/quickstart.md">Quickstart</a></li>
+          <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/kubernetes.md">Kubernetes</a></li>
+          <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/LICENSING.md">Licensing</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Contact</h2>
+        <ul>
+          <li>Questions and help: <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/discussions">GitHub Discussions</a></li>
+          <li>Licensing and support: <a href="mailto:licensing@haruspex.systems">licensing@haruspex.systems</a></li>
+          <li>Feedback and ideas: <a href="mailto:feedback@haruspex.systems">feedback@haruspex.systems</a></li>
+          <li>Security reports: <a href="mailto:security@haruspex.systems">security@haruspex.systems</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="legal">
+      <p>&copy; 2026 Haruspex Systems B.V., Zevenaar, the Netherlands. KVK 42142878.</p>
+      <p>&ldquo;Ducks in a Row&rdquo; is a trademark of Haruspex Systems B.V.</p>
+      <p>This site sets no cookies and runs no scripts. <a href="/privacy">Privacy notice</a>.</p>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

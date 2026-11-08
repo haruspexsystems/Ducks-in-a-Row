@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ducks in a Row: Certificate automation for ADCS</title>
 <meta name="description" content="ACME automation and inventory management for the Microsoft ADCS you already run. Free alerts before any certificate or CRL expires. No telemetry, ever.">
+<link rel="canonical" href="https://ducksinarow.dev/">
 <meta name="theme-color" content="#0c1322">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Ducks in a Row">
@@ -16,6 +17,44 @@
 <meta property="og:image:height" content="630">
 <meta property="og:image:alt" content="The Ducks in a Row mascot, a winking yellow duck in a knight's helmet.">
 <meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "Organization",
+      "@id": "https://ducksinarow.dev/#publisher",
+      "name": "Haruspex Systems B.V.",
+      "legalName": "Haruspex Systems B.V.",
+      "address": {
+        "@type": "PostalAddress",
+        "addressLocality": "Zevenaar",
+        "addressCountry": "NL"
+      }
+    },
+    {
+      "@type": "SoftwareApplication",
+      "@id": "https://ducksinarow.dev/#software",
+      "name": "Ducks in a Row",
+      "description": "Certificate management and automation for Microsoft ADCS: an ACME server in front of the CA you already run, the certificate inventory, and alerts before any certificate or CRL expires.",
+      "url": "https://ducksinarow.dev/",
+      "applicationCategory": "SecurityApplication",
+      "operatingSystem": "Windows Server 2019, Windows Server 2022, Windows Server 2025",
+      "downloadUrl": "https://ducksinarow.dev/download",
+      "softwareHelp": {
+        "@type": "CreativeWork",
+        "url": "https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/README.md"
+      },
+      "license": "https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/LICENSE",
+      "isAccessibleForFree": true,
+      "image": "https://ducksinarow.dev/assets/og-image.png",
+      "screenshot": "https://ducksinarow.dev/assets/dashboard.png",
+      "sameAs": ["https://github.com/haruspexsystems/Ducks-in-a-Row"],
+      "publisher": { "@id": "https://ducksinarow.dev/#publisher" }
+    }
+  ]
+}
+</script>
 <link rel="preload" href="/assets/fonts/hanken-grotesk-latin-800-normal.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/assets/site.css">
 </head>
@@ -157,6 +196,8 @@
         directory URL and the challenge types.</p>
       </li>
     </ol>
+    <p class="meta"><a href="/acme-for-adcs">More about the ACME server</a> &middot;
+    <a href="/cert-manager-adcs">cert-manager and ADCS</a></p>
   </div>
 </section>
 
@@ -205,6 +246,7 @@
       root's included. It reads them from the CA itself and from the distribution points over
       LDAP and HTTP, and it watches each copy separately: a root CRL renewed into the directory
       but never copied to the web server is reported, with the location named.</p>
+      <p class="meta"><a href="/crl-expiry-monitoring">More about CRL monitoring</a></p>
     </div>
     <div class="card schedule">
       <h3>Warnings for a CRL published by hand</h3>
@@ -363,6 +405,14 @@
           <li><a href="/notices">Security notices</a></li>
           <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/releases">Releases</a></li>
           <li><a href="/problems/">Problem types</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Use cases</h2>
+        <ul>
+          <li><a href="/acme-for-adcs">ACME for ADCS</a></li>
+          <li><a href="/crl-expiry-monitoring">CRL expiry monitoring</a></li>
+          <li><a href="/cert-manager-adcs">cert-manager and ADCS</a></li>
         </ul>
       </div>
       <div>
