@@ -3,13 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ducks in a Row: ACME and expiry alerts for Microsoft ADCS</title>
-<meta name="description" content="One Windows service in front of the ADCS certificate authority you already run. Machines renew their own certificates over ACME, and expiry alerts cover your CA's inventory and every CRL in its chain. No telemetry, ever.">
+<title>Ducks in a Row: Certificate automation for ADCS</title>
+<meta name="description" content="ACME automation and inventory management for the Microsoft ADCS you already run. Free alerts before any certificate or CRL expires. No telemetry, ever.">
 <meta name="theme-color" content="#0c1322">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Ducks in a Row">
-<meta property="og:title" content="Ducks in a Row: ACME and expiry alerts for Microsoft ADCS">
-<meta property="og:description" content="One Windows service in front of the ADCS certificate authority you already run. Machines renew their own certificates over ACME, and expiry alerts cover your CA's inventory and every CRL in its chain. No telemetry, ever.">
+<meta property="og:title" content="Ducks in a Row: Certificate automation for ADCS">
+<meta property="og:description" content="ACME automation and inventory management for the Microsoft ADCS you already run. Free alerts before any certificate or CRL expires. No telemetry, ever.">
 <meta property="og:url" content="https://ducksinarow.dev/">
 <meta property="og:image" content="https://ducksinarow.dev/assets/og-image.png">
 <meta property="og:image:width" content="1200">
@@ -71,12 +71,12 @@
 
 <div class="wrap">
   <ul class="trust">
-    <li><strong>ACME server</strong><span>A COM native, RFC 8555 compliant ACME server with modern
-    challenge types supported.</span></li>
+    <li><strong>ACME server</strong><span>A COM native, RFC 8555 compliant ACME server supporting all
+    four standard challenge types.</span></li>
     <li><strong>Certificate management</strong><span>An intuitive dashboard for managing the ADCS
     certificate inventory.</span></li>
-    <li><strong>Expiry alerts</strong><span>Expiry monitoring and alerting with mail and
-    webhooks.</span></li>
+    <li><strong>Expiry monitoring</strong><span>Certificates and CRLs, with alerts by email
+    and webhook.</span></li>
     <li><strong>Quick installation</strong><span>Get up and running quickly with our streamlined,
     code-signed installer.</span></li>
   </ul>
@@ -90,34 +90,37 @@
     </div>
     <ul class="cards">
       <li class="card">
-        <h3>Expiry alerts, free</h3>
-        <p>Email and webhook alerts for every certificate in your CA's inventory.</p>
+        <h3>Prevent outages</h3>
+        <p>Free email and webhook alerts for every certificate your CA has issued, not only
+        the ones issued over ACME.</p>
       </li>
       <li class="card">
-        <h3>Pull, not push</h3>
-        <p>Each machine asks for its own certificate, so no credentials for your servers are
-        stored anywhere and Ducks in a Row needs no rights on them.</p>
+        <h3>Certificate automation</h3>
+        <p>Automate issuance and renewal for machines autoenrollment can't reach, such as Linux,
+        appliances and anything not domain joined. Each one asks for its own certificate, so no
+        server credentials are stored anywhere.</p>
       </li>
       <li class="card">
-        <h3>One scoped credential per team</h3>
+        <h3>Scoped credentials</h3>
         <p>You set the names a team may request with an external account binding credential,
         and the team serves itself within them.</p>
       </li>
       <li class="card">
-        <h3>Your trust chain stays as it is</h3>
+        <h3>Use your existing CA</h3>
         <p>Certificates come from the ADCS you already run and chain to the root you already
         trust.</p>
       </li>
       <li class="card">
-        <h3>Rights checked before first use</h3>
-        <p>The setup wizard proves what it can of the service's rights on your CA, and says
-        plainly what it cannot.</p>
+        <h3>Running in an afternoon</h3>
+        <p>The setup wizard checks the service's rights on your CA before first use and tells you
+        plainly what it could not check.</p>
       </li>
       <li class="card">
-        <h3>Kubernetes too</h3>
-        <p>cert-manager's built in ACME issuer works with it, with no plugin in the cluster.
-        The <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/kubernetes.md">Kubernetes
-        chapter</a> says which parts our tests have run.</p>
+        <h3>Broad client support</h3>
+        <p>Works with any standard ACME client, including certbot, win-acme, Posh-ACME and
+        cert-manager. See the
+        <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/acme-clients.md">client
+        guide</a>.</p>
       </li>
     </ul>
   </div>
@@ -351,7 +354,7 @@
     <div class="footer-grid">
       <div>
         <a class="brand" href="/"><img src="/assets/duck-128.png" width="30" height="30" alt=""><span>Ducks in a Row</span></a>
-        <p>ACME and expiry alerts for Microsoft ADCS.</p>
+        <p>Certificate management and automation for Microsoft ADCS.</p>
       </div>
       <div>
         <h2>Product</h2>
