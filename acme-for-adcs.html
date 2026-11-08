@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0c1322">
+<title>ACME server for Microsoft ADCS | Ducks in a Row</title>
+<meta name="description" content="Put an RFC 8555 ACME server in front of the ADCS CA you already run. certbot, win-acme, Posh-ACME and cert-manager renew from your own CA.">
+<link rel="canonical" href="https://ducksinarow.dev/acme-for-adcs">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Ducks in a Row">
+<meta property="og:title" content="ACME server for Microsoft ADCS | Ducks in a Row">
+<meta property="og:description" content="Put an RFC 8555 ACME server in front of the ADCS CA you already run. certbot, win-acme, Posh-ACME and cert-manager renew from your own CA.">
+<meta property="og:url" content="https://ducksinarow.dev/acme-for-adcs">
+<meta property="og:image" content="https://ducksinarow.dev/assets/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="The Ducks in a Row mascot, a winking yellow duck in a knight's helmet.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="/"><img src="/assets/duck-128.png" width="30" height="30" alt=""><span>Ducks in a Row</span></a>
+    <nav aria-label="Main">
+      <ul>
+        <li class="wide"><a href="/#features">Features</a></li>
+        <li class="wide"><a href="/#acme">ACME</a></li>
+        <li class="wide"><a href="/#certificates">Certificates</a></li>
+        <li class="wide"><a href="/#crl">CRL</a></li>
+        <li class="wide"><a href="/#security">Security</a></li>
+        <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/README.md">Docs</a></li>
+        <li class="wide"><a href="https://github.com/haruspexsystems/Ducks-in-a-Row">GitHub</a></li>
+        <li><a class="btn btn-primary btn-small" href="/download">Download</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<main id="main" class="page">
+<div class="wrap prose">
+<p class="pill light"><span>ACME server</span></p>
+<h1>An ACME server for the ADCS you already run</h1>
+<p class="lead">Autoenrollment looks after domain joined Windows machines. Linux servers,
+appliances and anything not domain joined usually get their certificates by hand. Ducks in a
+Row is one Windows service in front of your ADCS certificate authority that speaks ACME, so
+those machines request and renew their own certificates from the CA you already run, and the
+certificates chain to the root you already trust.</p>
+<div class="cta">
+  <a class="btn btn-primary" href="/download">Download</a>
+  <a class="btn btn-quiet" href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/quickstart.md">Read the quickstart</a>
+</div>
+
+<h2>How it works</h2>
+<p>Ducks in a Row implements RFC 8555, so any standard ACME client works, with no agent or
+proprietary software on your endpoints. Every certificate template you enable for ACME becomes
+its own directory:</p>
+<pre><code>https://your-server:5001/acme/&lt;template&gt;/directory</code></pre>
+<p>A client proves control of a name, the server validates the challenge itself, and then it
+submits the request to your CA through the CA's own COM interface. The template still decides
+the key type and the lifetime, and the CA's policy module still has the last word.</p>
+<ul>
+  <li><strong>Challenge types:</strong> http-01, dns-01 and tls-alpn-01, and device-attest-01
+  for managed devices.</li>
+  <li><strong>External account binding:</strong> a new install requires a credential to
+  register. A credential can carry a domain namespace, so a team orders only its own names, and
+  revoking it suspends orders from that team's accounts and no one else's.</li>
+  <li><strong>Renewal information (ARI):</strong> the server tells clients when to renew. A
+  revoked certificate's window moves into the past, so a client that reads ARI renews at
+  once.</li>
+  <li><strong>No stored server credentials:</strong> each machine asks for its own certificate
+  with its own ACME account key.</li>
+</ul>
+
+<h2>The clients</h2>
+<p>The <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/acme-clients.md">client
+guide</a> covers certbot, win-acme, Caddy, Traefik, Posh-ACME and cert-manager, with the
+directory URL, the challenge types and the key and CSR rules. For Kubernetes, see
+<a href="/cert-manager-adcs">cert-manager and ADCS</a>.</p>
+
+<h2>What it needs</h2>
+<ul>
+  <li>A domain joined Windows Server 2019, Server 2022 with current updates, or Server 2025,
+  with the ADCS Remote Administration Tools (<code>RSAT-ADCS-Mgmt</code>).</li>
+  <li>For the server's computer account: Request Certificates on the CA and Enroll on each
+  template you expose.</li>
+  <li>Outbound reach from the server to the names it validates: port 80 for http-01, 53 for
+  dns-01, 443 for tls-alpn-01. Clients reach the server on TCP 5001.</li>
+</ul>
+<p><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/ad-and-ca-team-request.md">What
+to ask your AD and CA team</a> lists every right and firewall opening in a page you can
+forward, and the
+<a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/system-requirements.md">system
+requirements</a> have the full list.</p>
+
+<h2>Part of the free core</h2>
+<p>The ACME server, all four challenge types and external account binding are part of the free
+core: free in production, with no limit on certificates, for one CA. Ducks in a Row is source
+available under the Business Source License 1.1, and it collects no telemetry.</p>
+<p class="meta"><a href="/">What else Ducks in a Row does</a></p>
+</div>
+</main>
+<footer class="site">
+  <div class="wrap">
+    <div class="footer-grid">
+      <div>
+        <a class="brand" href="/"><img src="/assets/duck-128.png" width="30" height="30" alt=""><span>Ducks in a Row</span></a>
+        <p>Certificate management and automation for Microsoft ADCS.</p>
+      </div>
+      <div>
+        <h2>Product</h2>
+        <ul>
+          <li><a href="/download">Download</a></li>
+          <li><a href="/notices">Security notices</a></li>
+          <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/releases">Releases</a></li>
+          <li><a href="/problems/">Problem types</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Use cases</h2>
+        <ul>
+          <li><a href="/acme-for-adcs">ACME for ADCS</a></li>
+          <li><a href="/crl-expiry-monitoring">CRL expiry monitoring</a></li>
+          <li><a href="/cert-manager-adcs">cert-manager and ADCS</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Documentation</h2>
+        <ul>
+          <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/README.md">All documentation</a></li>
+          <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/quickstart.md">Quickstart</a></li>
+          <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/kubernetes.md">Kubernetes</a></li>
+          <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/LICENSING.md">Licensing</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Contact</h2>
+        <ul>
+          <li>Questions and help: <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/discussions">GitHub Discussions</a></li>
+          <li>Licensing and support: <a href="mailto:licensing@haruspex.systems">licensing@haruspex.systems</a></li>
+          <li>Feedback and ideas: <a href="mailto:feedback@haruspex.systems">feedback@haruspex.systems</a></li>
+          <li>Security reports: <a href="mailto:security@haruspex.systems">security@haruspex.systems</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="legal">
+      <p>&copy; 2026 Haruspex Systems B.V., Zevenaar, the Netherlands. KVK 42142878.</p>
+      <p>&ldquo;Ducks in a Row&rdquo; is a trademark of Haruspex Systems B.V.</p>
+      <p>This site sets no cookies and runs no scripts. <a href="/privacy">Privacy notice</a>.</p>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

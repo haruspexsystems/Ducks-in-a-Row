@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://ducksinarow.dev/</loc></url>
+  <url><loc>https://ducksinarow.dev/acme-for-adcs</loc></url>
+  <url><loc>https://ducksinarow.dev/crl-expiry-monitoring</loc></url>
+  <url><loc>https://ducksinarow.dev/cert-manager-adcs</loc></url>
+  <url><loc>https://ducksinarow.dev/download</loc></url>
+  <url><loc>https://ducksinarow.dev/notices</loc></url>
+  <url><loc>https://ducksinarow.dev/privacy</loc></url>
+  <url><loc>https://ducksinarow.dev/problems/</loc></url>
+  <url><loc>https://ducksinarow.dev/problems/ca-access-denied</loc></url>
+  <url><loc>https://ducksinarow.dev/problems/ca-error</loc></url>
+  <url><loc>https://ducksinarow.dev/problems/ca-unavailable</loc></url>
+  <url><loc>https://ducksinarow.dev/problems/certificate-already-revoked</loc></url>
+  <url><loc>https://ducksinarow.dev/problems/certificate-not-revocable</loc></url>
+  <url><loc>https://ducksinarow.dev/problems/certificate-unavailable</loc></url>
+  <url><loc>https://ducksinarow.dev/problems/invalid-revocation-reason</loc></url>
+  <url><loc>https://ducksinarow.dev/problems/monitor-mode</loc></url>
+  <url><loc>https://ducksinarow.dev/problems/revocation-blocked-by-guardrail</loc></url>
+  <url><loc>https://ducksinarow.dev/problems/revocation-out-of-scope</loc></url>
+  <url><loc>https://ducksinarow.dev/problems/revocation-target-mismatch</loc></url>
+</urlset>

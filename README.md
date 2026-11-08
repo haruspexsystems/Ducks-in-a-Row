@@ -13,6 +13,9 @@ what is served.
 - **No trackers and no scripts.** The product promises that nothing phones home,
   and its website keeps the same promise. The sign-up form needs no exception: it
   is a plain HTML form that posts to our own list server, `lists.ducksinarow.dev`.
+  Nor does the `<script type="application/ld+json">` block in the home page's head:
+  it is structured data for search engines, and browsers never execute that type.
+  It is the only `<script` element allowed on the site.
 - **Every request stays on this domain.** Fonts and images are served from
   `/assets`, never from a font service or a CDN. The two fonts are the dashboard's
   own, Hanken Grotesk and JetBrains Mono, latin subset, under the SIL Open Font
@@ -40,6 +43,18 @@ what is served.
   `SECURITY.md`, word for word: change both together.
 - **`/thanks` links `releases/latest`.** That is right from 1.0.0 on, the first release that
   is not a prerelease. Before it, `releases/latest` led only to the releases list.
+- **The use case pages follow the docs.** `/acme-for-adcs`, `/crl-expiry-monitoring`
+  and `/cert-manager-adcs` are written for people searching for the problem. Every
+  claim on them is true of the latest public release and backed by a page in its
+  `docs/`, which they link. Where the docs say something has not been run, such as
+  parts of cert-manager, the page says so too.
+- **Search engines see one address per page.** Every indexable page carries a
+  `<link rel="canonical">` with its extensionless address (`/download`, not
+  `/download.html`), its own `og:` tags, and an entry in `sitemap.xml`. A new page
+  gets all three; a removed page leaves the sitemap. `/thanks`, `/subscribed` and
+  `404.html` stay `noindex` or unlisted and carry none of them. The sitemap is kept
+  by hand and lists addresses only, no dates. The home page's JSON-LD names no
+  price and no version, so it needs no change at a release.
 - **`/problems/<slug>` is a contract.** Every Ducks in a Row release from 1.0.0
   on names these addresses as the `type` of the problem documents its dashboard
   returns, so a page may be reworded or restyled but never renamed or removed. A
@@ -55,6 +70,9 @@ what is served.
 | `notices.html` | The security notices sign up, linked from the product, with the newsletter as an unticked option |
 | `subscribed.html` | Where the list server sends people after they sign up on `/notices`; it says how to confirm and is not indexed |
 | `privacy.html` | The privacy notice, served at `/privacy` and linked from every footer |
+| `acme-for-adcs.html`, `crl-expiry-monitoring.html`, `cert-manager-adcs.html` | The use case pages, linked from the home page and the footer's Use cases column |
+| `robots.txt` | Lets every crawler in and names the sitemap |
+| `sitemap.xml` | Every indexable address, kept by hand |
 | `problems/index.html` | The list of problem types |
 | `problems/<slug>.html` | One page per problem type, served at `/problems/<slug>` |
 | `404.html` | Served by GitHub Pages for any address with no page |

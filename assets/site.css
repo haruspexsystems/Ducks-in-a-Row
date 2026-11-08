@@ -117,6 +117,18 @@ code {
   overflow-wrap: anywhere;
 }
 
+/* A block of code, such as a manifest. It scrolls inside itself, never the page. */
+pre {
+  margin: 0 0 1rem;
+  padding: 1rem 1.1rem;
+  background: var(--code-bg);
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  overflow-x: auto;
+  line-height: 1.5;
+}
+pre code { background: none; padding: 0; font-size: 0.85rem; overflow-wrap: normal; white-space: pre; }
+
 .lead { font-size: 1.2rem; color: var(--ink-soft); }
 .meta { color: var(--ink-soft); font-size: 0.95rem; }
 
@@ -451,6 +463,7 @@ ol.how li::before {
   font-weight: 500;
 }
 ol.how p { color: var(--ink-soft); }
+ol.how + .meta { margin-top: 1.5rem; }
 
 /* The callout: a band inside the body. */
 .callout {
@@ -509,6 +522,18 @@ ul.tiers p { color: var(--ink-soft); }
 /* Ordinary pages: the download, notices, privacy and problem pages. */
 main.page { padding: clamp(2.5rem, 2rem + 3vw, 4.5rem) 0 1rem; }
 main.page h2 { font-size: 1.35rem; margin-top: 2rem; }
+
+/* The second button on a light page: slate ink and a hairline, where the ghost button
+   on the dark band would vanish. */
+.btn-quiet { background: var(--surface); color: var(--ink); border-color: var(--rule); }
+.btn-quiet:hover { border-color: var(--accent); }
+
+/* A plain two column table, as on the use case pages. */
+table.plain { width: 100%; border-collapse: collapse; margin: 0 0 1rem; font-size: 0.98rem; }
+table.plain th,
+table.plain td { text-align: left; vertical-align: top; padding: 0.6rem 0.75rem 0.6rem 0; border-bottom: 1px solid var(--rule); }
+table.plain th { font-weight: 600; }
+table.plain td:first-child { width: 40%; font-weight: 600; }
 
 ul.types { padding-left: 1.25rem; }
 ul.types li { margin-bottom: 0.4rem; }
@@ -589,7 +614,7 @@ footer.site a:hover { text-decoration: underline; }
 .footer-grid li { margin-bottom: 0.4rem; overflow-wrap: anywhere; }
 
 @media (min-width: 60rem) {
-  .footer-grid { grid-template-columns: 1.3fr repeat(3, 1fr); }
+  .footer-grid { grid-template-columns: 1.2fr repeat(3, 1fr) 1.5fr; }
 }
 
 .legal { border-top: 1px solid var(--band-rule); padding-top: 1.5rem; }
