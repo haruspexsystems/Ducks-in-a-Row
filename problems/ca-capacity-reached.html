@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0c1322">
+<title>No more CAs can be connected | Ducks in a Row</title>
+<meta name="description" content="Ducks in a Row problem type ca-capacity-reached: No more CAs can be connected.">
+<link rel="canonical" href="https://ducksinarow.dev/problems/ca-capacity-reached">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Ducks in a Row">
+<meta property="og:title" content="No more CAs can be connected | Ducks in a Row">
+<meta property="og:description" content="Ducks in a Row problem type ca-capacity-reached: No more CAs can be connected.">
+<meta property="og:url" content="https://ducksinarow.dev/problems/ca-capacity-reached">
+<meta property="og:image" content="https://ducksinarow.dev/assets/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="The Ducks in a Row mascot, a winking yellow duck in a knight's helmet, giving a thumbs up.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="/"><img src="/assets/duck-128.png" width="30" height="30" alt=""><span>Ducks in a Row</span></a>
+    <nav aria-label="Main">
+      <ul>
+        <li class="wide"><a href="/#features">Features</a></li>
+        <li class="wide"><a href="/#acme">ACME</a></li>
+        <li class="wide"><a href="/#certificates">Certificates</a></li>
+        <li class="wide"><a href="/#crl">CRL</a></li>
+        <li class="wide"><a href="/#security">Security</a></li>
+        <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/README.md">Docs</a></li>
+        <li class="wide"><a href="https://github.com/haruspexsystems/Ducks-in-a-Row">GitHub</a></li>
+        <li><a class="btn btn-primary btn-small" href="/download">Download</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<main id="main" class="page">
+<div class="wrap prose">
+<p class="pill light"><span>Problem type</span></p>
+<h1>No more CAs can be connected</h1>
+<p class="meta">HTTP 403 Forbidden<br><code>https://ducksinarow.dev/problems/ca-capacity-reached</code></p>
+<h2>What it means</h2>
+<p>You asked Ducks in a Row to connect another certificate authority, and as many
+CAs are already connected as this installation may have, so nothing was changed.
+No CA was contacted and no setting was written.</p>
+<p>The free product connects one CA. Covering more than one CA is a paid
+capability: a licence that includes it sets how many CAs may be connected. A
+licence that has lapsed, a paid module too old to know the capability, or a paid
+module that is not running (still starting after a restart, or stopped) allows
+one CA again. That never disconnects a CA: every CA already connected keeps
+syncing and issuing, and only adding another is refused.</p>
+<h2>What to do</h2>
+<p>Open the Licence card on the Settings page to see what the installed licence
+covers and whether the paid module is running. To connect more CAs, install a licence that covers them, or disconnect a
+CA you no longer need. A new licence takes effect at once, with no restart.
+<a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/licence.md">Licence and
+paid module</a> explains the tiers, and an estate can also run
+<a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/several-cas.md">one
+installation per CA</a> on the free product.</p>
+<p class="meta"><a href="/problems/">All problem types</a></p>
+</div>
+</main>
+<footer class="site">
+  <div class="wrap">
+    <div class="footer-grid">
+      <div>
+        <a class="brand" href="/"><img src="/assets/duck-128.png" width="30" height="30" alt=""><span>Ducks in a Row</span></a>
+        <p>Certificate management and automation for Microsoft ADCS.</p>
+      </div>
+      <div>
+        <h2>Product</h2>
+        <ul>
+          <li><a href="/download">Download</a></li>
+          <li><a href="/notices">Security notices</a></li>
+          <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/releases">Releases</a></li>
+          <li><a href="/problems/">Problem types</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Use cases</h2>
+        <ul>
+          <li><a href="/acme-for-adcs">ACME for ADCS</a></li>
+          <li><a href="/crl-expiry-monitoring">CRL expiry monitoring</a></li>
+          <li><a href="/cert-manager-adcs">cert-manager and ADCS</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Documentation</h2>
+        <ul>
+          <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/README.md">All documentation</a></li>
+          <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/quickstart.md">Quickstart</a></li>
+          <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/kubernetes.md">Kubernetes</a></li>
+          <li><a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/LICENSING.md">Licensing</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Contact</h2>
+        <ul>
+          <li>Questions and help: <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/discussions">GitHub Discussions</a></li>
+          <li>Licensing and support: <a href="mailto:licensing@haruspex.systems">licensing@haruspex.systems</a></li>
+          <li>Feedback and ideas: <a href="mailto:feedback@haruspex.systems">feedback@haruspex.systems</a></li>
+          <li>Security reports: <a href="mailto:security@haruspex.systems">security@haruspex.systems</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="legal">
+      <p>&copy; 2026 Haruspex Systems B.V., Zevenaar, the Netherlands. KVK 42142878.</p>
+      <p>&ldquo;Ducks in a Row&rdquo; is a trademark of Haruspex Systems B.V.</p>
+      <p>This site sets no cookies and runs no scripts. <a href="/privacy">Privacy notice</a>.</p>
+    </div>
+  </div>
+</footer>
+</body>
+</html>
