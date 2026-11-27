@@ -25,6 +25,14 @@ what is served.
   them and must stay there.
 - **One header and one footer.** Every page carries the same header and footer,
   copied from `index.html`. Change them on every page together.
+- **English only, read through the browser's translation.** The site has no translated
+  pages; readers in other languages use their browser's built-in translation, so mark what
+  it must leave alone with `translate="no"`. That is every `<code>` and `<pre>`, the names
+  Ducks in a Row, Haruspex Systems B.V., Business Source License 1.1, Apache License 2.0
+  and GitHub Discussions, and dashboard labels such as `Settings` or a card's
+  name, because the dashboard itself is in English. In running text wrap the name in
+  `<span translate="no">`. `site.css` lets the header wrap and long words break so a
+  translated page never scrolls sideways; check a new layout with longer words on a phone.
 - **The look follows the dashboard.** The colours in `site.css` are the product's
   (slate chrome, duck yellow for the one highlight, teal for links). Yellow is a
   fill behind slate text or a highlight on the dark band, never text on white,
