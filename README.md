@@ -17,9 +17,12 @@ what is served.
   it is structured data for search engines, and browsers never execute that type.
   It is the only `<script` element allowed on the site.
 - **Every request stays on this domain.** Fonts and images are served from
-  `/assets`, never from a font service or a CDN. The two fonts are the dashboard's
-  own, Hanken Grotesk and JetBrains Mono, latin subset, under the SIL Open Font
-  License; their licence files sit beside them and must stay there.
+  `/assets`, never from a font service or a CDN. The text face is Inter, the European
+  Commission's web typeface, as a variable font with the latin, latin-ext, greek and
+  cyrillic subsets, enough for every official EU language (from
+  `@fontsource-variable/inter` 5.3.0); code and labels use JetBrains Mono, latin
+  subset. Both are under the SIL Open Font License; their licence files sit beside
+  them and must stay there.
 - **One header and one footer.** Every page carries the same header and footer,
   copied from `index.html`. Change them on every page together.
 - **The look follows the dashboard.** The colours in `site.css` are the product's
