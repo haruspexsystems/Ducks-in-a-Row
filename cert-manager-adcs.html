@@ -23,7 +23,7 @@
 <a class="skip" href="#main">Skip to content</a>
 <header class="site">
   <div class="wrap">
-    <a class="brand" href="/"><img src="/assets/duck-128.png" width="30" height="30" alt=""><span>Ducks in a Row</span></a>
+    <a class="brand" href="/"><img src="/assets/duck-128.png" width="30" height="30" alt=""><span translate="no">Ducks in a Row</span></a>
     <nav aria-label="Main">
       <ul>
         <li class="wide"><a href="/#features">Features</a></li>
@@ -44,7 +44,7 @@
 <h1>cert-manager certificates from your ADCS, with no plugin</h1>
 <p class="lead">Workloads in a cluster often get their certificates from a CA the cluster keeps
 for itself, which nothing outside the cluster trusts. cert-manager's built in ACME issuer can
-ask Ducks in a Row instead, and the certificates then chain to the ADCS root your organisation
+ask <span translate="no">Ducks in a Row</span> instead, and the certificates then chain to the ADCS root your organisation
 already trusts. The cluster needs no plugin, holds no Active Directory account and no rights on
 the CA, and one scoped credential decides which names it may order.</p>
 <div class="cta">
@@ -56,9 +56,9 @@ the CA, and one scoped credential decides which names it may order.</p>
 <p>Each certificate template is its own ACME directory, so an Issuer points at the template it
 should issue from. The dashboard writes the manifest for you: create a credential on the ACME
 page and pick cert-manager in the setup panel. It produces an Issuer like this one, a
-<code>kubectl create secret</code> line for the key, and a sample Certificate whose key already
+<code translate="no">kubectl create secret</code> line for the key, and a sample Certificate whose key already
 matches the template.</p>
-<pre><code>apiVersion: cert-manager.io/v1
+<pre translate="no"><code>apiVersion: cert-manager.io/v1
 kind: Issuer
 metadata:
   name: ducks-in-a-row
@@ -88,22 +88,22 @@ team owns every name, a single ClusterIssuer with one credential is simpler.</p>
 
 <h2>What it asks of your network</h2>
 <ul>
-  <li>cert-manager 1.11 or later, and your root in <code>caBundle</code>, so cert-manager
+  <li>cert-manager 1.11 or later, and your root in <code translate="no">caBundle</code>, so cert-manager
   trusts the server's own certificate from your CA.</li>
-  <li>For http-01, an ingress that answers plain HTTP on port 80, reachable from the Ducks in a
-  Row server, whose DNS resolves the certificate names to that ingress.</li>
+  <li>For http-01, an ingress that answers plain HTTP on port 80, reachable from the <span translate="no">Ducks in a
+  Row</span> server, whose DNS resolves the certificate names to that ingress.</li>
   <li>For wildcards, dns-01 into a zone the server's DNS servers answer from.</li>
   <li>Your internal zone resolvable inside the cluster, because cert-manager checks the
   challenge itself before it tells the server it is ready.</li>
 </ul>
 <p>By default cert-manager renews at two thirds of the lifetime the template gave the certificate. From
-cert-manager 1.21, with the <code>ACMEUseARI</code> feature gate switched on, it also reads the
+cert-manager 1.21, with the <code translate="no">ACMEUseARI</code> feature gate switched on, it also reads the
 server's renewal information, so a revoked certificate is renewed at once.</p>
 
 <h2>What has been run</h2>
 <p>Our regular test cycle runs cert-manager against a real ADCS certificate authority: a
 namespaced Issuer, a Certificate with an RSA key, the Ingress annotations, http-01 through
-ingress-nginx, and dns-01. Not yet run against Ducks in a Row: <code>caBundle</code>, external
+ingress-nginx, and dns-01. Not yet run against <span translate="no">Ducks in a Row</span>: <code translate="no">caBundle</code>, external
 account binding, a ClusterIssuer, an ECDSA template, renewal and ARI, and anything on
 OpenShift. The
 <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/docs/kubernetes.md">Kubernetes
@@ -111,17 +111,17 @@ guide</a> marks each of these where it comes up, and says what is known about Op
 
 <h2>Part of the free core</h2>
 <p>The ACME server and external account binding are part of the free core: free in
-production, with no limit on certificates, for one CA. Ducks in a Row is source available under
-the Business Source License 1.1, and it collects no telemetry.</p>
+production, with no limit on certificates, for one CA. <span translate="no">Ducks in a Row</span> is source available under
+the <span translate="no">Business Source License 1.1</span>, and it collects no telemetry.</p>
 <p class="meta"><a href="/acme-for-adcs">The ACME server for other clients</a> &middot;
-<a href="/">What else Ducks in a Row does</a></p>
+<a href="/">What else <span translate="no">Ducks in a Row</span> does</a></p>
 </div>
 </main>
 <footer class="site">
   <div class="wrap">
     <div class="footer-grid">
       <div>
-        <a class="brand" href="/"><img src="/assets/duck-128.png" width="30" height="30" alt=""><span>Ducks in a Row</span></a>
+        <a class="brand" href="/"><img src="/assets/duck-128.png" width="30" height="30" alt=""><span translate="no">Ducks in a Row</span></a>
         <p>Certificate management and automation for Microsoft ADCS.</p>
       </div>
       <div>
@@ -153,7 +153,7 @@ the Business Source License 1.1, and it collects no telemetry.</p>
       <div>
         <h2>Contact</h2>
         <ul>
-          <li>Questions and help: <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/discussions">GitHub Discussions</a></li>
+          <li>Questions and help: <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/discussions"><span translate="no">GitHub Discussions</span></a></li>
           <li>Licensing and support: <a href="mailto:licensing@haruspex.systems">licensing@haruspex.systems</a></li>
           <li>Feedback and ideas: <a href="mailto:feedback@haruspex.systems">feedback@haruspex.systems</a></li>
           <li>Security reports: <a href="mailto:security@haruspex.systems">security@haruspex.systems</a></li>
@@ -161,8 +161,8 @@ the Business Source License 1.1, and it collects no telemetry.</p>
       </div>
     </div>
     <div class="legal">
-      <p>&copy; 2026 Haruspex Systems B.V., Zevenaar, the Netherlands. KVK 42142878.</p>
-      <p>&ldquo;Ducks in a Row&rdquo; is a trademark of Haruspex Systems B.V.</p>
+      <p>&copy; 2026 <span translate="no">Haruspex Systems B.V.</span>, Zevenaar, the Netherlands. KVK 42142878.</p>
+      <p>&ldquo;<span translate="no">Ducks in a Row</span>&rdquo; is a trademark of <span translate="no">Haruspex Systems B.V.</span></p>
       <p>This site sets no cookies and runs no scripts. <a href="/privacy">Privacy notice</a>.</p>
     </div>
   </div>

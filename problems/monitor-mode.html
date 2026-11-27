@@ -23,7 +23,7 @@
 <a class="skip" href="#main">Skip to content</a>
 <header class="site">
   <div class="wrap">
-    <a class="brand" href="/"><img src="/assets/duck-128.png" width="30" height="30" alt=""><span>Ducks in a Row</span></a>
+    <a class="brand" href="/"><img src="/assets/duck-128.png" width="30" height="30" alt=""><span translate="no">Ducks in a Row</span></a>
     <nav aria-label="Main">
       <ul>
         <li class="wide"><a href="/#features">Features</a></li>
@@ -42,9 +42,9 @@
 <div class="wrap prose">
 <p class="pill light"><span>Problem type</span></p>
 <h1>Not available in monitor mode</h1>
-<p class="meta">HTTP 403 Forbidden, or 404 Not Found on the ACME administration API<br><code>https://ducksinarow.dev/problems/monitor-mode</code></p>
+<p class="meta">HTTP 403 Forbidden, or 404 Not Found on the ACME administration API<br><code translate="no">https://ducksinarow.dev/problems/monitor-mode</code></p>
 <h2>What it means</h2>
-<p>This Ducks in a Row server runs in monitor mode. It watches its certification
+<p>This <span translate="no">Ducks in a Row</span> server runs in monitor mode. It watches its certification
 authority: it keeps the certificate inventory, warns before certificates expire,
 and watches the CA's revocation lists. It never writes to the CA, so it issues no
 certificates, offers no ACME service, and revokes nothing, from the dashboard or
@@ -53,14 +53,14 @@ any other way.</p>
 was sent to the CA.</p>
 <h2>What to do</h2>
 <p>To issue or revoke a certificate, do it at the certification authority, or from
-a Ducks in a Row server in full mode.</p>
+a <span translate="no">Ducks in a Row</span> server in full mode.</p>
 <p>Monitor mode is chosen by a local administrator on the server, never from the
-dashboard. It is the registry value <code>Mode</code> beside
-<code>DataDirectory</code> under
-<code>HKLM\SOFTWARE\Haruspex Systems\Ducks in a Row</code>. To turn issuance on,
+dashboard. It is the registry value <code translate="no">Mode</code> beside
+<code translate="no">DataDirectory</code> under
+<code translate="no">HKLM\SOFTWARE\Haruspex Systems\Ducks in a Row</code>. To turn issuance on,
 grant the server's computer account the rights issuance needs (Request
 Certificates on the CA and Enroll on each template), set the value to
-<code>full</code>, and restart the service.</p>
+<code translate="no">full</code>, and restart the service.</p>
 <p class="meta"><a href="/problems/">All problem types</a></p>
 </div>
 </main>
@@ -68,7 +68,7 @@ Certificates on the CA and Enroll on each template), set the value to
   <div class="wrap">
     <div class="footer-grid">
       <div>
-        <a class="brand" href="/"><img src="/assets/duck-128.png" width="30" height="30" alt=""><span>Ducks in a Row</span></a>
+        <a class="brand" href="/"><img src="/assets/duck-128.png" width="30" height="30" alt=""><span translate="no">Ducks in a Row</span></a>
         <p>Certificate management and automation for Microsoft ADCS.</p>
       </div>
       <div>
@@ -100,7 +100,7 @@ Certificates on the CA and Enroll on each template), set the value to
       <div>
         <h2>Contact</h2>
         <ul>
-          <li>Questions and help: <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/discussions">GitHub Discussions</a></li>
+          <li>Questions and help: <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/discussions"><span translate="no">GitHub Discussions</span></a></li>
           <li>Licensing and support: <a href="mailto:licensing@haruspex.systems">licensing@haruspex.systems</a></li>
           <li>Feedback and ideas: <a href="mailto:feedback@haruspex.systems">feedback@haruspex.systems</a></li>
           <li>Security reports: <a href="mailto:security@haruspex.systems">security@haruspex.systems</a></li>
@@ -108,8 +108,8 @@ Certificates on the CA and Enroll on each template), set the value to
       </div>
     </div>
     <div class="legal">
-      <p>&copy; 2026 Haruspex Systems B.V., Zevenaar, the Netherlands. KVK 42142878.</p>
-      <p>&ldquo;Ducks in a Row&rdquo; is a trademark of Haruspex Systems B.V.</p>
+      <p>&copy; 2026 <span translate="no">Haruspex Systems B.V.</span>, Zevenaar, the Netherlands. KVK 42142878.</p>
+      <p>&ldquo;<span translate="no">Ducks in a Row</span>&rdquo; is a trademark of <span translate="no">Haruspex Systems B.V.</span></p>
       <p>This site sets no cookies and runs no scripts. <a href="/privacy">Privacy notice</a>.</p>
     </div>
   </div>

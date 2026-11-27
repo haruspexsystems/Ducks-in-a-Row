@@ -62,7 +62,7 @@
 <a class="skip" href="#main">Skip to content</a>
 <header class="site">
   <div class="wrap">
-    <a class="brand" href="/"><img src="/assets/duck-128.png" width="30" height="30" alt=""><span>Ducks in a Row</span></a>
+    <a class="brand" href="/"><img src="/assets/duck-128.png" width="30" height="30" alt=""><span translate="no">Ducks in a Row</span></a>
     <nav aria-label="Main">
       <ul>
         <li class="wide"><a href="/#features">Features</a></li>
@@ -85,7 +85,7 @@
     <h1>No quack remedies. <span class="hl">Certificate management for ADCS that just goes with the flow.</span></h1>
     <p class="lead">Are you running Active Directory Certificate Services (ADCS) and still managing
     certificate renewals with improvised scripts and calendar reminders?
-    <strong>Ducks in a Row is one Windows service in front of the ADCS certificate authority you
+    <strong><span translate="no">Ducks in a Row</span> is one Windows service in front of the ADCS certificate authority you
     already run.</strong> Your machines, domain joined or not, request and renew their own
     certificates from it with a standard ACME client.</p>
     <div class="cta">
@@ -170,7 +170,7 @@
     <div class="section-head">
       <span class="kicker">ACME server</span>
       <h2>Three steps to the first certificate</h2>
-      <p>Ducks in a Row is an RFC 8555 ACME server that talks to your CA through the CA's own COM
+      <p><span translate="no">Ducks in a Row</span> is an RFC 8555 ACME server that talks to your CA through the CA's own COM
       interface. Clients prove control of a name with http-01, dns-01 or tls-alpn-01, and managed
       devices with device-attest-01. External account binding keeps each team to its own names.</p>
     </div>
@@ -222,8 +222,8 @@
       </li>
       <li class="card">
         <h3>Revoke within a scope you set</h3>
-        <p>Revoke a TLS certificate from the dashboard. By default only the certificates Ducks in
-        a Row manages can be revoked, and you decide whether to widen that.</p>
+        <p>Revoke a TLS certificate from the dashboard. By default only the certificates <span translate="no">Ducks in
+        a Row</span> manages can be revoked, and you decide whether to widen that.</p>
       </li>
       <li class="card">
         <h3>An audit trail</h3>
@@ -242,7 +242,7 @@
       <p>A certificate that expires breaks one service. A certificate revocation list that
       expires breaks revocation checking for everything its CA ever signed, all at once, and for
       an offline root nothing automatic replaces it.</p>
-      <p>Ducks in a Row watches every CRL in the chain of the CA you connect it to, the offline
+      <p><span translate="no">Ducks in a Row</span> watches every CRL in the chain of the CA you connect it to, the offline
       root's included. It reads them from the CA itself and from the distribution points over
       LDAP and HTTP, and it watches each copy separately: a root CRL renewed into the directory
       but never copied to the web server is reported, with the location named.</p>
@@ -275,7 +275,7 @@
     <ul class="cards pair">
       <li class="card">
         <h3>Code signed</h3>
-        <p>Both installers and every binary the MSI installs are signed by Haruspex Systems B.V.,
+        <p>Both installers and every binary the MSI installs are signed by <span translate="no">Haruspex Systems B.V.</span>,
         and timestamped.</p>
       </li>
       <li class="card">
@@ -285,7 +285,7 @@
       </li>
       <li class="card">
         <h3>Security fixes</h3>
-        <p>Ducks in a Row receives security fixes until 31 December 2031, at least five years after
+        <p><span translate="no">Ducks in a Row</span> receives security fixes until 31 December 2031, at least five years after
         1.0.0 became generally available, delivered through upgrades to the latest release, with no
         backports.</p>
         <p>Security fixes are free to everyone, with or without a subscription. To hear about each
@@ -296,9 +296,9 @@
       </li>
       <li class="card">
         <h3>License</h3>
-        <p>Ducks in a Row is published under the Business Source License 1.1. It is source available
+        <p><span translate="no">Ducks in a Row</span> is published under the <span translate="no">Business Source License 1.1</span>. It is source available
         and free in production on infrastructure you own or operate, or administer for customers as
-        part of a managed IT service. Each version of the core becomes Apache License 2.0 four years
+        part of a managed IT service. Each version of the core becomes <span translate="no">Apache License 2.0</span> four years
         after its release. Reselling it, or hosting it as a competing product, needs a commercial
         license. <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/blob/main/LICENSING.md">Licensing
         in plain language</a>.</p>
@@ -312,7 +312,7 @@
     <div class="callout">
       <span class="kicker">Privacy and sovereignty</span>
       <h2>No telemetry. Ever.</h2>
-      <p>Ducks in a Row runs entirely on your own servers and never sends data back to us or to
+      <p><span translate="no">Ducks in a Row</span> runs entirely on your own servers and never sends data back to us or to
       anyone else. Fonts and other assets are bundled with the app, so the dashboard makes no
       third party requests. A tool that sits in front of your certificate authority should not be
       watching you, and this one does not.</p>
@@ -320,7 +320,7 @@
     <ul class="cards pair">
       <li class="card">
         <h3>Sovereign by design</h3>
-        <p>Ducks in a Row is published by Haruspex Systems B.V., a company based in the
+        <p><span translate="no">Ducks in a Row</span> is published by <span translate="no">Haruspex Systems B.V.</span>, a company based in the
         Netherlands. It runs entirely on Windows servers you control, beside the CA you already
         run: no cloud service, no tenant and no account with us. The free core needs no licence key
         or activation, and the installer carries its own runtime, so it installs and runs on a
@@ -380,7 +380,7 @@
   <div class="wrap prose">
     <h3>Support</h3>
     <p>Community help is free in
-    <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/discussions">GitHub Discussions</a>.
+    <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/discussions"><span translate="no">GitHub Discussions</span></a>.
     A support subscription gives your organisation a first reply from a person by the end of
     the next business day, as a response target with no penalties. It is available on Free and
     Standard, and included in Compliance; ask
@@ -395,7 +395,7 @@
   <div class="wrap">
     <div class="footer-grid">
       <div>
-        <a class="brand" href="/"><img src="/assets/duck-128.png" width="30" height="30" alt=""><span>Ducks in a Row</span></a>
+        <a class="brand" href="/"><img src="/assets/duck-128.png" width="30" height="30" alt=""><span translate="no">Ducks in a Row</span></a>
         <p>Certificate management and automation for Microsoft ADCS.</p>
       </div>
       <div>
@@ -427,7 +427,7 @@
       <div>
         <h2>Contact</h2>
         <ul>
-          <li>Questions and help: <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/discussions">GitHub Discussions</a></li>
+          <li>Questions and help: <a href="https://github.com/haruspexsystems/Ducks-in-a-Row/discussions"><span translate="no">GitHub Discussions</span></a></li>
           <li>Licensing and support: <a href="mailto:licensing@haruspex.systems">licensing@haruspex.systems</a></li>
           <li>Feedback and ideas: <a href="mailto:feedback@haruspex.systems">feedback@haruspex.systems</a></li>
           <li>Security reports: <a href="mailto:security@haruspex.systems">security@haruspex.systems</a></li>
@@ -435,8 +435,8 @@
       </div>
     </div>
     <div class="legal">
-      <p>&copy; 2026 Haruspex Systems B.V., Zevenaar, the Netherlands. KVK 42142878.</p>
-      <p>&ldquo;Ducks in a Row&rdquo; is a trademark of Haruspex Systems B.V.</p>
+      <p>&copy; 2026 <span translate="no">Haruspex Systems B.V.</span>, Zevenaar, the Netherlands. KVK 42142878.</p>
+      <p>&ldquo;<span translate="no">Ducks in a Row</span>&rdquo; is a trademark of <span translate="no">Haruspex Systems B.V.</span></p>
       <p>This site sets no cookies and runs no scripts. <a href="/privacy">Privacy notice</a>.</p>
     </div>
   </div>
